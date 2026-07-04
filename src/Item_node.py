@@ -1,5 +1,6 @@
-from enum import Enum
 from __future__ import annotations
+
+from enum import Enum
 
 '''TODO: This is the nodes and classes here we will put the methods and usages of each any one of them
 first the type enum to catalog them easiely'''
@@ -19,17 +20,24 @@ class ItemType(Enum):
 
 
 class ItemNode():
-    def __init__(self, id : str, count : int, quality_score : int, type : ItemType, in_use_count : int, requierments : list[Requirement]):
-        self.id = id
-        self.count = count
-        self.quality_score = quality_score
-        self.type = type
-        self.in_use_count = in_use_count
-        self.req = requierments
+    def __init__(self):
+        self.id = ""
+        self.count = 0
+        self.quality_score = 0
+        self.type = None
+        self.in_use_count = 0
+        self.req = []
+    
+    def add_req(self, req : Requirement):
+        self.req.append(req)
+    
 
 
 
 class Requirement:
-    def __init__(self, item: ItemNode, amount: int):
+    def __init__(self, item=None, amount=None):
         self.item = item
         self.amount = amount
+    
+    def __repr__(self):
+        return f"{self.amount}x {self.item.id}"
