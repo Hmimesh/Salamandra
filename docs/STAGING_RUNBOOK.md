@@ -19,8 +19,8 @@ deployment without an approved hosting provider and credentials.
 5. PostgreSQL: use a staging-only database and least-privilege role with encrypted
    transport, durable storage, and backups.
 6. Migration: run `.venv/bin/alembic upgrade head` as a one-shot deployment step.
-7. Startup: run `.venv/bin/python src/server.py` under the process supervisor,
-   listening privately on `127.0.0.1:8000` behind the edge.
+7. Startup: run `.venv/bin/python src/server.py` under the process supervisor;
+   Railway supplies `PORT` and the process listens on `0.0.0.0:$PORT`.
 8. Health: require `GET /health` and `GET /ready` to return `200` before traffic.
 9. Accounts: provision Org A and Org B owners from a controlled terminal, then use
    Org A owner team management to add the lower-role tester.
@@ -40,9 +40,9 @@ internet
 ```
 
 The edge and application may share one VM/process namespace for the first private
-staging deployment. If a container platform requires `0.0.0.0:$PORT`, record that
-provider requirement and add a reviewed startup adapter before deploying; the
-current server intentionally defaults to a private loopback listener.
+staging deployment. Without `PORT`, the server defaults to the local-development
+listener `127.0.0.1:8000`. When Railway or another container platform supplies
+`PORT`, the process listens on `0.0.0.0:$PORT`.
 
 Required provider capabilities:
 

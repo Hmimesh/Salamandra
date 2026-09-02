@@ -19,7 +19,7 @@ if str(TESTS) not in sys.path:
 
 from operational_logging import JsonLogFormatter, log_event
 from readiness import ReadinessResult
-from server import SalamandraServer
+from server import SalamandraServer, server_bind_address
 from test_security_phase1 import ServerHarness
 from web_config import ConfigurationError, WebConfig
 
@@ -53,6 +53,18 @@ class FakeReadiness:
 
 
 class TestWebConfiguration(unittest.TestCase):
+    def test_server_bind_address_uses_railway_port_only_when_present(self):
+        self.assertEqual(server_bind_address({}), ("127.0.0.1", 8000))
+        self.assertEqual(server_bind_address({"PORT": "32145"}), ("0.0.0.0", 32145))
+
+    def test_server_bind_address_rejects_invalid_railway_port(self):
+        for port in ("", "not-a-port", "0", "65536", "8000.5"):
+            with self.subTest(port=port), self.assertRaisesRegex(
+                ConfigurationError,
+                "PORT must be an integer between 1 and 65535",
+            ):
+                server_bind_address({"PORT": port})
+
     def test_insecure_staging_cookie_configuration_is_rejected(self):
         with self.assertRaises(ConfigurationError):
             WebConfig.from_environment(

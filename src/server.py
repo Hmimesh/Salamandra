@@ -1783,5 +1783,22 @@ def run(host: str = "127.0.0.1", port: int = 8000):
         )
 
 
+def server_bind_address(environment=None) -> tuple[str, int]:
+    values = os.environ if environment is None else environment
+    if "PORT" not in values:
+        return "127.0.0.1", 8000
+
+    raw_port = str(values.get("PORT", "")).strip()
+    try:
+        port = int(raw_port)
+    except ValueError as error:
+        raise ConfigurationError(
+            "PORT must be an integer between 1 and 65535."
+        ) from error
+    if port < 1 or port > 65_535:
+        raise ConfigurationError("PORT must be an integer between 1 and 65535.")
+    return "0.0.0.0", port
+
+
 if __name__ == "__main__":
-    run()
+    run(*server_bind_address())
