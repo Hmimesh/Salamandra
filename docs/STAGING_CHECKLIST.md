@@ -4,6 +4,26 @@ Use this checklist for the first private staging deployment and repeat it after 
 
 Do not use production warehouse data unless every required item is PASS and the production pilot gate is explicitly approved.
 
+Target: `https://salamandra-staging.hmimesh.com`
+
+## First Private Staging Execution Order
+
+Execute this checklist in the following order; do not route named testers until
+the infrastructure and account gates pass:
+
+1. Record the immutable release commit and hosting environment below.
+2. Complete Sections 1-5 for fail-closed startup, PostgreSQL, DNS, TLS, cookies,
+   trusted Host, and origin enforcement.
+3. Provision only the Org A owner, Org A technician/operator, and Org B owner test
+   identities, then complete Sections 6-14.
+4. Open three isolated browser profiles, one for each identity.
+5. Complete Sections 15-24 using fake events and fake inventory.
+6. Complete the restart proof in Section 25 without restarting PostgreSQL.
+7. Complete migration, backup, observability, browser, and rollback evidence in
+   Sections 26-30.
+
+Do not paste passwords, cookies, database URLs, or tokens into this document.
+
 ## Code Gate Before Environment Testing
 
 Confirm the release candidate includes all of these before beginning the checklist:
@@ -27,6 +47,9 @@ These are code-presence checks, not deployment approval. Every environment resul
 - Alembic head revision:
 - Reverse proxy/ingress:
 - Browser set:
+- Org A owner profile:
+- Org A lower-role profile and role:
+- Org B owner profile:
 - Notes:
 
 ## Required Result Format
@@ -97,9 +120,10 @@ Result:
 Steps:
 
 1. Resolve `salamandra-staging.hmimesh.com`.
-2. Open `https://salamandra-staging.hmimesh.com`.
-3. Attempt plain HTTP.
-4. Attempt the app through any raw host/IP that should not be public.
+2. Run `python scripts/staging_public_smoke.py` from the release checkout.
+3. Open `https://salamandra-staging.hmimesh.com`.
+4. Attempt plain HTTP.
+5. Attempt the app through any raw host/IP that should not be public.
 
 Expected:
 
@@ -412,12 +436,15 @@ Result:
 Steps:
 
 1. Sign in as Org A.
-2. Submit Org B IDs in JSON bodies for event save, checklist update, status transition, inventory update/remove, item class remove, integrations, and team paths.
+2. Submit Org B IDs in JSON bodies for checklist update, status transition, inventory update/remove, item class remove, integrations, and team paths.
+3. Submit Org B's real event ID and a nonexistent event ID separately to `/api/events/save` as client-selected creation IDs.
 
 Expected:
 
-- Cross-organization mutation fails with 403 or non-disclosing 404.
+- Organization-scoped update commands fail with 403 or non-disclosing 404.
+- Both `/api/events/save` probes return the same generic 400 response without revealing whether the ID exists.
 - Org B rows remain unchanged.
+- Org A event, allocation, inventory, movement, audit, and idempotency rows remain unchanged by both rejected creation requests.
 - Audit logs do not claim successful Org A mutation of Org B resources.
 
 Evidence:
@@ -434,11 +461,13 @@ Result:
 Steps:
 
 1. POST `/api/events/save` with a client-declared event ID, organization ID, owner ID, status `out`, forged allocation plan, forged movements, and nonexistent inventory.
-2. POST `/api/events/status` with illegal transitions, for example planning directly to out.
+2. Repeat without a client-selected ID but retain the forged server-owned fields.
+3. POST `/api/events/status` with illegal transitions, for example planning directly to out.
 
 Expected:
 
-- Server derives ID, org, owner, assigned users, status, plan verification, allocation, and movement fields.
+- Any client-selected creation ID receives the same generic HTTP 400 response and causes no mutation.
+- ID-less creation generates the ID server-side and derives organization, owner, assigned users, planning status, verified plan, allocation, and movement fields.
 - Illegal transitions fail.
 - Nonexistent/forged stock is not persisted or moved.
 
@@ -634,13 +663,17 @@ Result:
 Steps:
 
 1. Create inventory, event, checklist updates, dispatch, return, item class, integration config, profile, and preferences.
-2. Restart the app.
-3. Re-read state and database rows.
+2. Record the active session, event IDs, holding buckets, movement counts, and `/ready` response.
+3. Remove the app from traffic and stop only the application process.
+4. Keep PostgreSQL running and restart the same immutable application artifact.
+5. Wait for `/ready`, then reuse the original cookie and re-read state and database rows.
+6. Repeat with logged-out, expired, revoked, disabled-user, and disabled-membership cookies.
 
 Expected:
 
 - Data persists in PostgreSQL.
 - Session persists unless logged out/expired/revoked.
+- Disabled users and disabled memberships remain unauthenticated after restart.
 - JSON persistence file hashes are unchanged.
 - No state is stored only in process memory except transient rate-limit counters.
 
@@ -735,9 +768,12 @@ Result:
 
 Steps:
 
-1. Test latest Chrome, Edge, Firefox, and Safari if available.
-2. Test desktop and a mobile viewport.
-3. Exercise login, navigation, inventory, event create, kit checkout, checklist, dispatch, return, settings, team, import, and export.
+1. Open separate browser profiles or isolated contexts for Org A owner, Org A lower-role user, and Org B owner.
+2. Test latest Chrome, Edge, Firefox, and Safari if available.
+3. Test desktop and a mobile viewport.
+4. Exercise login, navigation, inventory, event create, kit checkout, checklist, dispatch, return, settings, team, import, and export.
+5. While Org A owner edits an event/checklist, have the Org A lower-role user attempt a representative restricted operation and have Org B owner create or edit an Org B event.
+6. Refresh all three sessions and confirm each remains in the correct organization with no cross-tenant state.
 
 Expected:
 
@@ -745,6 +781,7 @@ Expected:
 - Layout is usable at tested viewports.
 - Downloads work.
 - Auth redirects behave correctly after logout/session invalidation.
+- Simultaneous operations conserve inventory and preserve role and tenant boundaries.
 
 Evidence:
 
