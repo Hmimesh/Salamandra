@@ -1,5 +1,9 @@
 # Salamandra Production-Readiness Review
 
+> Historical snapshot from the original adversarial review. The remediated implementation and
+> current verification status are documented in `SECURITY_PHASE1.md` and
+> `POSTGRESQL_PHASE2.md`; findings below describe the pre-remediation repository.
+
 Date: 2026-08-21
 
 Scope: current uncommitted working tree on `main`

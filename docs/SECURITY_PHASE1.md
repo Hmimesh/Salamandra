@@ -77,6 +77,9 @@ without requiring a partially written JSON file.
 - Dispatch records exact personal/shared source allocations in the event movement record.
 - Return replays that dispatch record; aggregate in-use stock from another event cannot be used.
 - Retrying `out` or `returned` returns success without another inventory movement.
+- Kit checkout accepts only a server-owned kit ID and idempotency key. It creates an event,
+  advances it through the legal state machine, and persists the exact dispatch movement. The
+  former client-plan `/api/events/use` mutation is removed.
 
 ### Adjacent input/integration fixes
 
@@ -102,6 +105,8 @@ without requiring a partially written JSON file.
 - `test_invalid_status_transition_is_rejected`
 - `test_duplicate_dispatch_moves_inventory_once`
 - `test_duplicate_return_restores_inventory_once`
+- `test_duplicate_kit_checkout_creates_one_event_and_movement`
+- `test_legacy_client_plan_checkout_is_removed`
 - `test_malformed_event_id_returns_validation_error`
 - `test_nonexistent_inventory_id_does_not_change_stock`
 - `test_csv_import_is_atomic_when_a_later_row_is_invalid`
@@ -117,15 +122,23 @@ inventory/classes/integrations, fixed credential references, local-endpoint reje
 existing planner/operations regressions including Coffee-House.
 
 `tests/test_database_phase2.py` proves schema constraints, same-tenant ownership, rollback,
-idempotent transition movements, JSON migration behavior, and Alembic upgrade/downgrade. The
-PostgreSQL row-lock race test is present but skipped unless `SALAMANDRA_TEST_POSTGRES_URL` points
-to an isolated PostgreSQL database.
+idempotent transition movements, JSON migration behavior, Alembic upgrade/downgrade, personal
+inventory ownership, and real PostgreSQL row-lock behavior when
+`SALAMANDRA_TEST_POSTGRES_URL` points to the disposable test database.
 
-## Remaining Blocker/High Risk
+`tests/test_postgres_api.py` starts two independent API processes against one isolated PostgreSQL
+schema. It proves durable database sessions, database-backed inventory and events, transactional
+confirmation/dispatch/return, one movement under a simultaneous duplicate dispatch, restart
+durability, and the absence of JSON persistence writes.
 
-The current local compatibility server still loads JSON into process-global mutable stores. Its
-dispatch/return logic is sequentially idempotent, but it cannot provide a transaction spanning
-event and inventory files, and simultaneous requests/processes can still lose updates. It is not
-production-safe. The PostgreSQL schema and transactional service are implemented, but the API
-repository cutover in `docs/POSTGRESQL_PHASE2.md` must be completed and tested against a real
-PostgreSQL service before production use.
+## Remaining Risk
+
+Production startup now requires `SALAMANDRA_DATABASE_URL` and uses PostgreSQL repositories for
+identity, sessions, inventory, events, allocations, movements, item classes, integrations, and
+preferences. JSON compatibility storage is available only with the explicit
+`SALAMANDRA_ALLOW_JSON_DEV=1` or demo switch; its event transition is protected by one process lock
+but remains unsuitable for multi-process production use.
+
+Deployment still requires a backup/import rehearsal for the real warehouse dataset and operational
+monitoring of the production database. Those deployment tasks do not leave an active application
+path writing authoritative production mutations to JSON.

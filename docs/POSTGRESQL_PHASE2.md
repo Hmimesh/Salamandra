@@ -7,9 +7,20 @@ Date: 2026-08-21
 Replace all authoritative JSON/global-memory state with the PostgreSQL transactional core without
 changing user-facing product behavior or rewriting the planner.
 
-The schema, initial Alembic migration, SQLAlchemy models, transaction service, JSON importer, and
-portable constraint/idempotency tests now exist. The remaining work is repository/API cutover and
-real PostgreSQL concurrency verification.
+The schema, explicit Alembic migrations, SQLAlchemy models, transaction service, JSON importer,
+repository/API cutover, and real PostgreSQL concurrency verification now exist. Production uses
+this path whenever `SALAMANDRA_DATABASE_URL` is configured.
+
+## Cutover Status
+
+- Database-backed identity, membership context, hashed durable sessions, inventory, events,
+  item classes, integrations, preferences, and organization state are implemented.
+- Confirm, pack, dispatch, and return execute through row-locked PostgreSQL transactions.
+- Personal allocation candidates are limited to the event owner's holdings plus shared stock.
+- Production startup rejects implicit JSON persistence. The compatibility path requires the
+  explicit `SALAMANDRA_ALLOW_JSON_DEV=1` or demo switch.
+- CI provisions PostgreSQL 16, applies Alembic, and runs both row-lock and two-process HTTP tests.
+- The remaining sequence below is a deployment rehearsal checklist, not unfinished API plumbing.
 
 ## Implemented Foundation
 
@@ -115,7 +126,7 @@ bounded and must reuse the same client request/idempotency key.
 
 ## Completion Gate
 
-Phase 2 is complete only when the running API no longer instantiates `AccountStore`,
-`InventoryWorkspace`, `EventMemory`, `ItemClassCatalog`, or `IntegrationStore` as authoritative
-production stores; every mutation is transaction-backed; PostgreSQL race tests pass; backup restore
-is rehearsed; and JSON is import/export compatibility data only.
+The software cutover gate is met: the running production API replaces the JSON store objects with
+PostgreSQL adapters before accepting requests, operational mutations are transaction-backed, the
+PostgreSQL race tests pass, and JSON is compatibility/import data only. A real deployment remains
+gated on backup/restore rehearsal and migration reconciliation for the operator's actual dataset.

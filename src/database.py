@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from sqlalchemy import (
@@ -14,15 +16,19 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    and_,
     create_engine,
+    or_,
     select,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from event_operations import EVENT_TRANSITIONS
-from security import ResourceNotFound, StateConflict
+from security import Permission, ResourceNotFound, StateConflict, require_permission
 
 
 JSON_VALUE = JSON().with_variant(JSONB, "postgresql")
@@ -101,6 +107,7 @@ class InventoryHoldingModel(Base):
     reserved_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     packed_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     dispatched_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active: Mapped[bool] = mapped_column(nullable=False, default=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     data: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
 
@@ -131,6 +138,23 @@ class InventoryHoldingModel(Base):
             name="fk_holdings_owner_same_org",
         ),
         Index("ix_holdings_org_item", "organization_id", "legacy_item_id"),
+        Index(
+            "uq_holdings_shared_item",
+            "organization_id",
+            "legacy_item_id",
+            unique=True,
+            postgresql_where=text("scope = 'shared'"),
+            sqlite_where=text("scope = 'shared'"),
+        ),
+        Index(
+            "uq_holdings_personal_item",
+            "organization_id",
+            "owner_user_id",
+            "legacy_item_id",
+            unique=True,
+            postgresql_where=text("scope = 'personal'"),
+            sqlite_where=text("scope = 'personal'"),
+        ),
     )
 
 
@@ -297,6 +321,66 @@ class StockMovementModel(Base):
     )
 
 
+class InventoryAdjustmentModel(Base):
+    __tablename__ = "inventory_adjustments"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    holding_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    item_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    actor_membership_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    before_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    after_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    delta: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason: Mapped[str] = mapped_column(String(300), nullable=False)
+    source: Mapped[str] = mapped_column(String(100), nullable=False)
+    request_id: Mapped[str] = mapped_column(String(160), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    batch_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["holding_id", "organization_id"],
+            ["inventory_holdings.id", "inventory_holdings.organization_id"],
+            ondelete="RESTRICT",
+            name="fk_adjustments_holding_same_org",
+        ),
+        ForeignKeyConstraint(
+            ["actor_membership_id", "organization_id"],
+            ["memberships.id", "memberships.organization_id"],
+            ondelete="RESTRICT",
+            name="fk_adjustments_actor_same_org",
+        ),
+        CheckConstraint("before_quantity >= 0", name="ck_adjustments_before"),
+        CheckConstraint("after_quantity >= 0", name="ck_adjustments_after"),
+        CheckConstraint(
+            "after_quantity - before_quantity = delta",
+            name="ck_adjustments_delta",
+        ),
+        UniqueConstraint(
+            "organization_id",
+            "operation",
+            "idempotency_key",
+            "holding_id",
+            name="uq_adjustments_operation_holding_key",
+        ),
+        Index(
+            "ix_adjustments_org_holding_created",
+            "organization_id",
+            "holding_id",
+            "created_at",
+        ),
+        Index(
+            "ix_adjustments_org_batch",
+            "organization_id",
+            "batch_id",
+        ),
+    )
+
+
 class AuditEventModel(Base):
     __tablename__ = "audit_events"
 
@@ -330,10 +414,59 @@ class SessionModel(Base):
     user_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
+    organization_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    membership_id: Mapped[str] = mapped_column(String(64), nullable=False)
     token_hash: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["membership_id", "organization_id"],
+            ["memberships.id", "memberships.organization_id"],
+            ondelete="CASCADE",
+            name="fk_sessions_membership_same_org",
+        ),
+        Index("ix_sessions_user_active", "user_id", "revoked_at", "expires_at"),
+    )
+
+
+class OperationRequestModel(Base):
+    __tablename__ = "operation_requests"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="processing")
+    resource_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    response: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id",
+            "operation",
+            "idempotency_key",
+            name="uq_operation_requests_org_operation_key",
+        ),
+        CheckConstraint(
+            "status IN ('processing', 'completed')",
+            name="ck_operation_requests_status",
+        ),
+        Index(
+            "ix_operation_requests_org_resource",
+            "organization_id",
+            "resource_id",
+        ),
+    )
 
 
 def create_database_engine(database_url: str, *, production: bool = False) -> Engine:
@@ -344,6 +477,178 @@ def create_database_engine(database_url: str, *, production: bool = False) -> En
 
 def session_factory(engine: Engine) -> sessionmaker[Session]:
     return sessionmaker(bind=engine, expire_on_commit=False, future=True)
+
+
+def active_membership(
+    session: Session,
+    organization_id: str,
+    user_id: str,
+) -> MembershipModel:
+    membership = session.scalar(
+        select(MembershipModel).where(
+            MembershipModel.organization_id == organization_id,
+            MembershipModel.user_id == user_id,
+            MembershipModel.status == "active",
+        )
+    )
+    if membership is None:
+        raise ResourceNotFound("Organization membership was not found.")
+    return membership
+
+
+class TransactionalEventDetails:
+    """Narrow commands for event fields that do not own operational state."""
+
+    def __init__(self, factory: sessionmaker[Session]):
+        self.factory = factory
+
+    def update_checklist(
+        self,
+        organization_id: str,
+        event_id: str,
+        phase: str,
+        item_id: str,
+        done: bool,
+        actor_user_id: str,
+        request_id: str,
+    ) -> EventModel:
+        if phase not in {"pack", "return"}:
+            raise ValueError("Checklist phase is not supported.")
+        checklist_field = "return_checklist" if phase == "return" else "checklist"
+        permission = (
+            Permission.OPERATIONS_RETURN
+            if phase == "return"
+            else Permission.OPERATIONS_PACK
+        )
+        with self.factory.begin() as session:
+            membership = active_membership(session, organization_id, actor_user_id)
+            require_permission(membership.role, permission)
+            event = self._event(session, organization_id, event_id)
+            allowed_statuses = (
+                {"out", "returned"}
+                if phase == "return"
+                else {"confirmed", "packed", "out", "returned"}
+            )
+            if event.status not in allowed_statuses:
+                raise StateConflict(
+                    f"The {phase} checklist is not available while the event is {event.status}."
+                )
+
+            data = dict(event.data or {})
+            checklist = [dict(item) for item in data.get(checklist_field, [])]
+            matched = False
+            changed = False
+            for item in checklist:
+                if str(item.get("item_id", "")).strip().lower() == item_id:
+                    matched = True
+                    if bool(item.get("done")) != done:
+                        item["done"] = done
+                        changed = True
+            if not matched:
+                raise ResourceNotFound("Checklist item was not found.")
+            if not changed:
+                return event
+            if phase == "return" and event.status == "returned" and not done:
+                raise StateConflict("A completed return checklist cannot be reopened.")
+
+            history = list(data.get("history", []))
+            history.append(
+                {
+                    "action": "checklist",
+                    "actor_id": actor_user_id,
+                    "note": f"{phase} checklist updated.",
+                    "timestamp": utc_now().isoformat(),
+                }
+            )
+            data[checklist_field] = checklist
+            data["history"] = history
+            event.data = data
+            event.version += 1
+            session.add(
+                AuditEventModel(
+                    organization_id=organization_id,
+                    actor_membership_id=membership.id,
+                    action="event.checklist",
+                    resource_type="event",
+                    resource_id=event.id,
+                    request_id=request_id,
+                    changes={
+                        "phase": phase,
+                        "item_id": item_id,
+                        "done": done,
+                        "version": event.version,
+                    },
+                )
+            )
+            return event
+
+    def update_planning_plan(
+        self,
+        organization_id: str,
+        event_id: str,
+        plan: dict[str, Any],
+        checklist: list[dict[str, Any]],
+        return_checklist: list[dict[str, Any]],
+        actor_user_id: str,
+        request_id: str,
+        note: str,
+    ) -> EventModel:
+        with self.factory.begin() as session:
+            membership = active_membership(session, organization_id, actor_user_id)
+            require_permission(membership.role, Permission.EVENTS_UPDATE)
+            event = self._event(session, organization_id, event_id)
+            if event.status != "planning":
+                raise StateConflict("Only planning events can be reallocated.")
+            if session.scalar(
+                select(AllocationModel.id).where(
+                    AllocationModel.organization_id == organization_id,
+                    AllocationModel.event_id == event.id,
+                )
+            ):
+                raise StateConflict("An allocated event cannot be replanned in place.")
+
+            data = dict(event.data or {})
+            data["plan"] = dict(plan)
+            data["checklist"] = [dict(item) for item in checklist]
+            data["return_checklist"] = [dict(item) for item in return_checklist]
+            history = list(data.get("history", []))
+            history.append(
+                {
+                    "action": "reallocated",
+                    "actor_id": actor_user_id,
+                    "note": note,
+                    "timestamp": utc_now().isoformat(),
+                }
+            )
+            data["history"] = history
+            event.data = data
+            event.version += 1
+            session.add(
+                AuditEventModel(
+                    organization_id=organization_id,
+                    actor_membership_id=membership.id,
+                    action="event.reallocated",
+                    resource_type="event",
+                    resource_id=event.id,
+                    request_id=request_id,
+                    changes={"version": event.version},
+                )
+            )
+            return event
+
+    @staticmethod
+    def _event(session: Session, organization_id: str, event_id: str) -> EventModel:
+        event = session.scalar(
+            select(EventModel)
+            .where(
+                EventModel.organization_id == organization_id,
+                EventModel.id == event_id,
+            )
+            .with_for_update()
+        )
+        if event is None:
+            raise ResourceNotFound("Event was not found.")
+        return event
 
 
 class TransactionalEventOperations:
@@ -359,57 +664,107 @@ class TransactionalEventOperations:
         next_status: str,
         actor_membership_id: str,
         request_id: str,
+        idempotency_key: str | None = None,
     ) -> EventModel:
         with self.factory.begin() as session:
-            event = session.scalar(
-                select(EventModel)
-                .where(
-                    EventModel.id == event_id,
-                    EventModel.organization_id == organization_id,
-                )
-                .with_for_update()
+            return self.transition_in_session(
+                session,
+                organization_id,
+                event_id,
+                next_status,
+                actor_membership_id,
+                request_id,
+                idempotency_key,
             )
-            if event is None:
-                raise ResourceNotFound("Event was not found.")
-            if next_status == event.status and next_status in {"out", "returned"}:
-                return event
-            if next_status not in EVENT_TRANSITIONS.get(event.status, frozenset()):
-                raise StateConflict(
-                    f"Event cannot move from {event.status} to {next_status}."
-                )
 
-            if next_status == "confirmed":
-                self._reserve_plan(session, event)
-            elif next_status == "packed":
-                self._move_allocation(session, event, "reserved", "packed")
-            elif next_status == "out":
-                self._move_allocation(session, event, "packed", "dispatched")
-            elif next_status == "returned":
-                self._move_allocation(session, event, "dispatched", "returned")
+    def transition_in_session(
+        self,
+        session: Session,
+        organization_id: str,
+        event_id: str,
+        next_status: str,
+        actor_membership_id: str,
+        request_id: str,
+        idempotency_key: str | None = None,
+    ) -> EventModel:
+        event = session.scalar(
+            select(EventModel)
+            .where(
+                EventModel.id == event_id,
+                EventModel.organization_id == organization_id,
+            )
+            .with_for_update()
+        )
+        if event is None:
+            raise ResourceNotFound("Event was not found.")
+        if next_status == event.status and next_status in {"out", "returned"}:
+            return event
+        if next_status not in EVENT_TRANSITIONS.get(event.status, frozenset()):
+            raise StateConflict(
+                f"Event cannot move from {event.status} to {next_status}."
+            )
 
-            event.status = next_status
-            event.version += 1
-            movement = StockMovementModel(
+        event_data = dict(event.data or {})
+        if next_status == "packed" and any(
+            not item.get("done") for item in event_data.get("checklist", [])
+        ):
+            raise StateConflict(
+                "Complete the packing checklist before marking the event packed."
+            )
+        if next_status == "out" and event_data.get("conflicts"):
+            raise StateConflict("Resolve inventory conflicts before dispatching the event.")
+        if next_status == "returned" and any(
+            not item.get("done") for item in event_data.get("return_checklist", [])
+        ):
+            raise StateConflict(
+                "Complete the return checklist before closing the event."
+            )
+
+        if next_status == "confirmed":
+            self._reserve_plan(session, event)
+        elif next_status == "packed":
+            self._move_allocation(session, event, "reserved", "packed")
+        elif next_status == "out":
+            self._move_allocation(session, event, "packed", "dispatched")
+        elif next_status == "returned":
+            self._move_allocation(session, event, "dispatched", "returned")
+
+        event.status = next_status
+        event.version += 1
+        event_data["status"] = next_status
+        history = list(event_data.get("history", []))
+        history.append(
+            {
+                "action": next_status,
+                "actor_id": actor_membership_id,
+                "note": f"Event marked {next_status}.",
+                "timestamp": utc_now().isoformat(),
+            }
+        )
+        event_data["history"] = history
+        event.data = event_data
+        session.add(
+            StockMovementModel(
                 organization_id=organization_id,
                 event_id=event.id,
                 action=next_status,
-                idempotency_key=f"{event.id}:{next_status}",
+                idempotency_key=idempotency_key or f"{event.id}:{next_status}",
                 actor_membership_id=actor_membership_id,
                 lines=self._movement_lines(session, event),
             )
-            session.add(movement)
-            session.add(
-                AuditEventModel(
-                    organization_id=organization_id,
-                    actor_membership_id=actor_membership_id,
-                    action=f"event.{next_status}",
-                    resource_type="event",
-                    resource_id=event.id,
-                    request_id=request_id,
-                    changes={"status": next_status, "version": event.version},
-                )
+        )
+        session.add(
+            AuditEventModel(
+                organization_id=organization_id,
+                actor_membership_id=actor_membership_id,
+                action=f"event.{next_status}",
+                resource_type="event",
+                resource_id=event.id,
+                request_id=request_id,
+                changes={"status": next_status, "version": event.version},
             )
-            return event
+        )
+        return event
 
     def _reserve_plan(self, session: Session, event: EventModel):
         if event.data.get("plan_verified") is not True:
@@ -453,9 +808,18 @@ class TransactionalEventOperations:
                     .where(
                         InventoryHoldingModel.organization_id == event.organization_id,
                         InventoryHoldingModel.legacy_item_id == legacy_item_id,
+                        InventoryHoldingModel.active.is_(True),
+                        or_(
+                            InventoryHoldingModel.scope == "shared",
+                            and_(
+                                InventoryHoldingModel.scope == "personal",
+                                InventoryHoldingModel.owner_user_id == event.owner_user_id,
+                            ),
+                        ),
                     )
                     .order_by(
-                        InventoryHoldingModel.scope.desc(),
+                        InventoryHoldingModel.scope,
+                        InventoryHoldingModel.owner_user_id,
                         InventoryHoldingModel.id,
                     )
                     .with_for_update()
@@ -573,3 +937,1090 @@ class TransactionalEventOperations:
                 )
             )
         ]
+
+
+class TransactionalInventoryOperations:
+    """Atomic stock-definition and quantity reconciliation commands."""
+
+    DEFINITION_UPDATE_OPERATION = "inventory.definition_update"
+    ACTIVE_EDITABLE_FIELDS = frozenset({"info"})
+    SEPARATE_COMMAND_FIELDS = frozenset(
+        {
+            "id",
+            "count",
+            "in_use_count",
+            "available_quantity",
+            "reserved_quantity",
+            "packed_quantity",
+            "dispatched_quantity",
+            "scope",
+            "owner_user_id",
+            "active",
+            "version",
+        }
+    )
+
+    def __init__(self, factory: sessionmaker[Session]):
+        self.factory = factory
+
+    def update_definition(
+        self,
+        organization_id: str,
+        actor_user_id: str,
+        scope: str,
+        owner_user_id: str | None,
+        item_id: str,
+        new_item_id: str,
+        metadata: dict[str, Any],
+        idempotency_key: str,
+        request_id: str,
+    ) -> tuple[InventoryHoldingModel, bool]:
+        self._validate_context(scope, owner_user_id, actor_user_id)
+        self._validate_item_id(item_id)
+        self._validate_item_id(new_item_id)
+        self._validate_operation_key(idempotency_key)
+        normalized_metadata = self._normalize_definition_metadata(
+            metadata,
+            reject_restricted=True,
+        )
+        payload = {
+            "scope": scope,
+            "owner_user_id": owner_user_id,
+            "item_id": item_id,
+            "new_item_id": new_item_id,
+            "metadata": normalized_metadata,
+        }
+        fingerprint = self._fingerprint(payload)
+        try:
+            with self.factory.begin() as session:
+                membership = self._authorize(
+                    session,
+                    organization_id,
+                    actor_user_id,
+                    scope,
+                    import_required=False,
+                    definition_required=True,
+                )
+                self._lock_organization(session, organization_id)
+                existing = self._request(
+                    session,
+                    organization_id,
+                    self.DEFINITION_UPDATE_OPERATION,
+                    idempotency_key,
+                    lock=True,
+                )
+                if existing is not None:
+                    return self._existing_holding(session, existing, fingerprint), False
+
+                request = OperationRequestModel(
+                    organization_id=organization_id,
+                    operation=self.DEFINITION_UPDATE_OPERATION,
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=fingerprint,
+                )
+                session.add(request)
+                session.flush()
+
+                holding = self._holding(
+                    session,
+                    organization_id,
+                    scope,
+                    owner_user_id,
+                    item_id,
+                )
+                if holding is None or not holding.active:
+                    raise ResourceNotFound("Inventory item was not found.")
+                if new_item_id != holding.legacy_item_id:
+                    collision = self._holding(
+                        session,
+                        organization_id,
+                        scope,
+                        owner_user_id,
+                        new_item_id,
+                    )
+                    if collision is not None:
+                        raise StateConflict(
+                            "Another inventory item already uses that identity."
+                        )
+
+                before, after, changed_fields = self._definition_changes(
+                    holding,
+                    new_item_id,
+                    normalized_metadata,
+                )
+                self._ensure_definition_change_allowed(holding, changed_fields)
+                changed = bool(changed_fields)
+                if changed:
+                    holding.legacy_item_id = new_item_id
+                    holding.data = normalized_metadata
+                    holding.version += 1
+                    self._audit_definition_update(
+                        session,
+                        holding,
+                        membership.id,
+                        request_id,
+                        before,
+                        after,
+                        changed_fields,
+                    )
+
+                request.status = "completed"
+                request.resource_id = holding.id
+                request.response = {
+                    "holding_id": holding.id,
+                    "item_id": holding.legacy_item_id,
+                    "changed": changed,
+                }
+                request.completed_at = utc_now()
+                session.flush()
+                return holding, changed
+        except IntegrityError:
+            with self.factory() as session:
+                self._authorize(
+                    session,
+                    organization_id,
+                    actor_user_id,
+                    scope,
+                    import_required=False,
+                    definition_required=True,
+                )
+                existing = self._request(
+                    session,
+                    organization_id,
+                    self.DEFINITION_UPDATE_OPERATION,
+                    idempotency_key,
+                    lock=False,
+                )
+                if existing is None:
+                    raise
+                return self._existing_holding(session, existing, fingerprint), False
+
+    def adjust(
+        self,
+        organization_id: str,
+        actor_user_id: str,
+        scope: str,
+        owner_user_id: str | None,
+        item_id: str,
+        amount: int,
+        metadata: dict[str, Any],
+        operation: str,
+        idempotency_key: str,
+        request_id: str,
+        reason_code: str,
+        reason: str,
+        source: str,
+    ) -> tuple[InventoryHoldingModel, bool]:
+        if operation not in {"inventory.add", "inventory.remove"}:
+            raise ValueError("Inventory adjustment operation is invalid.")
+        if amount <= 0:
+            raise ValueError("Amount must be greater than zero.")
+        self._validate_context(scope, owner_user_id, actor_user_id)
+        self._validate_text(reason_code, reason, source)
+        normalized_metadata = self._normalize_definition_metadata(
+            metadata,
+            reject_restricted=True,
+        )
+        payload = {
+            "scope": scope,
+            "owner_user_id": owner_user_id,
+            "item_id": item_id,
+            "amount": amount,
+            "metadata": normalized_metadata if operation == "inventory.add" else {},
+            "reason_code": reason_code,
+            "reason": reason,
+            "source": source,
+        }
+        fingerprint = self._fingerprint(payload)
+        try:
+            with self.factory.begin() as session:
+                membership = self._authorize(
+                    session, organization_id, actor_user_id, scope, import_required=False
+                )
+                self._lock_organization(session, organization_id)
+                existing = self._request(
+                    session, organization_id, operation, idempotency_key, lock=True
+                )
+                if existing is not None:
+                    return self._existing_holding(session, existing, fingerprint), False
+                request = OperationRequestModel(
+                    organization_id=organization_id,
+                    operation=operation,
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=fingerprint,
+                )
+                session.add(request)
+                session.flush()
+                holding = self._holding(
+                    session,
+                    organization_id,
+                    scope,
+                    owner_user_id,
+                    item_id,
+                )
+                definition_action = ""
+                definition_update: tuple[
+                    dict[str, Any],
+                    dict[str, Any],
+                    frozenset[str],
+                ] | None = None
+                if holding is None:
+                    if operation == "inventory.remove":
+                        raise ResourceNotFound("Inventory item was not found.")
+                    holding = InventoryHoldingModel(
+                        organization_id=organization_id,
+                        legacy_item_id=item_id,
+                        scope=scope,
+                        owner_user_id=owner_user_id,
+                        available_quantity=0,
+                        active=True,
+                        data=dict(normalized_metadata),
+                    )
+                    session.add(holding)
+                    session.flush()
+                    definition_action = "inventory.definition_created"
+                elif operation == "inventory.add":
+                    merged_metadata = {
+                        **self._normalize_definition_metadata(
+                            dict(holding.data or {}),
+                            reject_restricted=False,
+                        ),
+                        **dict(normalized_metadata),
+                    }
+                    before_definition, after_definition, changed_fields = (
+                        self._definition_changes(
+                            holding,
+                            holding.legacy_item_id,
+                            merged_metadata,
+                        )
+                    )
+                    if changed_fields:
+                        require_permission(
+                            membership.role,
+                            Permission.INVENTORY_DEFINITION_MANAGE,
+                        )
+                    self._ensure_definition_change_allowed(holding, changed_fields)
+                    if changed_fields:
+                        holding.data = merged_metadata
+                        definition_update = (
+                            before_definition,
+                            after_definition,
+                            changed_fields,
+                        )
+                    if not holding.active:
+                        holding.active = True
+                        definition_action = "inventory.definition_reactivated"
+
+                before = self._total(holding)
+                if operation == "inventory.add":
+                    holding.available_quantity += amount
+                else:
+                    if not holding.active:
+                        raise ResourceNotFound("Inventory item was not found.")
+                    if amount > holding.available_quantity:
+                        raise StateConflict(
+                            f"Cannot remove {amount}; only {holding.available_quantity} available."
+                        )
+                    holding.available_quantity -= amount
+                    if self._total(holding) == 0:
+                        holding.active = False
+                        definition_action = "inventory.definition_archived"
+                holding.version += 1
+                after = self._total(holding)
+                self._record_adjustment(
+                    session,
+                    holding,
+                    membership.id,
+                    operation,
+                    before,
+                    after,
+                    reason_code,
+                    reason,
+                    source,
+                    request_id,
+                    idempotency_key,
+                )
+                if definition_action:
+                    self._audit_definition(
+                        session,
+                        holding,
+                        membership.id,
+                        definition_action,
+                        request_id,
+                    )
+                if definition_update is not None:
+                    self._audit_definition_update(
+                        session,
+                        holding,
+                        membership.id,
+                        request_id,
+                        *definition_update,
+                    )
+                request.status = "completed"
+                request.resource_id = holding.id
+                request.response = {
+                    "holding_id": holding.id,
+                    "item_id": holding.legacy_item_id,
+                    "active": holding.active,
+                }
+                request.completed_at = utc_now()
+                session.flush()
+                return holding, True
+        except IntegrityError:
+            with self.factory() as session:
+                self._authorize(
+                    session, organization_id, actor_user_id, scope, import_required=False
+                )
+                existing = self._request(
+                    session, organization_id, operation, idempotency_key, lock=False
+                )
+                if existing is None:
+                    raise
+                return self._existing_holding(session, existing, fingerprint), False
+
+    def reconcile(
+        self,
+        organization_id: str,
+        actor_user_id: str,
+        scope: str,
+        owner_user_id: str | None,
+        items: list[dict[str, Any]],
+        idempotency_key: str,
+        request_id: str,
+        reason_code: str,
+        reason: str,
+        source: str,
+    ) -> tuple[int, bool]:
+        self._validate_context(scope, owner_user_id, actor_user_id)
+        self._validate_text(reason_code, reason, source)
+        normalized = sorted(
+            [
+                {
+                    **item,
+                    "metadata": self._normalize_definition_metadata(
+                        dict(item.get("metadata", {})),
+                        reject_restricted=True,
+                    ),
+                }
+                for item in items
+            ],
+            key=lambda item: str(item["item_id"]),
+        )
+        item_ids = [str(item["item_id"]) for item in normalized]
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("Inventory reconciliation contains duplicate item IDs.")
+        for item in normalized:
+            if int(item["quantity"]) < 0:
+                raise ValueError("Inventory quantity cannot be negative.")
+        payload = {
+            "scope": scope,
+            "owner_user_id": owner_user_id,
+            "items": normalized,
+            "reason_code": reason_code,
+            "reason": reason,
+            "source": source,
+        }
+        fingerprint = self._fingerprint(payload)
+        operation = "inventory.import"
+        try:
+            with self.factory.begin() as session:
+                membership = self._authorize(
+                    session, organization_id, actor_user_id, scope, import_required=True
+                )
+                self._lock_organization(session, organization_id)
+                existing = self._request(
+                    session, organization_id, operation, idempotency_key, lock=True
+                )
+                if existing is not None:
+                    return self._existing_count(existing, fingerprint), False
+                request = OperationRequestModel(
+                    organization_id=organization_id,
+                    operation=operation,
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=fingerprint,
+                )
+                session.add(request)
+                session.flush()
+                batch_id = new_id()
+                for item in normalized:
+                    item_id = str(item["item_id"])
+                    metadata = dict(item.get("metadata", {}))
+                    quantity = int(item["quantity"])
+                    holding = self._holding(
+                        session,
+                        organization_id,
+                        scope,
+                        owner_user_id,
+                        item_id,
+                    )
+                    definition_action = ""
+                    definition_update: tuple[
+                        dict[str, Any],
+                        dict[str, Any],
+                        frozenset[str],
+                    ] | None = None
+                    if holding is None:
+                        holding = InventoryHoldingModel(
+                            organization_id=organization_id,
+                            legacy_item_id=item_id,
+                            scope=scope,
+                            owner_user_id=owner_user_id,
+                            available_quantity=0,
+                            active=True,
+                            data=metadata,
+                        )
+                        session.add(holding)
+                        session.flush()
+                        definition_action = "inventory.definition_created"
+                    elif not holding.active:
+                        holding.active = True
+                        definition_action = "inventory.definition_reactivated"
+
+                    before = self._total(holding)
+                    if definition_action == "inventory.definition_created":
+                        metadata_changed = False
+                    else:
+                        before_definition, after_definition, changed_fields = (
+                            self._definition_changes(
+                                holding,
+                                holding.legacy_item_id,
+                                metadata,
+                            )
+                        )
+                        self._ensure_definition_change_allowed(
+                            holding,
+                            changed_fields,
+                        )
+                        if changed_fields:
+                            require_permission(
+                                membership.role,
+                                Permission.INVENTORY_DEFINITION_MANAGE,
+                            )
+                        metadata_changed = bool(changed_fields)
+                        if metadata_changed:
+                            definition_update = (
+                                before_definition,
+                                after_definition,
+                                changed_fields,
+                            )
+                    quantity_changed = holding.available_quantity != quantity
+                    if metadata_changed:
+                        holding.data = metadata
+                    holding.available_quantity = quantity
+                    if metadata_changed or quantity_changed or definition_action:
+                        holding.version += 1
+                    after = self._total(holding)
+                    if before != after:
+                        self._record_adjustment(
+                            session,
+                            holding,
+                            membership.id,
+                            operation,
+                            before,
+                            after,
+                            reason_code,
+                            reason,
+                            source,
+                            request_id,
+                            idempotency_key,
+                            batch_id,
+                        )
+                    if definition_action:
+                        self._audit_definition(
+                            session,
+                            holding,
+                            membership.id,
+                            definition_action,
+                            request_id,
+                            batch_id,
+                        )
+                    if definition_update is not None:
+                        self._audit_definition_update(
+                            session,
+                            holding,
+                            membership.id,
+                            request_id,
+                            *definition_update,
+                            batch_id=batch_id,
+                        )
+
+                request.status = "completed"
+                request.resource_id = batch_id
+                request.response = {"imported": len(normalized), "batch_id": batch_id}
+                request.completed_at = utc_now()
+                session.flush()
+                return len(normalized), True
+        except IntegrityError:
+            with self.factory() as session:
+                self._authorize(
+                    session, organization_id, actor_user_id, scope, import_required=True
+                )
+                existing = self._request(
+                    session, organization_id, operation, idempotency_key, lock=False
+                )
+                if existing is None:
+                    raise
+                return self._existing_count(existing, fingerprint), False
+
+    @staticmethod
+    def _validate_context(
+        scope: str,
+        owner_user_id: str | None,
+        actor_user_id: str,
+    ) -> None:
+        if scope not in {"shared", "personal"}:
+            raise ValueError("Inventory scope must be shared or personal.")
+        if scope == "shared" and owner_user_id is not None:
+            raise ValueError("Shared inventory cannot have a personal owner.")
+        if scope == "personal" and owner_user_id != actor_user_id:
+            raise ResourceNotFound("Personal inventory was not found.")
+
+    @staticmethod
+    def _validate_text(reason_code: str, reason: str, source: str) -> None:
+        if not reason_code or len(reason_code) > 64:
+            raise ValueError("Inventory reason code is invalid.")
+        if not reason or len(reason) > 300:
+            raise ValueError("Inventory reason is invalid.")
+        if not source or len(source) > 100:
+            raise ValueError("Inventory source is invalid.")
+
+    @staticmethod
+    def _validate_item_id(item_id: str) -> None:
+        if (
+            not isinstance(item_id, str)
+            or not item_id
+            or item_id != item_id.strip().lower()
+            or len(item_id) > 256
+        ):
+            raise ValueError("Inventory item identity is invalid.")
+
+    @staticmethod
+    def _validate_operation_key(idempotency_key: str) -> None:
+        if (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key
+            or len(idempotency_key) > 160
+        ):
+            raise ValueError("Inventory operation key is invalid.")
+
+    @classmethod
+    def _normalize_definition_metadata(
+        cls,
+        metadata: dict[str, Any],
+        *,
+        reject_restricted: bool,
+    ) -> dict[str, Any]:
+        if not isinstance(metadata, dict):
+            raise ValueError("Inventory definition metadata must be an object.")
+        restricted = cls.SEPARATE_COMMAND_FIELDS.intersection(metadata)
+        if reject_restricted and restricted:
+            raise ValueError(
+                "Stock quantities, ownership, scope, and holding state require a separate command."
+            )
+        return {
+            key: value
+            for key, value in metadata.items()
+            if key not in cls.SEPARATE_COMMAND_FIELDS
+        }
+
+    @classmethod
+    def _definition_changes(
+        cls,
+        holding: InventoryHoldingModel,
+        new_item_id: str,
+        new_metadata: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], frozenset[str]]:
+        before = {
+            "item_id": holding.legacy_item_id,
+            **cls._normalize_definition_metadata(
+                dict(holding.data or {}),
+                reject_restricted=False,
+            ),
+        }
+        after = {"item_id": new_item_id, **dict(new_metadata)}
+        changed_fields = frozenset(
+            field
+            for field in before.keys() | after.keys()
+            if before.get(field) != after.get(field)
+        )
+        return before, after, changed_fields
+
+    @classmethod
+    def _ensure_definition_change_allowed(
+        cls,
+        holding: InventoryHoldingModel,
+        changed_fields: frozenset[str],
+    ) -> None:
+        protected_changes = changed_fields - cls.ACTIVE_EDITABLE_FIELDS
+        operational_quantity = sum(
+            (
+                holding.reserved_quantity,
+                holding.packed_quantity,
+                holding.dispatched_quantity,
+            )
+        )
+        if operational_quantity and protected_changes:
+            raise StateConflict(
+                "This inventory definition cannot change while stock is reserved, packed, or dispatched."
+            )
+
+    @staticmethod
+    def _authorize(
+        session: Session,
+        organization_id: str,
+        actor_user_id: str,
+        scope: str,
+        *,
+        import_required: bool,
+        definition_required: bool = False,
+    ) -> MembershipModel:
+        membership = active_membership(session, organization_id, actor_user_id)
+        permission = (
+            Permission.INVENTORY_PERSONAL_WRITE
+            if scope == "personal"
+            else Permission.INVENTORY_SHARED_WRITE
+        )
+        require_permission(membership.role, permission)
+        if import_required:
+            require_permission(membership.role, Permission.INVENTORY_IMPORT)
+        if definition_required:
+            require_permission(
+                membership.role,
+                Permission.INVENTORY_DEFINITION_MANAGE,
+            )
+        return membership
+
+    @staticmethod
+    def _lock_organization(session: Session, organization_id: str) -> None:
+        organization = session.scalar(
+            select(OrganizationModel)
+            .where(OrganizationModel.id == organization_id)
+            .with_for_update()
+        )
+        if organization is None:
+            raise ResourceNotFound("Organization was not found.")
+
+    @staticmethod
+    def _holding(
+        session: Session,
+        organization_id: str,
+        scope: str,
+        owner_user_id: str | None,
+        item_id: str,
+    ) -> InventoryHoldingModel | None:
+        owner_filter = (
+            InventoryHoldingModel.owner_user_id.is_(None)
+            if owner_user_id is None
+            else InventoryHoldingModel.owner_user_id == owner_user_id
+        )
+        return session.scalar(
+            select(InventoryHoldingModel)
+            .where(
+                InventoryHoldingModel.organization_id == organization_id,
+                InventoryHoldingModel.scope == scope,
+                owner_filter,
+                InventoryHoldingModel.legacy_item_id == item_id,
+            )
+            .with_for_update()
+        )
+
+    @staticmethod
+    def _total(holding: InventoryHoldingModel) -> int:
+        return sum(
+            (
+                holding.available_quantity,
+                holding.reserved_quantity,
+                holding.packed_quantity,
+                holding.dispatched_quantity,
+            )
+        )
+
+    @staticmethod
+    def _fingerprint(payload: dict[str, Any]) -> str:
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _request(
+        session: Session,
+        organization_id: str,
+        operation: str,
+        idempotency_key: str,
+        *,
+        lock: bool,
+    ) -> OperationRequestModel | None:
+        statement = select(OperationRequestModel).where(
+            OperationRequestModel.organization_id == organization_id,
+            OperationRequestModel.operation == operation,
+            OperationRequestModel.idempotency_key == idempotency_key,
+        )
+        if lock:
+            statement = statement.with_for_update()
+        return session.scalar(statement)
+
+    @staticmethod
+    def _existing_holding(
+        session: Session,
+        request: OperationRequestModel,
+        fingerprint: str,
+    ) -> InventoryHoldingModel:
+        if request.request_fingerprint != fingerprint:
+            raise StateConflict(
+                "This idempotency key was already used for another inventory change."
+            )
+        if request.status != "completed" or not request.resource_id:
+            raise StateConflict("This inventory change is still being processed.")
+        holding = session.scalar(
+            select(InventoryHoldingModel).where(
+                InventoryHoldingModel.organization_id == request.organization_id,
+                InventoryHoldingModel.id == request.resource_id,
+            )
+        )
+        if holding is None:
+            raise StateConflict("The completed inventory change is unavailable.")
+        return holding
+
+    @staticmethod
+    def _existing_count(request: OperationRequestModel, fingerprint: str) -> int:
+        if request.request_fingerprint != fingerprint:
+            raise StateConflict(
+                "This idempotency key was already used for another inventory import."
+            )
+        if request.status != "completed":
+            raise StateConflict("This inventory import is still being processed.")
+        return int(dict(request.response or {}).get("imported", 0))
+
+    @staticmethod
+    def _record_adjustment(
+        session: Session,
+        holding: InventoryHoldingModel,
+        actor_membership_id: str,
+        operation: str,
+        before: int,
+        after: int,
+        reason_code: str,
+        reason: str,
+        source: str,
+        request_id: str,
+        idempotency_key: str,
+        batch_id: str | None = None,
+    ) -> None:
+        adjustment = InventoryAdjustmentModel(
+            organization_id=holding.organization_id,
+            holding_id=holding.id,
+            item_id=holding.legacy_item_id,
+            actor_membership_id=actor_membership_id,
+            operation=operation,
+            before_quantity=before,
+            after_quantity=after,
+            delta=after - before,
+            reason_code=reason_code,
+            reason=reason,
+            source=source,
+            request_id=request_id,
+            idempotency_key=idempotency_key,
+            batch_id=batch_id,
+        )
+        session.add(adjustment)
+        session.flush()
+        session.add(
+            AuditEventModel(
+                organization_id=holding.organization_id,
+                actor_membership_id=actor_membership_id,
+                action="inventory.adjusted",
+                resource_type="inventory_holding",
+                resource_id=holding.id,
+                request_id=request_id,
+                changes={
+                    "adjustment_id": adjustment.id,
+                    "operation": operation,
+                    "item_id": holding.legacy_item_id,
+                    "before_quantity": before,
+                    "after_quantity": after,
+                    "delta": after - before,
+                    "reason_code": reason_code,
+                    "source": source,
+                    "batch_id": batch_id,
+                },
+            )
+        )
+
+    @staticmethod
+    def _audit_definition(
+        session: Session,
+        holding: InventoryHoldingModel,
+        actor_membership_id: str,
+        action: str,
+        request_id: str,
+        batch_id: str | None = None,
+    ) -> None:
+        session.add(
+            AuditEventModel(
+                organization_id=holding.organization_id,
+                actor_membership_id=actor_membership_id,
+                action=action,
+                resource_type="inventory_holding",
+                resource_id=holding.id,
+                request_id=request_id,
+                changes={
+                    "item_id": holding.legacy_item_id,
+                    "active": holding.active,
+                    "batch_id": batch_id,
+                },
+            )
+        )
+
+    @staticmethod
+    def _audit_definition_update(
+        session: Session,
+        holding: InventoryHoldingModel,
+        actor_membership_id: str,
+        request_id: str,
+        before: dict[str, Any],
+        after: dict[str, Any],
+        changed_fields: frozenset[str],
+        batch_id: str | None = None,
+    ) -> None:
+        ordered_fields = sorted(changed_fields)
+        session.add(
+            AuditEventModel(
+                organization_id=holding.organization_id,
+                actor_membership_id=actor_membership_id,
+                action="inventory.definition_updated",
+                resource_type="inventory_holding",
+                resource_id=holding.id,
+                request_id=request_id,
+                changes={
+                    "changed_fields": ordered_fields,
+                    "before": {field: before.get(field) for field in ordered_fields},
+                    "after": {field: after.get(field) for field in ordered_fields},
+                    "batch_id": batch_id,
+                },
+            )
+        )
+
+
+class TransactionalKitOperations:
+    """Create, allocate, pack, and dispatch a kit in one database transaction."""
+
+    OPERATION = "kit.checkout"
+
+    def __init__(self, factory: sessionmaker[Session]):
+        self.factory = factory
+        self.events = TransactionalEventOperations(factory)
+
+    def checkout(
+        self,
+        organization_id: str,
+        owner_user_id: str,
+        actor_membership_id: str,
+        source_id: str,
+        idempotency_key: str,
+        request_id: str,
+        event_data_factory: Callable[[], dict[str, Any]],
+    ) -> tuple[EventModel, bool]:
+        source_id = source_id.strip().lower()
+        idempotency_key = idempotency_key.strip()
+        if not organization_id or not owner_user_id or not source_id:
+            raise ValueError("Kit checkout context is incomplete.")
+        if not idempotency_key or len(idempotency_key) > 160:
+            raise ValueError("Kit checkout idempotency key is invalid.")
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {"source_id": source_id},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        try:
+            with self.factory.begin() as session:
+                existing = self._request(
+                    session, organization_id, idempotency_key, lock=True
+                )
+                if existing is not None:
+                    return self._existing_result(session, existing, fingerprint)
+
+                legacy = self._legacy_result(
+                    session, organization_id, idempotency_key, source_id
+                )
+                if legacy is not None:
+                    return legacy, False
+
+                operation = OperationRequestModel(
+                    organization_id=organization_id,
+                    operation=self.OPERATION,
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=fingerprint,
+                )
+                session.add(operation)
+                session.flush()
+
+                event_data = event_data_factory()
+                if (
+                    event_data.get("source_type") != "kit"
+                    or event_data.get("source_id") != source_id
+                ):
+                    raise ValueError("Kit checkout source is invalid.")
+                event_id = new_id()
+                authoritative_data = dict(event_data)
+                authoritative_data.update(
+                    {
+                        "id": event_id,
+                        "organization_id": organization_id,
+                        "owner_id": owner_user_id,
+                        "assigned_user_ids": [owner_user_id],
+                        "source_type": "kit",
+                        "source_id": source_id,
+                        "status": "planning",
+                        "plan_verified": True,
+                        "movements": [],
+                    }
+                )
+                event = EventModel(
+                    id=event_id,
+                    organization_id=organization_id,
+                    owner_user_id=owner_user_id,
+                    title=str(authoritative_data.get("title", "Kit checkout")),
+                    status="planning",
+                    priority_score=int(authoritative_data.get("priority_score", 50)),
+                    data=authoritative_data,
+                )
+                session.add(event)
+                session.flush()
+
+                self.events.transition_in_session(
+                    session,
+                    organization_id,
+                    event.id,
+                    "confirmed",
+                    actor_membership_id,
+                    request_id,
+                )
+                packed_data = dict(event.data or {})
+                packed_data["checklist"] = [
+                    {**item, "done": True}
+                    for item in packed_data.get("checklist", [])
+                ]
+                packed_history = list(packed_data.get("history", []))
+                packed_history.append(
+                    {
+                        "action": "checklist",
+                        "actor_id": actor_membership_id,
+                        "note": "Kit packing checklist completed automatically.",
+                        "timestamp": utc_now().isoformat(),
+                    }
+                )
+                packed_data["history"] = packed_history
+                event.data = packed_data
+                self.events.transition_in_session(
+                    session,
+                    organization_id,
+                    event.id,
+                    "packed",
+                    actor_membership_id,
+                    request_id,
+                )
+                self.events.transition_in_session(
+                    session,
+                    organization_id,
+                    event.id,
+                    "out",
+                    actor_membership_id,
+                    request_id,
+                    f"kit:{idempotency_key}",
+                )
+
+                operation.status = "completed"
+                operation.resource_id = event.id
+                operation.response = {"event_id": event.id, "source_id": source_id}
+                operation.completed_at = utc_now()
+                session.add(
+                    AuditEventModel(
+                        organization_id=organization_id,
+                        actor_membership_id=actor_membership_id,
+                        action="kit.checkout",
+                        resource_type="event",
+                        resource_id=event.id,
+                        request_id=request_id,
+                        changes={
+                            "source_id": source_id,
+                            "idempotency_key": idempotency_key,
+                        },
+                    )
+                )
+                session.flush()
+                return event, True
+        except IntegrityError:
+            with self.factory() as session:
+                existing = self._request(
+                    session, organization_id, idempotency_key, lock=False
+                )
+                if existing is None:
+                    raise
+                return self._existing_result(session, existing, fingerprint)
+
+    def _request(
+        self,
+        session: Session,
+        organization_id: str,
+        idempotency_key: str,
+        *,
+        lock: bool,
+    ) -> OperationRequestModel | None:
+        statement = select(OperationRequestModel).where(
+            OperationRequestModel.organization_id == organization_id,
+            OperationRequestModel.operation == self.OPERATION,
+            OperationRequestModel.idempotency_key == idempotency_key,
+        )
+        if lock:
+            statement = statement.with_for_update()
+        return session.scalar(statement)
+
+    def _existing_result(
+        self,
+        session: Session,
+        request: OperationRequestModel,
+        fingerprint: str,
+    ) -> tuple[EventModel, bool]:
+        if request.request_fingerprint != fingerprint:
+            raise StateConflict(
+                "This idempotency key was already used for another kit checkout."
+            )
+        if request.status != "completed" or not request.resource_id:
+            raise StateConflict("This kit checkout is still being processed.")
+        event = session.scalar(
+            select(EventModel).where(
+                EventModel.id == request.resource_id,
+                EventModel.organization_id == request.organization_id,
+            )
+        )
+        if event is None:
+            raise StateConflict("The completed kit checkout event is unavailable.")
+        return event, False
+
+    def _legacy_result(
+        self,
+        session: Session,
+        organization_id: str,
+        idempotency_key: str,
+        source_id: str,
+    ) -> EventModel | None:
+        movement = session.scalar(
+            select(StockMovementModel).where(
+                StockMovementModel.organization_id == organization_id,
+                StockMovementModel.idempotency_key == f"kit:{idempotency_key}",
+            )
+        )
+        if movement is None:
+            return None
+        event = session.scalar(
+            select(EventModel).where(
+                EventModel.id == movement.event_id,
+                EventModel.organization_id == organization_id,
+            )
+        )
+        if event is None or event.data.get("source_id") != source_id:
+            raise StateConflict(
+                "This idempotency key was already used for another kit checkout."
+            )
+        return event

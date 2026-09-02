@@ -19,6 +19,8 @@ class EventRecord:
     start_time: str = "10:00"
     duration_minutes: int = 240
     location: str = ""
+    source_type: str = ""
+    source_id: str = ""
     status: str = "planning"
     organization_id: str = "salamandra"
     owner_id: str = ""
@@ -52,6 +54,8 @@ class EventRecord:
             "start_time": self.start_time,
             "duration_minutes": self.duration_minutes,
             "location": self.location,
+            "source_type": self.source_type,
+            "source_id": self.source_id,
             "status": self.status,
             "organization_id": self.organization_id,
             "owner_id": self.owner_id,
@@ -89,6 +93,8 @@ class EventRecord:
             start_time=data.get("start_time", "10:00"),
             duration_minutes=int(data.get("duration_minutes", 240)),
             location=data.get("location", ""),
+            source_type=data.get("source_type", ""),
+            source_id=data.get("source_id", ""),
             status=data.get("status", "planning"),
             organization_id=data.get("organization_id", "salamandra"),
             owner_id=data.get("owner_id", ""),
@@ -182,6 +188,21 @@ class EventMemory:
         if event is None or event.organization_id != organization_id:
             return None
         return event
+
+    def get_by_movement_key(
+        self,
+        idempotency_key: str,
+        organization_id: str,
+    ) -> EventRecord | None:
+        for event in self.events.values():
+            if event.organization_id != organization_id:
+                continue
+            if any(
+                movement.get("idempotency_key") == idempotency_key
+                for movement in event.movements
+            ):
+                return event
+        return None
 
     def list_events(self, organization_id: str | None = None) -> list[EventRecord]:
         events = self.events.values()

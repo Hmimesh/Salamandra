@@ -9,6 +9,7 @@ class Permission(StrEnum):
     INVENTORY_READ = "inventory.read"
     INVENTORY_PERSONAL_WRITE = "inventory.personal.write"
     INVENTORY_SHARED_WRITE = "inventory.shared.write"
+    INVENTORY_DEFINITION_MANAGE = "inventory.definition.manage"
     INVENTORY_EXPORT = "inventory.export"
     INVENTORY_IMPORT = "inventory.import"
     ITEM_CLASSES_MANAGE = "item_classes.manage"
@@ -46,6 +47,7 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
             Permission.INVENTORY_READ,
             Permission.INVENTORY_PERSONAL_WRITE,
             Permission.INVENTORY_SHARED_WRITE,
+            Permission.INVENTORY_DEFINITION_MANAGE,
             Permission.INVENTORY_EXPORT,
             Permission.INVENTORY_IMPORT,
             Permission.EVENTS_PLAN,

@@ -19,9 +19,10 @@ if str(SRC) not in sys.path:
 
 from accounts import AccountStore
 from event_memory import EventMemory, EventRecord
+from event_templates import Kit, TemplateCatalog
 from integrations import IntegrationStore
 from inventory_workspace import InventoryWorkspace
-from Item_node import ItemNode, ItemType
+from Item_node import ItemNode, ItemType, Requirement
 from item_classes import ItemClassCatalog
 from server import SalamandraServer
 
@@ -150,7 +151,10 @@ class TestSecurityPhaseOne(unittest.TestCase):
                 ("/api/item-classes/remove", {"class_id": "class"}),
                 ("/api/events/plan", {"items": [{"item_id": "speaker", "amount": 1}]}),
                 ("/api/events/template", {"source_type": "template", "source_id": "conference-basic"}),
-                ("/api/events/use", {"items": [{"item_id": "speaker", "amount": 1}]}),
+                (
+                    "/api/kits/checkout",
+                    {"source_id": "speech-kit", "idempotency_key": "unauthorized-kit"},
+                ),
                 ("/api/events/describe", {"description": "Small event"}),
                 ("/api/events/save", {"description": "Small event"}),
                 ("/api/integrations/configure", {"integration_id": "crm", "endpoint": "https://example.com"}),
@@ -279,7 +283,7 @@ class TestSecurityPhaseOne(unittest.TestCase):
             app.handler.memory.add(victim)
             cookie = app.sign_in("owner-a@example.test", "owner-a-password")
 
-            status, _, _ = app.request(
+            status, payload, _ = app.request(
                 "POST",
                 "/api/events/save",
                 {
@@ -292,7 +296,15 @@ class TestSecurityPhaseOne(unittest.TestCase):
                 cookie,
             )
 
-            self.assertIn(status, {403, 404})
+            self.assertEqual(status, 400)
+            self.assertEqual(
+                payload,
+                {
+                    "error": (
+                        "Client-selected event IDs are not accepted for event creation."
+                    )
+                },
+            )
             stored = app.handler.memory.get("org-b-event")
             self.assertEqual(stored.organization_id, "org-b")
             self.assertEqual(stored.title, "B event")
@@ -398,6 +410,148 @@ class TestSecurityPhaseOne(unittest.TestCase):
             item = inventory.get_item("dispatch mic")
             self.assertEqual((first, second), (200, 200))
             self.assertEqual((item.count, item.in_use_count), (1, 1))
+
+    def test_concurrent_duplicate_dispatch_moves_inventory_once(self):
+        with ServerHarness() as app:
+            inventory = app.handler.workspace.inventory_for(
+                "shared", app.owner_a.id, "org-a"
+            )
+            inventory.add_item(ItemNode("race dispatch mic", ItemType.MIC), amount=2)
+            app.handler.workspace.save()
+            event = EventRecord(
+                id="concurrent-packed-event",
+                title="Concurrent packed event",
+                description="Ready",
+                start_date="2026-09-10",
+                organization_id="org-a",
+                owner_id=app.owner_a.id,
+                status="packed",
+                plan={
+                    "lines": [
+                        {"item_id": "race dispatch mic", "amount": 1, "missing": 0}
+                    ]
+                },
+            )
+            app.handler.memory.add(event)
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+            start = threading.Barrier(3)
+            mutation_race = threading.Barrier(2)
+            results: list[tuple[int, dict[str, Any]]] = []
+            original_apply = app.handler.workspace.apply_scope_allocations
+
+            def apply_after_both_requests_validate(*args, **kwargs):
+                try:
+                    mutation_race.wait(timeout=0.5)
+                except threading.BrokenBarrierError:
+                    pass
+                return original_apply(*args, **kwargs)
+
+            app.handler.workspace.apply_scope_allocations = (
+                apply_after_both_requests_validate
+            )
+
+            def dispatch():
+                start.wait(timeout=5)
+                status, payload, _ = app.request(
+                    "POST",
+                    "/api/events/status",
+                    {"event_id": event.id, "status": "out"},
+                    cookie,
+                )
+                results.append((status, payload))
+
+            threads = [threading.Thread(target=dispatch) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            start.wait(timeout=5)
+            for thread in threads:
+                thread.join(timeout=5)
+
+            stored = app.handler.memory.get(event.id)
+            item = inventory.get_item("race dispatch mic")
+            dispatch_movements = [
+                movement
+                for movement in stored.movements
+                if movement.get("action") == "dispatch"
+            ]
+            self.assertEqual(sorted(status for status, _ in results), [200, 200])
+            self.assertEqual((item.count, item.in_use_count), (1, 1))
+            self.assertEqual(stored.status, "out")
+            self.assertEqual(len(dispatch_movements), 1)
+
+    def test_duplicate_kit_checkout_creates_one_event_and_movement(self):
+        with ServerHarness() as app:
+            app.handler.templates = TemplateCatalog(
+                kits=[
+                    Kit(
+                        id="test-kit",
+                        name="Test Kit",
+                        category="test",
+                        description="One authoritative test item.",
+                        items=(Requirement("kit checkout item", 1),),
+                    )
+                ]
+            )
+            inventory = app.handler.workspace.inventory_for(
+                "shared", app.owner_a.id, "org-a"
+            )
+            inventory.add_item(
+                ItemNode("kit checkout item", ItemType.OTHER), amount=2
+            )
+            app.handler.workspace.save()
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+            body = {
+                "source_id": "test-kit",
+                "idempotency_key": "checkout-request-1",
+            }
+
+            first_status, first_payload, _ = app.request(
+                "POST", "/api/kits/checkout", body, cookie
+            )
+            second_status, second_payload, _ = app.request(
+                "POST", "/api/kits/checkout", body, cookie
+            )
+
+            item = inventory.get_item("kit checkout item")
+            events = app.handler.memory.list_events("org-a")
+            dispatch_movements = [
+                movement
+                for event in events
+                for movement in event.movements
+                if movement.get("action") == "dispatch"
+            ]
+            self.assertEqual((first_status, second_status), (201, 200))
+            self.assertEqual(first_payload["event"]["id"], second_payload["event"]["id"])
+            self.assertEqual((item.count, item.in_use_count), (1, 1))
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].status, "out")
+            self.assertEqual(events[0].source_id, "test-kit")
+            self.assertEqual(len(dispatch_movements), 1)
+            self.assertEqual(
+                dispatch_movements[0]["idempotency_key"],
+                "kit:checkout-request-1",
+            )
+
+    def test_legacy_client_plan_checkout_is_removed(self):
+        with ServerHarness() as app:
+            inventory = app.handler.workspace.inventory_for(
+                "shared", app.owner_a.id, "org-a"
+            )
+            inventory.add_item(ItemNode("client supplied item", ItemType.OTHER), amount=2)
+            app.handler.workspace.save()
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+
+            status, _, _ = app.request(
+                "POST",
+                "/api/events/use",
+                {"items": [{"item_id": "client supplied item", "amount": 1}]},
+                cookie,
+            )
+
+            item = inventory.get_item("client supplied item")
+            self.assertEqual(status, 404)
+            self.assertEqual((item.count, item.in_use_count), (2, 0))
+            self.assertEqual(app.handler.memory.list_events("org-a"), [])
 
     def test_duplicate_return_restores_inventory_once(self):
         with ServerHarness() as app:

@@ -232,6 +232,8 @@ export interface EventRecord {
   start_time: string;
   duration_minutes: number;
   location: string;
+  source_type: string;
+  source_id: string;
   status: "planning" | "confirmed" | "packed" | "out" | "returned";
   organization_id: string;
   owner_id: string;

@@ -2,6 +2,10 @@
 
 In-house warehouse/event inventory manager.
 
+Private staging operators should use [the staging runbook](docs/STAGING_RUNBOOK.md)
+and [staging checklist](docs/STAGING_CHECKLIST.md). The safe environment-variable
+inventory is in `config/staging.env.example`.
+
 ## Run Local GUI
 
 Build the React/TypeScript client:
@@ -32,15 +36,16 @@ Then open:
 http://127.0.0.1:8000
 ```
 
-Workspace inventory is saved to `docs/inventories.json`; organization-owned item classes are saved to `docs/item_classes.json`.
+In explicit demo mode, workspace inventory is saved to `docs/inventories.json` and
+organization-owned item classes are saved to `docs/item_classes.json`.
 
 Demo users have generated, non-documented passwords and cannot use password sign-in.
 Use the **Open demo workspace** action only while explicit demo mode is enabled.
 
 New workspace data is saved to `docs/inventories.json`, with shared inventory and per-account personal inventory.
 
-The JSON server is retained for local compatibility during the database migration and
-must not be exposed as a production multi-user service.
+The JSON compatibility runtime must not be exposed as a production multi-user service. Outside
+demo mode, it requires the explicit `SALAMANDRA_ALLOW_JSON_DEV=1` switch.
 
 ## PostgreSQL Transactional Core
 
@@ -57,6 +62,17 @@ files. The PostgreSQL model records available, reserved, packed, and dispatched 
 separately and enforces tenant ownership, non-negative quantities, legal event states,
 idempotent movement keys, and same-organization foreign keys.
 
+Start the production persistence path with the same database URL:
+
+```powershell
+$env:SALAMANDRA_DATABASE_URL="postgresql+psycopg://salamandra:password@127.0.0.1/salamandra"
+.\.venv\Scripts\python.exe src/server.py
+```
+
+This runtime uses database-backed accounts, sessions, organizations, inventory, events,
+allocations, movements, item classes, integrations, and preferences. It does not write normal
+application mutations to the JSON stores.
+
 ## Event Operations
 
 Use the planner in the local GUI to choose an event item, event template, or kit. Salamandra expands requirements, checks shared and personal stock, shows dated conflicts against saved events, and only allocates items that exist in inventory.
@@ -69,7 +85,8 @@ Inventory operators can create and edit equipment, set model quality and handlin
 
 - `frontend/` contains the React and TypeScript application source.
 - `src/` contains reusable warehouse, account, event, and planning logic.
-- `src/server.py` exposes the local JSON API and serves the production frontend.
+- `src/server.py` selects the PostgreSQL production runtime or explicit local compatibility mode
+  and serves the production frontend.
 - `web/` contains the generated production bundle.
 - `tests/` contains Python unit tests for inventory, planning, accounts, organizations, and event operations.
 

@@ -54,6 +54,7 @@ class InventoryWorkspace:
         scope: str,
         user_id: str | None,
         organization_id: str = "salamandra",
+        **_operation_context: Any,
     ):
         return self.inventory_for(scope, user_id, organization_id).add_item(
             item,
@@ -67,6 +68,7 @@ class InventoryWorkspace:
         user_id: str | None,
         amount: int | None = None,
         organization_id: str = "salamandra",
+        **_operation_context: Any,
     ):
         return self.inventory_for(scope, user_id, organization_id).add_from_preset(
             preset,
@@ -80,6 +82,7 @@ class InventoryWorkspace:
         scope: str,
         user_id: str | None,
         organization_id: str = "salamandra",
+        **_operation_context: Any,
     ) -> bool:
         return self.inventory_for(scope, user_id, organization_id).use_item(item_id, amount)
 
@@ -100,6 +103,7 @@ class InventoryWorkspace:
         scope: str,
         user_id: str | None,
         organization_id: str = "salamandra",
+        **_operation_context: Any,
     ) -> bool:
         return self.inventory_for(scope, user_id, organization_id).remove_item(item_id, amount)
 
@@ -110,11 +114,24 @@ class InventoryWorkspace:
         scope: str,
         user_id: str | None,
         organization_id: str = "salamandra",
+        **_operation_context: Any,
     ) -> ItemNode:
         return self.inventory_for(scope, user_id, organization_id).update_item(
             item_id,
             updated_item,
         )
+
+    def replace_items(
+        self,
+        items: list[ItemNode],
+        scope: str,
+        user_id: str | None,
+        organization_id: str,
+        **_operation_context: Any,
+    ):
+        inventory = self.inventory_for(scope, user_id, organization_id)
+        for item in items:
+            inventory.items[item.id] = item
 
     def use_from_available_scopes(
         self,

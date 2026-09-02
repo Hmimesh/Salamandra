@@ -3,18 +3,25 @@ import { useState } from "react";
 import { Modal, PageHeader } from "../components/ui";
 import { useWorkspace } from "../context/WorkspaceContext";
 import { titleCase } from "../lib/format";
-import type { EventPlan, EventTemplate, StateEnvelope } from "../types";
+import type { EventPlan, EventRecord, EventTemplate, StateEnvelope } from "../types";
+
+type SelectedPlan = {
+  source: EventTemplate;
+  type: "kit" | "template";
+  plan: EventPlan;
+  checkoutKey: string;
+};
 
 export function KitsPage() {
   const { state, mutate } = useWorkspace();
   const [tab, setTab] = useState<"kits" | "templates">("kits");
-  const [selected, setSelected] = useState<{ source: EventTemplate; type: "kit" | "template"; plan: EventPlan } | null>(null);
+  const [selected, setSelected] = useState<SelectedPlan | null>(null);
   const sources = tab === "kits" ? state!.templates.kits : state!.templates.templates;
 
   async function preview(source: EventTemplate, type: "kit" | "template") {
     try {
       const response = await mutate<StateEnvelope & { plan: EventPlan }>("/api/events/template", { source_type: type, source_id: source.id });
-      setSelected({ source, type, plan: response.plan });
+      setSelected({ source, type, plan: response.plan, checkoutKey: crypto.randomUUID() });
     } catch {
       // The workspace provider reports the API message.
     }
@@ -23,7 +30,7 @@ export function KitsPage() {
   async function reserve() {
     if (!selected) return;
     try {
-      const response = await mutate<StateEnvelope & { plan: EventPlan }>("/api/events/use", { items: selected.plan.requested_items }, { success: `${selected.source.name} checked out from inventory.` });
+      const response = await mutate<StateEnvelope & { event: EventRecord; plan: EventPlan }>("/api/kits/checkout", { source_id: selected.source.id, idempotency_key: selected.checkoutKey }, { success: `${selected.source.name} checked out from inventory.` });
       setSelected({ ...selected, plan: response.plan });
     } catch {
       // The workspace provider reports the API message.
@@ -43,7 +50,7 @@ export function KitsPage() {
       </section>
 
       <Modal open={Boolean(selected)} title={selected?.source.name || "Equipment plan"} description={selected?.source.description} onClose={() => setSelected(null)} size="lg">
-        {selected ? <div className="kit-plan"><div className={`plan-readiness-banner ${selected.plan.is_ready ? "ready" : "blocked"}`}>{selected.plan.is_ready ? <CheckCircle2 size={22} /> : <ShieldAlert size={22} />}<div><strong>{selected.plan.is_ready ? "Ready from current inventory" : `${selected.plan.total_missing} items missing`}</strong><span>{selected.plan.is_ready ? "Every line is available after active reservations." : "Resolve the missing stock before checking out this package."}</span></div></div><div className="plan-lines plan-lines-bordered">{selected.plan.lines.map((line) => <div key={line.item_id}><span><strong>{line.amount}x {titleCase(line.item_id)}</strong><small>{titleCase(line.type || line.capability)} · {line.source === "event" ? "Package item" : `Required by ${titleCase(line.source)}`}</small></span><span className={line.missing ? "line-missing" : "line-ready"}>{line.missing ? `${line.missing} missing` : `${line.available - line.reserved_elsewhere} free`}</span></div>)}</div><div className="modal-actions"><button className="button button-secondary" onClick={() => setSelected(null)}>Close</button><button className="button button-primary" disabled={!selected.plan.is_ready} onClick={() => void reserve()}><PackageCheck size={17} />Check out kit</button></div></div> : null}
+        {selected ? <div className="kit-plan"><div className={`plan-readiness-banner ${selected.plan.is_ready ? "ready" : "blocked"}`}>{selected.plan.is_ready ? <CheckCircle2 size={22} /> : <ShieldAlert size={22} />}<div><strong>{selected.plan.is_ready ? "Ready from current inventory" : `${selected.plan.total_missing} items missing`}</strong><span>{selected.plan.is_ready ? "Every line is available after active reservations." : "Resolve the missing stock before checking out this package."}</span></div></div><div className="plan-lines plan-lines-bordered">{selected.plan.lines.map((line) => <div key={line.item_id}><span><strong>{line.amount}x {titleCase(line.item_id)}</strong><small>{titleCase(line.type || line.capability)} · {line.source === "event" ? "Package item" : `Required by ${titleCase(line.source)}`}</small></span><span className={line.missing ? "line-missing" : "line-ready"}>{line.missing ? `${line.missing} missing` : `${line.available - line.reserved_elsewhere} free`}</span></div>)}</div><div className="modal-actions"><button className="button button-secondary" onClick={() => setSelected(null)}>Close</button>{selected.type === "kit" ? <button className="button button-primary" disabled={!selected.plan.is_ready} onClick={() => void reserve()}><PackageCheck size={17} />Check out kit</button> : null}</div></div> : null}
       </Modal>
     </div>
   );

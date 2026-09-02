@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import csv
+import email.utils
 import io
+import ipaddress
 import json
+import logging
 import mimetypes
 import os
 import secrets
+import threading
 import time
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -34,6 +38,9 @@ from security import (
     require_permission,
     validate_assignable_role,
 )
+from operational_logging import configure_logging, log_event
+from readiness import DatabaseReadiness, ReadinessResult
+from web_config import ConfigurationError, WebConfig, normalize_host, normalize_origin
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -46,6 +53,8 @@ USERS_PATH = DOCS_DIR / "users.json"
 ITEM_CLASSES_PATH = DOCS_DIR / "item_classes.json"
 INTEGRATIONS_PATH = DOCS_DIR / "integrations.json"
 MAX_JSON_BODY_BYTES = 1_000_000
+LOGGER = logging.getLogger(__name__)
+LOGGER.addHandler(logging.NullHandler())
 
 
 class SalamandraServer(BaseHTTPRequestHandler):
@@ -58,17 +67,67 @@ class SalamandraServer(BaseHTTPRequestHandler):
     integrations = IntegrationStore(INTEGRATIONS_PATH)
     sessions: dict[str, dict[str, float | str]] = {}
     login_attempts: dict[str, list[float]] = {}
+    operation_lock = threading.RLock()
+    database_runtime = None
+    readiness_probe = None
+    web_config = WebConfig.local_default()
 
     def do_GET(self):
+        parsed_url = urlparse(self.path)
         try:
+            self.validate_request_host()
+            self.validate_request_origin(require=False)
             self._do_GET()
         except ApiError as error:
+            self.log_api_error(error, parsed_url.path)
             self.send_json_error(str(error), error.status)
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             self.send_json_error(str(error) or "Request is invalid.", HTTPStatus.BAD_REQUEST)
+        except Exception:
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "unexpected_server_error",
+                request_id=self.correlation_id(),
+                action=parsed_url.path,
+                result="error",
+            )
+            LOGGER.exception("Unhandled Salamandra GET error")
+            self.send_json_error(
+                "Salamandra could not complete that request.",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def _do_GET(self):
         parsed_url = urlparse(self.path)
+
+        if parsed_url.path == "/health":
+            self.send_json({"status": "ok"})
+            return
+
+        if parsed_url.path == "/ready":
+            result = (
+                self.readiness_probe.check()
+                if self.readiness_probe is not None
+                else ReadinessResult(False, "database_unavailable")
+            )
+            if not result.ready:
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    "readiness_failed",
+                    request_id=self.correlation_id(),
+                    action="readiness",
+                    result=result.code,
+                )
+                self.send_json(
+                    {"status": "not_ready"},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
+            self.send_json({"status": "ready"})
+            return
+
         user = self.current_user()
 
         if parsed_url.path == "/api/state":
@@ -115,7 +174,8 @@ class SalamandraServer(BaseHTTPRequestHandler):
         parsed_url = urlparse(self.path)
 
         try:
-            self.validate_request_origin()
+            self.validate_request_host()
+            self.validate_request_origin(require=self.web_config.production_like)
             body = self.read_json_body()
 
             if parsed_url.path == "/api/auth/signin":
@@ -135,25 +195,33 @@ class SalamandraServer(BaseHTTPRequestHandler):
             if parsed_url.path == "/api/inventory/items":
                 scope = self.authorized_inventory_scope(body, user)
                 item = self.create_item_from_body(body)
+                operation_key = self.operation_request_id(body)
                 stored_item = self.workspace.add_item(
                     item,
                     amount=item.count,
                     scope=scope,
                     user_id=user.id,
                     organization_id=user.organization_id,
+                    request_id=operation_key,
+                    reason_code="stock_received",
+                    reason=str(body.get("reason", "Inventory received.")),
+                    source="inventory_ui",
                 )
                 self.save_workspace()
                 self.send_json({"item": stored_item.to_dict(), "state": self.state_payload(user)})
                 return
 
             if parsed_url.path == "/api/inventory/items/update":
+                require_permission(user.role, Permission.INVENTORY_DEFINITION_MANAGE)
                 scope = self.authorized_inventory_scope(body, user)
+                operation_key = self.operation_request_id(body)
                 updated_item = self.workspace.update_item(
                     body.get("original_id", body.get("id", "")),
                     self.create_item_from_body(body),
                     scope=scope,
                     user_id=user.id,
                     organization_id=user.organization_id,
+                    request_id=operation_key,
                 )
                 self.save_workspace()
                 self.send_json(
@@ -220,6 +288,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
                     user_id=user.id,
                     amount=self.optional_int(body.get("amount")),
                     organization_id=user.organization_id,
+                    request_id=self.operation_request_id(body),
                 )
                 self.save_workspace()
                 self.send_json({"item": stored_item.to_dict(), "state": self.state_payload(user)})
@@ -227,6 +296,10 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
             if parsed_url.path == "/api/inventory/use":
                 scope = self.authorized_inventory_scope(body, user)
+                if self.database_runtime is not None:
+                    raise StateConflict(
+                        "Direct inventory checkout is disabled. Dispatch an event or kit instead."
+                    )
                 if not self.workspace.use_item(
                     body.get("item_id", ""),
                     self.required_amount(body),
@@ -242,6 +315,10 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
             if parsed_url.path == "/api/inventory/return":
                 scope = self.authorized_inventory_scope(body, user)
+                if self.database_runtime is not None:
+                    raise StateConflict(
+                        "Direct inventory return is disabled. Return the source event instead."
+                    )
                 if not self.workspace.return_item(
                     body.get("item_id", ""),
                     self.required_amount(body),
@@ -263,6 +340,10 @@ class SalamandraServer(BaseHTTPRequestHandler):
                     scope,
                     user.id,
                     user.organization_id,
+                    request_id=self.operation_request_id(body),
+                    reason_code=str(body.get("reason_code", "stock_removed")),
+                    reason=str(body.get("reason", "Inventory removed.")),
+                    source="inventory_ui",
                 ):
                     self.send_json_error("Item was not found.", HTTPStatus.NOT_FOUND)
                     return
@@ -295,59 +376,79 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 )
                 return
 
-            if parsed_url.path == "/api/events/use":
-                require_permission(user.role, Permission.INVENTORY_SHARED_WRITE)
-                plan = self.build_event_plan(body, user)
-                if not plan.is_ready:
-                    raise ValueError("Cannot use event plan while stock is missing or conflicted.")
-                for line in plan.lines:
-                    self.workspace.use_from_available_scopes(
-                        user.id,
-                        line.item_id,
-                        line.amount,
-                        user.organization_id,
-                    )
-                self.save_workspace()
-                self.send_json({"plan": plan.to_dict(), "state": self.state_payload(user)})
+            if parsed_url.path == "/api/kits/checkout":
+                require_permission(user.role, Permission.OPERATIONS_DISPATCH)
+                event, created = self.checkout_kit(body, user)
+                self.send_json(
+                    {
+                        "event": event.to_dict(),
+                        "plan": event.plan,
+                        "state": self.state_payload(user),
+                    },
+                    HTTPStatus.CREATED if created else HTTPStatus.OK,
+                )
                 return
 
             if parsed_url.path == "/api/events/return":
                 require_permission(user.role, Permission.OPERATIONS_RETURN)
-                event = self.event_from_body(body, user)
-                changed = EventOperations(self.workspace).transition(event, "returned", user)
-                if changed:
-                    self.save_workspace()
-                self.memory.add(event)
+                if self.database_runtime is not None:
+                    event_id = self.required_identifier(body.get("event_id"), "event_id")
+                    event = self.database_runtime.transition(
+                        event_id,
+                        "returned",
+                        user,
+                        self.request_id(),
+                    )
+                else:
+                    with self.operation_lock:
+                        event = self.event_from_body(body, user)
+                        changed = EventOperations(self.workspace).transition(
+                            event, "returned", user
+                        )
+                        if changed:
+                            self.save_workspace()
+                        self.memory.add(event)
                 self.send_json({"event": event.to_dict(), "state": self.state_payload(user)})
                 return
 
             if parsed_url.path == "/api/events/checklist":
-                event = self.event_from_body(body, user)
                 phase = body.get("phase", "pack")
+                if phase not in {"pack", "return"}:
+                    raise ValueError("Checklist phase is not supported.")
                 if phase == "return":
                     require_permission(user.role, Permission.OPERATIONS_RETURN)
-                    if event.status != "out":
-                        raise StateConflict("Return checklist is available only after dispatch.")
                 else:
                     require_permission(user.role, Permission.OPERATIONS_PACK)
-                    if event.status not in {"confirmed"}:
-                        raise StateConflict("Packing checklist is available only for confirmed events.")
-                checklist = event.return_checklist if phase == "return" else event.checklist
                 item_id = self.required_identifier(body.get("item_id"), "item_id")
-                matched = False
-                for item in checklist:
-                    if item.get("item_id") == item_id:
-                        item["done"] = bool(body.get("done", True))
-                        matched = True
-                if not matched:
-                    raise ResourceNotFound("Checklist item was not found.")
-                event.add_history("checklist", user.id, f"{phase} checklist updated.")
-                self.memory.add(event)
+                if self.database_runtime is not None:
+                    event = self.database_runtime.update_checklist(
+                        self.required_identifier(body.get("event_id"), "event_id"),
+                        phase,
+                        item_id,
+                        bool(body.get("done", True)),
+                        user,
+                        self.request_id(),
+                    )
+                else:
+                    event = self.event_from_body(body, user)
+                    if phase == "return" and event.status != "out":
+                        raise StateConflict("Return checklist is available only after dispatch.")
+                    if phase == "pack" and event.status != "confirmed":
+                        raise StateConflict("Packing checklist is available only for confirmed events.")
+                    checklist = event.return_checklist if phase == "return" else event.checklist
+                    matched = False
+                    for item in checklist:
+                        if item.get("item_id") == item_id:
+                            item["done"] = bool(body.get("done", True))
+                            matched = True
+                    if not matched:
+                        raise ResourceNotFound("Checklist item was not found.")
+                    event.add_history("checklist", user.id, f"{phase} checklist updated.")
+                    self.memory.add(event)
                 self.send_json({"event": event.to_dict(), "state": self.state_payload(user)})
                 return
 
             if parsed_url.path == "/api/events/status":
-                event = self.event_from_body(body, user)
                 next_status = str(body.get("status", "")).strip().lower()
                 transition_permissions = {
                     "confirmed": Permission.EVENTS_UPDATE,
@@ -359,11 +460,24 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 if permission is None:
                     raise ValueError("Event status is not supported.")
                 require_permission(user.role, permission)
-                changed = EventOperations(self.workspace).transition(event, next_status, user)
-                if changed:
-                    if next_status in {"out", "returned"}:
-                        self.save_workspace()
-                    self.memory.add(event)
+                if self.database_runtime is not None:
+                    event_id = self.required_identifier(body.get("event_id"), "event_id")
+                    event = self.database_runtime.transition(
+                        event_id,
+                        next_status,
+                        user,
+                        self.request_id(),
+                    )
+                else:
+                    with self.operation_lock:
+                        event = self.event_from_body(body, user)
+                        changed = EventOperations(self.workspace).transition(
+                            event, next_status, user
+                        )
+                        if changed:
+                            if next_status in {"out", "returned"}:
+                                self.save_workspace()
+                            self.memory.add(event)
                 self.send_json({"event": event.to_dict(), "state": self.state_payload(user)})
                 return
 
@@ -478,20 +592,53 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
             self.send_json_error("Endpoint was not found.", HTTPStatus.NOT_FOUND)
         except ApiError as error:
+            self.log_api_error(error, parsed_url.path)
             self.send_json_error(str(error), error.status)
         except ValueError as error:
             self.send_json_error(str(error), HTTPStatus.BAD_REQUEST)
         except (json.JSONDecodeError, TypeError, KeyError):
             self.send_json_error("Request body must be valid JSON.", HTTPStatus.BAD_REQUEST)
         except Exception:
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "unexpected_server_error",
+                request_id=self.correlation_id(),
+                actor_id=getattr(getattr(self, "_request_actor", None), "id", None),
+                organization_id=getattr(
+                    getattr(self, "_request_actor", None), "organization_id", None
+                ),
+                action=parsed_url.path,
+                result="error",
+            )
+            LOGGER.exception("Unhandled Salamandra API error")
             self.send_json_error("Salamandra could not complete that request.", HTTPStatus.INTERNAL_SERVER_ERROR)
+
+    def do_OPTIONS(self):
+        try:
+            self.validate_request_host()
+            self.validate_request_origin(require=True)
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self.send_security_headers()
+            self.send_cors_headers()
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, Idempotency-Key, X-Request-ID",
+            )
+            self.send_header("Access-Control-Max-Age", "600")
+            self.send_header("X-Request-ID", self.correlation_id())
+            self.end_headers()
+        except ApiError as error:
+            self.log_api_error(error, urlparse(self.path).path)
+            self.send_json_error(str(error), error.status)
 
     def handle_sign_in(self, body: dict):
         email = body.get("email", "")
         password = body.get("password", "")
         if not isinstance(email, str) or not isinstance(password, str):
             raise ValueError("Email and password must be strings.")
-        attempt_key = f"{self.client_address[0]}:{email.strip().lower()}"
+        attempt_key = f"{self.client_ip()}:{email.strip().lower()}"
         cutoff = time.time() - 300
         attempts = [
             attempt
@@ -499,15 +646,41 @@ class SalamandraServer(BaseHTTPRequestHandler):
             if attempt >= cutoff
         ]
         if len(attempts) >= 5:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "authentication_throttled",
+                request_id=self.correlation_id(),
+                action="signin",
+                result="throttled",
+            )
             raise ApiError("Too many sign-in attempts. Try again later.", 429)
         user = self.accounts.authenticate(email, password)
         if user is None:
             attempts.append(time.time())
             self.login_attempts[attempt_key] = attempts
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "authentication_failed",
+                request_id=self.correlation_id(),
+                action="signin",
+                result="denied",
+            )
             self.send_json_error("Email or password is incorrect.", HTTPStatus.UNAUTHORIZED)
             return
 
         self.login_attempts.pop(attempt_key, None)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "authentication_succeeded",
+            request_id=self.correlation_id(),
+            actor_id=user.id,
+            organization_id=user.organization_id,
+            action="signin",
+            result="success",
+        )
         self.create_session(user)
 
     def handle_demo_sign_in(self):
@@ -520,32 +693,56 @@ class SalamandraServer(BaseHTTPRequestHandler):
         self.create_session(user)
 
     def create_session(self, user: UserAccount):
-        token = secrets.token_urlsafe(32)
-        max_age = 43_200
-        self.sessions[token] = {
-            "user_id": user.id,
-            "expires_at": time.time() + max_age,
-        }
-        secure = "; Secure" if os.environ.get("SALAMANDRA_COOKIE_SECURE") == "1" else ""
+        max_age = self.web_config.session_max_age_seconds
+        if self.database_runtime is not None:
+            token = self.database_runtime.create_session(user, max_age)
+        else:
+            token = secrets.token_urlsafe(32)
+            self.sessions[token] = {
+                "user_id": user.id,
+                "expires_at": time.time() + max_age,
+            }
+        secure = "; Secure" if self.web_config.secure_cookie else ""
+        expires = email.utils.formatdate(time.time() + max_age, usegmt=True)
         self.send_json(
             {"state": self.state_payload(user)},
             headers={
                 "Set-Cookie": (
                     f"salamandra_session={token}; Path=/; HttpOnly; SameSite=Lax; "
-                    f"Max-Age={max_age}{secure}"
+                    f"Max-Age={max_age}; Expires={expires}{secure}"
                 )
             },
         )
 
     def handle_sign_out(self):
+        user = self.current_user()
+        if user is not None:
+            self._request_actor = user
         token = self.session_token()
         if token:
-            self.sessions.pop(token, None)
+            if self.database_runtime is not None:
+                self.database_runtime.revoke_session(token)
+            else:
+                self.sessions.pop(token, None)
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "session_revoked",
+                request_id=self.correlation_id(),
+                actor_id=getattr(getattr(self, "_request_actor", None), "id", None),
+                organization_id=getattr(
+                    getattr(self, "_request_actor", None), "organization_id", None
+                ),
+                action="signout",
+                result="success",
+            )
+        secure = "; Secure" if self.web_config.secure_cookie else ""
         self.send_json(
             {"state": self.state_payload(None)},
             headers={
                 "Set-Cookie": (
-                    "salamandra_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax"
+                    "salamandra_session=; Path=/; HttpOnly; Max-Age=0; "
+                    f"Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax{secure}"
                 )
             },
         )
@@ -643,6 +840,103 @@ class SalamandraServer(BaseHTTPRequestHandler):
             raise ResourceNotFound("Event was not found.")
         return event
 
+    def checkout_kit(
+        self,
+        body: dict,
+        user: UserAccount,
+    ) -> tuple[EventRecord, bool]:
+        source_id = self.required_identifier(body.get("source_id"), "source_id")
+        request_key = self.required_idempotency_key(body.get("idempotency_key"))
+        movement_key = f"kit:{request_key}"
+
+        if self.database_runtime is not None:
+            def build_authoritative_event() -> dict:
+                source = self.templates.get_kit(source_id)
+                if source is None:
+                    raise ResourceNotFound("Kit was not found.")
+                plan = self.build_event_plan(
+                    {"items": [item.to_dict() for item in source.items]},
+                    user,
+                )
+                if not plan.is_ready:
+                    raise StateConflict(
+                        "Cannot check out this kit while stock is missing or conflicted."
+                    )
+                event = EventRecord(
+                    title=f"{source.name} checkout",
+                    description=f"Manual checkout of the {source.name} kit.",
+                    start_date=time.strftime("%Y-%m-%d"),
+                    source_type="kit",
+                    source_id=source.id,
+                    organization_id=user.organization_id,
+                    owner_id=user.id,
+                    assigned_user_ids=[user.id],
+                    requested_items=list(source.items),
+                    plan=plan.to_dict(),
+                )
+                event.prepare_operations(user.id)
+                return event.to_dict()
+
+            return self.database_runtime.checkout_kit(
+                source_id,
+                request_key,
+                user,
+                self.request_id(),
+                build_authoritative_event,
+            )
+
+        with self.operation_lock:
+            existing = self.memory.get_by_movement_key(
+                movement_key,
+                user.organization_id,
+            )
+            if existing is not None:
+                if existing.source_type != "kit" or existing.source_id != source_id:
+                    raise StateConflict(
+                        "This idempotency key was already used for another checkout."
+                    )
+                return existing, False
+
+            source = self.templates.get_kit(source_id)
+            if source is None:
+                raise ResourceNotFound("Kit was not found.")
+            plan = self.build_event_plan(
+                {"items": [item.to_dict() for item in source.items]},
+                user,
+            )
+            if not plan.is_ready:
+                raise StateConflict(
+                    "Cannot check out this kit while stock is missing or conflicted."
+                )
+
+            event = EventRecord(
+                title=f"{source.name} checkout",
+                description=f"Manual checkout of the {source.name} kit.",
+                start_date=time.strftime("%Y-%m-%d"),
+                source_type="kit",
+                source_id=source.id,
+                organization_id=user.organization_id,
+                owner_id=user.id,
+                assigned_user_ids=[user.id],
+                requested_items=list(source.items),
+                plan=plan.to_dict(),
+            )
+            event.prepare_operations(user.id)
+            operations = EventOperations(self.workspace)
+            operations.transition(event, "confirmed", user)
+            for item in event.checklist:
+                item["done"] = True
+            operations.transition(event, "packed", user)
+            operations.transition(
+                event,
+                "out",
+                user,
+                idempotency_key=movement_key,
+            )
+            self.memory.add(event)
+            self.save_workspace()
+            return event, True
+
     def create_event_from_request(
         self,
         body: dict,
@@ -653,16 +947,15 @@ class SalamandraServer(BaseHTTPRequestHandler):
             raise ValueError("Event data must be an object.")
         client_event = client_event or {}
 
-        supplied_id = client_event.get("id")
-        if supplied_id not in (None, ""):
-            supplied_id = self.required_identifier(supplied_id, "event.id")
-            existing = self.memory.get(supplied_id)
-            if existing is not None and existing.organization_id != user.organization_id:
-                raise ResourceNotFound("Event was not found.")
-            if existing is not None:
-                raise StateConflict(
-                    "Existing events must be changed through an explicit event action."
-                )
+        supplied_ids = (
+            body.get("id"),
+            body.get("event_id"),
+            client_event.get("id"),
+        )
+        if any(value not in (None, "") for value in supplied_ids):
+            raise ValueError(
+                "Client-selected event IDs are not accepted for event creation."
+            )
 
         description = body.get("description", client_event.get("description", ""))
         if not isinstance(description, str) or not description.strip():
@@ -764,11 +1057,15 @@ class SalamandraServer(BaseHTTPRequestHandler):
             if user
             else []
         )
-        active_user_ids = {
-            str(session.get("user_id", ""))
-            for session in self.sessions.values()
-            if float(session.get("expires_at", 0)) > time.time()
-        }
+        active_user_ids = (
+            self.database_runtime.active_user_ids(user.organization_id)
+            if self.database_runtime is not None
+            else {
+                str(session.get("user_id", ""))
+                for session in self.sessions.values()
+                if float(session.get("expires_at", 0)) > time.time()
+            }
+        )
         auth_payload = {
             "authenticated": user is not None,
             "user": user.to_public_dict() if user else None,
@@ -974,8 +1271,11 @@ class SalamandraServer(BaseHTTPRequestHandler):
     def apply_allocation_updates(self, event: EventRecord, user: UserAccount):
         updates = list(event.plan.get("allocation_updates", []))
         for update in updates:
-            affected = self.memory.get(update.get("event_id", ""))
-            if affected is None or affected.organization_id != user.organization_id:
+            affected = self.memory.get_for_organization(
+                update.get("event_id", ""),
+                user.organization_id,
+            )
+            if affected is None:
                 continue
             if affected.status not in {"planning", "confirmed"}:
                 continue
@@ -988,7 +1288,17 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 user.id,
                 f"Gear rebalanced after approving overlapping event {event.title}.",
             )
-            self.memory.add(affected)
+            if self.database_runtime is not None:
+                if affected.status != "planning":
+                    continue
+                self.database_runtime.update_planning_plan(
+                    affected,
+                    user,
+                    self.request_id(),
+                    f"Gear rebalanced after approving overlapping event {event.title}.",
+                )
+            else:
+                self.memory.add(affected)
         event.plan["allocation_updates"] = []
 
     def export_inventory_csv(self, user: UserAccount):
@@ -1096,8 +1406,16 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
         if not staged:
             raise ValueError("The CSV did not contain any inventory rows.")
-        for item in staged:
-            inventory.items[item.id] = item
+        self.workspace.replace_items(
+            staged,
+            scope,
+            user.id,
+            user.organization_id,
+            request_id=self.operation_request_id(body),
+            reason_code=str(body.get("reason_code", "csv_reconciliation")),
+            reason=str(body.get("reason", "Inventory reconciled from CSV.")),
+            source="csv_import",
+        )
         self.save_workspace()
         self.integrations.record_transfer(user.organization_id, "imported")
         return len(staged)
@@ -1106,19 +1424,30 @@ class SalamandraServer(BaseHTTPRequestHandler):
         token = self.session_token()
         if not token:
             return None
+        if self.database_runtime is not None:
+            user = self.database_runtime.current_user(token)
+            if user is None:
+                self.log_invalid_session()
+            return user
         session = self.sessions.get(token)
         if not session:
+            self.log_invalid_session()
             return None
         if float(session.get("expires_at", 0)) <= time.time():
             self.sessions.pop(token, None)
+            self.log_invalid_session()
             return None
         user_id = str(session.get("user_id", ""))
-        return self.accounts.get(user_id) if user_id else None
+        user = self.accounts.get(user_id) if user_id else None
+        if user is None:
+            self.log_invalid_session()
+        return user
 
     def require_user(self) -> UserAccount:
         user = self.current_user()
         if user is None:
             raise AuthenticationRequired()
+        self._request_actor = user
         return user
 
     def session_token(self) -> str:
@@ -1185,6 +1514,8 @@ class SalamandraServer(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded_payload)))
         self.send_header("Cache-Control", "no-store")
         self.send_security_headers()
+        self.send_cors_headers()
+        self.send_header("X-Request-ID", self.correlation_id())
         for header, value in (headers or {}).items():
             self.send_header(header, value)
         self.end_headers()
@@ -1212,19 +1543,127 @@ class SalamandraServer(BaseHTTPRequestHandler):
             raise ValueError(f"{field_name} is invalid.")
         return normalized
 
-    def validate_request_origin(self):
-        origin = self.headers.get("Origin", "").rstrip("/")
-        if not origin:
+    def required_idempotency_key(self, value) -> str:
+        if not isinstance(value, str):
+            raise ValueError("idempotency_key must be a string.")
+        normalized = value.strip()
+        if (
+            not normalized
+            or len(normalized) > 160
+            or any(ord(character) < 33 or ord(character) > 126 for character in normalized)
+        ):
+            raise ValueError("idempotency_key is invalid.")
+        return normalized
+
+    def request_id(self) -> str:
+        supplied = self.headers.get("Idempotency-Key", "").strip()
+        if supplied:
+            return self.required_idempotency_key(supplied)
+        return secrets.token_urlsafe(18)
+
+    def correlation_id(self) -> str:
+        cached = getattr(self, "_correlation_id", "")
+        if cached:
+            return cached
+        supplied = self.headers.get("X-Request-ID", "").strip()
+        if (
+            supplied
+            and len(supplied) <= 128
+            and all(character.isalnum() or character in "-_.:" for character in supplied)
+        ):
+            self._correlation_id = supplied
+        else:
+            self._correlation_id = secrets.token_urlsafe(18)
+        return self._correlation_id
+
+    def operation_request_id(self, body: dict) -> str:
+        supplied = body.get("idempotency_key")
+        if supplied not in (None, ""):
+            return self.required_idempotency_key(supplied)
+        return self.request_id()
+
+    def validate_request_host(self) -> None:
+        raw_host = self.headers.get("Host", "")
+        try:
+            host = normalize_host(raw_host, "Host")
+        except ConfigurationError as error:
+            raise ApiError("Request host is invalid.", HTTPStatus.BAD_REQUEST) from error
+        if host not in self.web_config.trusted_hosts:
+            raise ApiError("Request host is not trusted.", HTTPStatus.BAD_REQUEST)
+
+    def validate_request_origin(self, *, require: bool):
+        raw_origin = self.headers.get("Origin", "").strip()
+        if not raw_origin:
+            if require:
+                raise AccessDenied("An approved request origin is required.")
             return
-        configured = {
-            value.strip().rstrip("/")
-            for value in os.environ.get("SALAMANDRA_ALLOWED_ORIGINS", "").split(",")
-            if value.strip()
-        }
-        host = self.headers.get("Host", "")
-        allowed = configured or {f"http://{host}", f"https://{host}"}
-        if origin not in allowed:
+        try:
+            origin = normalize_origin(raw_origin, "Origin")
+        except ConfigurationError as error:
+            raise AccessDenied("Cross-origin requests are not allowed.") from error
+        if origin not in self.web_config.allowed_origins:
             raise AccessDenied("Cross-origin requests are not allowed.")
+
+    def send_cors_headers(self) -> None:
+        raw_origin = self.headers.get("Origin", "").strip()
+        if not raw_origin:
+            return
+        try:
+            origin = normalize_origin(raw_origin, "Origin")
+        except ConfigurationError:
+            return
+        if origin in self.web_config.allowed_origins:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Vary", "Origin")
+
+    def client_ip(self) -> str:
+        direct = str(self.client_address[0])
+        if (
+            not self.web_config.trust_proxy_headers
+            or direct not in self.web_config.trusted_proxy_ips
+        ):
+            return direct
+        forwarded = self.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+        try:
+            return str(ipaddress.ip_address(forwarded))
+        except ValueError:
+            return direct
+
+    def log_invalid_session(self) -> None:
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "invalid_session",
+            request_id=self.correlation_id(),
+            action=urlparse(self.path).path,
+            result="unauthenticated",
+        )
+
+    def log_api_error(self, error: ApiError, path: str) -> None:
+        status = int(error.status)
+        if isinstance(error, AccessDenied):
+            event_name = "authorization_denied"
+        elif isinstance(error, StateConflict) and path.startswith("/api/events"):
+            event_name = "event_transition_failed"
+        elif isinstance(error, StateConflict) and path.startswith("/api/inventory"):
+            event_name = "inventory_adjustment_failed"
+        elif isinstance(error, AuthenticationRequired):
+            event_name = "authentication_required"
+        else:
+            event_name = "request_rejected"
+        level = logging.WARNING if status in {403, 409, 429} else logging.INFO
+        actor = getattr(self, "_request_actor", None)
+        log_event(
+            LOGGER,
+            level,
+            event_name,
+            request_id=self.correlation_id(),
+            actor_id=getattr(actor, "id", None),
+            organization_id=getattr(actor, "organization_id", None),
+            action=path,
+            result=status,
+        )
 
     def spreadsheet_safe_value(self, value):
         if not isinstance(value, str):
@@ -1243,7 +1682,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
             "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
             "script-src 'self'; connect-src 'self'; frame-ancestors 'none'",
         )
-        if os.environ.get("SALAMANDRA_COOKIE_SECURE") == "1":
+        if self.web_config.secure_cookie:
             self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 
     def log_message(self, format, *args):
@@ -1251,23 +1690,97 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
 
 def run(host: str = "127.0.0.1", port: int = 8000):
-    demo_enabled = os.environ.get("SALAMANDRA_ENABLE_DEMO") == "1"
-    SalamandraServer.accounts = AccountStore(
-        USERS_PATH,
-        seed_defaults=demo_enabled,
-        allow_demo=demo_enabled,
-    )
-    SalamandraServer.workspace = InventoryWorkspace(WORKSPACE_PATH, INVENTORY_PATH)
-    SalamandraServer.workspace.migrate_preset_metadata(SalamandraServer.catalog)
-    SalamandraServer.memory = EventMemory(EVENTS_PATH)
-    SalamandraServer.item_classes = ItemClassCatalog(ITEM_CLASSES_PATH)
-    SalamandraServer.integrations = IntegrationStore(INTEGRATIONS_PATH)
+    try:
+        web_config = WebConfig.from_environment()
+    except ConfigurationError:
+        configure_logging("INFO")
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "startup_failed",
+            action="configuration",
+            result="invalid",
+        )
+        raise
+    configure_logging(web_config.log_level)
+    database_url = web_config.database_url
+    engine = None
+    readiness_probe = None
+    if database_url:
+        from database import create_database_engine, session_factory
+        from postgres_runtime import PostgresRuntime
+
+        engine = create_database_engine(database_url, production=True)
+        readiness_probe = DatabaseReadiness(engine, ROOT_DIR)
+        if web_config.production_like:
+            result = readiness_probe.check()
+            if not result.ready:
+                log_event(
+                    LOGGER,
+                    logging.ERROR,
+                    "startup_failed",
+                    action="database_readiness",
+                    result=result.code,
+                )
+                engine.dispose()
+                raise RuntimeError(
+                    "PostgreSQL is unavailable or its Alembic schema revision is not current."
+                )
+        runtime = PostgresRuntime(session_factory(engine))
+        SalamandraServer.database_runtime = runtime
+        SalamandraServer.accounts = runtime.accounts
+        SalamandraServer.workspace = runtime.workspace
+        SalamandraServer.memory = runtime.memory
+        SalamandraServer.item_classes = runtime.item_classes
+        SalamandraServer.integrations = runtime.integrations
+    elif not web_config.json_dev_enabled and not web_config.demo_enabled:
+        raise RuntimeError(
+            "Set SALAMANDRA_DATABASE_URL for PostgreSQL, or explicitly enable "
+            "SALAMANDRA_ALLOW_JSON_DEV=1 for local compatibility storage."
+        )
+    demo_enabled = web_config.demo_enabled
+    if not database_url:
+        SalamandraServer.database_runtime = None
+        SalamandraServer.accounts = AccountStore(
+            USERS_PATH,
+            seed_defaults=demo_enabled,
+            allow_demo=demo_enabled,
+        )
+        SalamandraServer.workspace = InventoryWorkspace(WORKSPACE_PATH, INVENTORY_PATH)
+        SalamandraServer.workspace.migrate_preset_metadata(SalamandraServer.catalog)
+        SalamandraServer.memory = EventMemory(EVENTS_PATH)
+        SalamandraServer.item_classes = ItemClassCatalog(ITEM_CLASSES_PATH)
+        SalamandraServer.integrations = IntegrationStore(INTEGRATIONS_PATH)
     SalamandraServer.sessions = {}
     SalamandraServer.login_attempts = {}
+    SalamandraServer.operation_lock = threading.RLock()
+    SalamandraServer.web_config = web_config
+    SalamandraServer.readiness_probe = readiness_probe
     server = ThreadingHTTPServer((host, port), SalamandraServer)
-    print(f"Salamandra running at http://{host}:{port}")
-    print("Press Ctrl+C to stop.")
-    server.serve_forever()
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "startup_succeeded",
+        action="server_start",
+        result="ready" if readiness_probe else "development",
+        mode=web_config.mode,
+        host=host,
+        port=port,
+    )
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        if engine is not None:
+            engine.dispose()
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "shutdown_completed",
+            action="server_stop",
+            result="success",
+            mode=web_config.mode,
+        )
 
 
 if __name__ == "__main__":

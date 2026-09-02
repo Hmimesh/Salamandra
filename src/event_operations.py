@@ -28,6 +28,8 @@ class EventOperations:
         event: EventRecord,
         next_status: str,
         actor: UserAccount,
+        *,
+        idempotency_key: str | None = None,
     ) -> bool:
         normalized_status = str(next_status).strip().lower()
         if normalized_status not in EVENT_TRANSITIONS:
@@ -63,7 +65,13 @@ class EventOperations:
                 raise StateConflict(str(error)) from error
             self.workspace.apply_scope_allocations(allocations, event.organization_id)
             event.movements.append(
-                self._movement("dispatch", event, actor, allocations)
+                self._movement(
+                    "dispatch",
+                    event,
+                    actor,
+                    allocations,
+                    idempotency_key=idempotency_key,
+                )
             )
 
         if normalized_status == "returned":
@@ -98,10 +106,12 @@ class EventOperations:
         event: EventRecord,
         actor: UserAccount,
         lines: list[dict[str, Any]],
+        *,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         return {
             "id": uuid4().hex,
-            "idempotency_key": f"{event.id}:{action}",
+            "idempotency_key": idempotency_key or f"{event.id}:{action}",
             "organization_id": event.organization_id,
             "event_id": event.id,
             "action": action,
