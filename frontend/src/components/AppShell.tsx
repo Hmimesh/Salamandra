@@ -18,6 +18,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useWorkspace } from "../context/WorkspaceContext";
 import { Avatar, Spinner } from "./ui";
+import { BrandMark } from "./BrandMark";
 
 const navigation = [
   { to: "/", label: "Dashboard", icon: Gauge },
@@ -40,7 +41,8 @@ const pageNames: Record<string, string> = {
   activity: "Activity",
   settings: "Settings",
   contact: "Contact",
-  legal: "Legal & privacy",
+  terms: "Terms of use",
+  privacy: "Privacy",
 };
 
 export function AppShell() {
@@ -74,7 +76,7 @@ export function AppShell() {
     <div className={`application ${mobileNavOpen ? "nav-open" : ""}`}>
       <aside className="app-sidebar">
         <div className="brand-row">
-          <span className="brand-symbol">S</span>
+          <BrandMark />
           <div><strong>SALAMANDRA</strong><span>EVENT OPERATIONS</span></div>
           <button className="icon-button mobile-only" type="button" onClick={closeNavigation} aria-label="Close navigation"><X size={20} /></button>
         </div>

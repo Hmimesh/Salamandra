@@ -111,7 +111,7 @@ export function RegisterPage() {
 
           <label className="auth-checkbox" htmlFor="accept-terms">
             <input id="accept-terms" type="checkbox" checked={fields.acceptTerms} onChange={(event) => update("acceptTerms", event.target.checked)} aria-invalid={Boolean(errors.acceptTerms)} aria-describedby={errors.acceptTerms ? "accept-terms-error" : undefined} />
-            <span>I agree to the <Link to="/legal#terms">Terms</Link> and <Link to="/legal#privacy">Privacy Policy</Link>.</span>
+            <span>I agree to the <Link to="/terms">Terms</Link> and <Link to="/privacy">Privacy Policy</Link>.</span>
           </label>
           {errors.acceptTerms ? <span className="field-error" id="accept-terms-error">{errors.acceptTerms}</span> : null}
 

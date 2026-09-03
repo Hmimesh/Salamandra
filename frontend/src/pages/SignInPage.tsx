@@ -47,7 +47,7 @@ export function SignInPage() {
           ) : null}
         </form>
         <p className="auth-switch">Need a workspace? <Link to="/register">Create one</Link></p>
-        <div className="auth-help-links"><Link to="/legal#privacy">Privacy</Link><Link to="/contact">Contact support</Link></div>
+        <div className="auth-help-links"><Link to="/privacy">Privacy</Link><Link to="/contact">Contact support</Link></div>
       </section>
     </main>
   );
