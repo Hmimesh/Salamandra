@@ -195,14 +195,17 @@ Result:
 
 Steps:
 
-1. Attempt to find or invoke a public registration endpoint.
-2. Attempt demo sign-in.
-3. As owner/admin, create a named staging tester through team management.
-4. As a non-admin role, attempt the same action directly against `/api/team/invite`.
+1. With `SALAMANDRA_REGISTRATION_MODE=open`, create one empty test workspace at `/register`.
+2. Retry the same normalized email and confirm that no second workspace is created.
+3. Set registration to `disabled`, restart, and verify that `/register` cannot create a workspace.
+4. Attempt demo sign-in.
+5. As owner/admin, create a named staging tester through team management.
+6. As a non-admin role, attempt the same action directly against `/api/team/invite`.
 
 Expected:
 
-- Public registration is unavailable for private staging.
+- Open registration works only when explicitly configured and creates an empty workspace.
+- Disabled or malformed registration configuration fails closed.
 - Demo sign-in is unavailable.
 - Owner/admin can create a staging account in the same organization.
 - Lower roles receive HTTP 403 for account creation.

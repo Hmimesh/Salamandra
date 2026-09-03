@@ -3,9 +3,12 @@ import {
   ArrowRight,
   CalendarDays,
   CheckCircle2,
+  ChevronRight,
   PackageCheck,
+  PackagePlus,
   RotateCcw,
   Trophy,
+  UserPlus,
 } from "lucide-react";
 import { useMemo } from "react";
 import { useNavigate } from "react-router-dom";
@@ -51,10 +54,66 @@ function inventoryGroups(items: InventoryItem[]) {
     .slice(0, 8);
 }
 
+function FirstRunDashboard() {
+  const { state, mutate } = useWorkspace();
+  const navigate = useNavigate();
+  const user = state!.auth.user!;
+  const showOnboarding = !user.preferences.onboarding_dismissed;
+
+  async function dismissOnboarding() {
+    await mutate("/api/account/preferences", {
+      ...user.preferences,
+      onboarding_dismissed: true,
+    }).catch(() => undefined);
+  }
+
+  const actions = [
+    { title: "Add inventory", copy: "Add equipment manually, from presets, or with a CSV import.", icon: PackagePlus, onClick: () => navigate("/inventory") },
+    { title: "Invite team", copy: "Create individual accounts and assign the access each person needs.", icon: UserPlus, onClick: () => navigate("/team") },
+    { title: "Create first event", copy: "Describe the job and build a plan against your real stock.", icon: CalendarDays, onClick: () => navigate("/events/new") },
+  ];
+
+  return (
+    <div className="page dashboard-page first-run-dashboard">
+      <header className="first-run-heading">
+        <div><h1>Your workspace is ready.</h1><p>Welcome to {state!.organization.name}. Add real stock and plan the first job when you are ready.</p></div>
+        {showOnboarding ? <button className="text-button" type="button" onClick={() => void dismissOnboarding()}>Skip setup</button> : null}
+      </header>
+
+      {showOnboarding ? (
+        <section className="onboarding-panel" aria-labelledby="setup-title">
+          <div className="section-title-row"><div><h2 id="setup-title">Set up the workspace</h2><p>Three useful starting points. None are mandatory.</p></div><span className="result-count">0 of 3 complete</span></div>
+          <div className="onboarding-actions">
+            {actions.map(({ title, copy, icon: Icon, onClick }) => (
+              <button key={title} type="button" onClick={onClick}>
+                <span><Icon size={21} aria-hidden="true" /></span>
+                <span><strong>{title}</strong><small>{copy}</small></span>
+                <ChevronRight size={19} aria-hidden="true" />
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      <div className="first-run-grid">
+        <section className="data-section">
+          <div className="section-title-row"><div><h2>Event schedule</h2><p>Your confirmed work will appear here.</p></div><button className="button button-secondary" type="button" onClick={() => navigate("/events/new")}>Create event</button></div>
+          <EmptyState title="No events yet" message="Describe your first event to create its schedule and inventory plan." action={<button className="button button-primary" type="button" onClick={() => navigate("/events/new")}>Create event</button>} />
+        </section>
+        <section className="data-section">
+          <div className="section-title-row"><div><h2>Inventory readiness</h2><p>Availability will be calculated from real holdings.</p></div><button className="button button-secondary" type="button" onClick={() => navigate("/inventory")}>Add inventory</button></div>
+          <EmptyState title="Your inventory is empty" message="Add items manually, start from the catalog, or import a CSV." action={<button className="button button-primary" type="button" onClick={() => navigate("/inventory")}>Add inventory</button>} />
+        </section>
+      </div>
+    </div>
+  );
+}
+
 export function DashboardPage() {
   const { state } = useWorkspace();
   const navigate = useNavigate();
   const user = state!.auth.user!;
+  const isEmptyWorkspace = state!.events.events.length === 0 && state!.inventory.items.length === 0;
   const events = useMemo(
     () => state!.events.events.filter((event) => event.status !== "returned").sort((a, b) => a.start_date.localeCompare(b.start_date)),
     [state],
@@ -71,6 +130,8 @@ export function DashboardPage() {
   const operationsPoints = completedEvents * 100 + closedChecks * 5 + tracked * 20;
   const operationsLevel = Math.floor(operationsPoints / 250) + 1;
   const levelProgress = operationsPoints % 250;
+
+  if (isEmptyWorkspace) return <FirstRunDashboard />;
 
   return (
     <div className="page dashboard-page">

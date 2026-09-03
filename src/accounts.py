@@ -25,6 +25,7 @@ def default_preferences() -> dict[str, Any]:
         "font_scale": "comfortable",
         "density": "comfortable",
         "show_progress": True,
+        "onboarding_dismissed": False,
     }
 
 
@@ -201,6 +202,10 @@ class AccountStore:
             updated[name] = value
         if "show_progress" in preferences:
             updated["show_progress"] = bool(preferences["show_progress"])
+        if "onboarding_dismissed" in preferences:
+            updated["onboarding_dismissed"] = bool(
+                preferences["onboarding_dismissed"]
+            )
         user.preferences = updated
         self.save()
         return user

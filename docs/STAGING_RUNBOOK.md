@@ -3,8 +3,8 @@
 Target: `https://salamandra-staging.hmimesh.com`
 
 This runbook prepares a restricted, named-tester deployment using fake data only.
-It does not authorize production inventory, public registration, DNS changes, or
-deployment without an approved hosting provider and credentials.
+It does not authorize production inventory, unrestricted public registration,
+DNS changes, or deployment without an approved hosting provider and credentials.
 
 ## Deployment Summary
 
@@ -66,6 +66,7 @@ SALAMANDRA_TRUSTED_HOSTS=salamandra-staging.hmimesh.com
 SALAMANDRA_COOKIE_SECURE=true
 SALAMANDRA_SESSION_MAX_AGE_SECONDS=43200
 SALAMANDRA_LOG_LEVEL=INFO
+SALAMANDRA_REGISTRATION_MODE=open
 SALAMANDRA_TRUST_PROXY_HEADERS=false
 SALAMANDRA_TRUSTED_PROXY_IPS=
 SALAMANDRA_ENABLE_DEMO=false
@@ -85,7 +86,9 @@ client ranges or trust forwarded headers from arbitrary sources.
 
 Staging startup fails closed if PostgreSQL, HTTPS origin, allowed origins, trusted
 host, secure cookies, or the current Alembic revision is missing. Demo and JSON
-fallback cannot be enabled in staging.
+fallback cannot be enabled in staging. Registration defaults to `disabled` when
+`SALAMANDRA_REGISTRATION_MODE` is absent. Use `open` only for the controlled
+onboarding test window, then set it to `invite_only` or `disabled`.
 
 ## 3. Build The Release Artifact
 
@@ -223,8 +226,11 @@ technician (or operator) in Org A. Minimum test identities are:
 - Org B owner: tenant-isolation testing
 
 Use fake email addresses controlled by the staging team and unique temporary
-passwords shared out of band. Do not reuse customer or employee passwords. Public
-registration and demo sign-in remain unavailable.
+passwords shared out of band. Do not reuse customer or employee passwords. During
+the controlled onboarding test window, the first Org A owner may create a new,
+empty workspace at `/register`. Set registration back to `invite_only` or
+`disabled` after the required test workspaces exist. Demo sign-in remains
+unavailable.
 
 ## 9. Execute The Staging Smoke Test
 

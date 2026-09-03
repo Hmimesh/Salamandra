@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from sqlalchemy import and_, delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from accounts import AccountStore, UserAccount, default_preferences
@@ -177,6 +178,81 @@ class PostgresAccountStore:
             session.flush()
             return self._account(session, user, membership)
 
+    def register_workspace(
+        self,
+        *,
+        name: str,
+        email: str,
+        password: str,
+        organization_name: str,
+    ) -> UserAccount:
+        display_name = str(name).strip()
+        normalized_email = str(email).strip().casefold()
+        workspace_name = str(organization_name).strip()
+        if not display_name or len(display_name) > 200:
+            raise ValueError("Name must be between 1 and 200 characters.")
+        if (
+            not normalized_email
+            or len(normalized_email) > 320
+            or normalized_email.count("@") != 1
+            or any(character.isspace() for character in normalized_email)
+        ):
+            raise ValueError("Enter a valid work email address.")
+        local_part, domain = normalized_email.rsplit("@", 1)
+        if (
+            not local_part
+            or "." not in domain
+            or domain.startswith(".")
+            or domain.endswith(".")
+        ):
+            raise ValueError("Enter a valid work email address.")
+        if len(password) < 8 or len(password) > 256:
+            raise ValueError("Password must be between 8 and 256 characters.")
+        if not workspace_name or len(workspace_name) > 200:
+            raise ValueError("Workspace name must be between 1 and 200 characters.")
+
+        user_id = new_id()
+        organization_id = new_id()
+        password_hash = AccountStore.hash_password(password)
+        try:
+            with self.factory.begin() as session:
+                organization = OrganizationModel(
+                    id=organization_id,
+                    name=workspace_name,
+                )
+                user = UserModel(
+                    id=user_id,
+                    email=normalized_email,
+                    name=display_name,
+                    password_hash=password_hash,
+                    preferences={
+                        **default_preferences(),
+                        "_profile": {
+                            "title": "Workspace Owner",
+                            "warehouse": "Main Warehouse",
+                            "avatar_url": "",
+                        },
+                    },
+                )
+                membership = MembershipModel(
+                    id=new_id(),
+                    organization_id=organization_id,
+                    user_id=user_id,
+                    role="owner",
+                )
+                session.add(organization)
+                session.flush()
+                session.add(user)
+                session.flush()
+                session.add(membership)
+                session.flush()
+                return self._account(session, user, membership)
+        except IntegrityError as error:
+            raise StateConflict(
+                "A workspace could not be created with these details. "
+                "Try signing in or use another work email."
+            ) from error
+
     def update_profile(self, user_id: str, *, name: str, title: str, warehouse: str) -> UserAccount:
         if not name.strip():
             raise ValueError("Name is required.")
@@ -216,6 +292,10 @@ class PostgresAccountStore:
                     preferences[name] = value
             if "show_progress" in values:
                 preferences["show_progress"] = bool(values["show_progress"])
+            if "onboarding_dismissed" in values:
+                preferences["onboarding_dismissed"] = bool(
+                    values["onboarding_dismissed"]
+                )
             user.preferences = preferences
             return self._account(session, user, membership)
 
@@ -749,6 +829,21 @@ class PostgresRuntime:
                 )
             )
         return token
+
+    def register_workspace(
+        self,
+        *,
+        name: str,
+        email: str,
+        password: str,
+        organization_name: str,
+    ) -> UserAccount:
+        return self.accounts.register_workspace(
+            name=name,
+            email=email,
+            password=password,
+            organization_name=organization_name,
+        )
 
     def current_user(self, token: str) -> UserAccount | None:
         token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()

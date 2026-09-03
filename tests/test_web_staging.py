@@ -98,6 +98,22 @@ class TestWebConfiguration(unittest.TestCase):
             with self.subTest(overrides=overrides), self.assertRaises(ConfigurationError):
                 WebConfig.from_environment(staging_environment(**overrides))
 
+    def test_registration_mode_is_fail_closed_and_strictly_validated(self):
+        self.assertEqual(
+            WebConfig.from_environment(staging_environment()).registration_mode,
+            "disabled",
+        )
+        self.assertEqual(
+            WebConfig.from_environment(
+                staging_environment(SALAMANDRA_REGISTRATION_MODE="open")
+            ).registration_mode,
+            "open",
+        )
+        with self.assertRaisesRegex(ConfigurationError, "REGISTRATION_MODE"):
+            WebConfig.from_environment(
+                staging_environment(SALAMANDRA_REGISTRATION_MODE="public")
+            )
+
     def test_proxy_headers_require_explicit_trusted_proxy_addresses(self):
         with self.assertRaises(ConfigurationError):
             WebConfig.from_environment(
@@ -240,7 +256,34 @@ class TestWebStagingHttp(unittest.TestCase):
             "POST", "/api/auth/demo", {}, extra_headers=self.headers
         )
 
-        self.assertEqual((register_status, demo_status), (401, 404))
+        self.assertEqual((register_status, demo_status), (403, 404))
+
+    def test_open_registration_is_rate_limited_before_database_work(self):
+        class RejectingRuntime:
+            @staticmethod
+            def register_workspace(**_values):
+                raise ValueError("Rejected test registration.")
+
+        self.app.handler.web_config = WebConfig.from_environment(
+            staging_environment(SALAMANDRA_REGISTRATION_MODE="open")
+        )
+        self.app.handler.database_runtime = RejectingRuntime()
+        body = {
+            "name": "Test User",
+            "email": "invalid",
+            "password": "not-a-secret",
+            "organization_name": "Test Workspace",
+            "accept_terms": True,
+        }
+        statuses = [
+            self.app.request(
+                "POST", "/api/auth/register", body, extra_headers=self.headers
+            )[0]
+            for _ in range(6)
+        ]
+
+        self.assertEqual(statuses[:5], [400] * 5)
+        self.assertEqual(statuses[5], 429)
 
 
 class TestOperationalLogRedaction(unittest.TestCase):

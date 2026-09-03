@@ -13,6 +13,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { type FormEvent, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { EmptyState, Modal, PageHeader } from "../components/ui";
 import { useWorkspace } from "../context/WorkspaceContext";
 import { titleCase } from "../lib/format";
@@ -41,6 +42,7 @@ function dependencyRules(value: FormDataEntryValue | null) {
 
 export function InventoryPage() {
   const { state, mutate } = useWorkspace();
+  const navigate = useNavigate();
   const [scope, setScope] = useState<InventoryScope>("combined");
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState("all");
@@ -192,7 +194,7 @@ export function InventoryPage() {
           const reserved = state!.events.active_reservations[item.id] || 0;
           const status = item.count === 0 ? "Out of stock" : reserved ? "Planned" : "Ready";
           return <tr key={item.id}><td><div className="item-name"><span className={`category-icon type-${item.type}`}>{item.id.slice(0, 1).toUpperCase()}</span><span><strong>{titleCase(item.id)}</strong><small>{[item.manufacturer, item.model, item.info].filter(Boolean).join(" · ") || "No equipment note"}</small></span>{item.info ? <span className="info-tooltip" title={item.info}><Info size={15} /></span> : null}</div></td><td><strong>{item.class_id ? titleCase(item.class_id) : titleCase(item.type)}</strong><small>{item.weight_kg ? `${item.weight_kg} kg · quality ${item.quality_score}` : item.condition}</small></td><td><strong>{item.count}</strong>{reserved ? <small>{reserved} planned across events</small> : null}</td><td>{item.in_use_count}</td><td>{item.requirements.length ? item.requirements.map((need) => `${need.amount}x ${titleCase(need.item_id)}`).join(", ") : "By class"}</td><td><span className={`stock-status stock-${status.toLowerCase().replaceAll(" ", "-")}`}>{status}</span></td><td><div className="row-actions"><button className="icon-button" title="Edit equipment" aria-label={`Edit ${item.id}`} onClick={() => setEditItem(item)}><Pencil size={16} /></button><button className="icon-button" title="Check gear out" aria-label={`Check out ${item.id}`} disabled={item.count < 1} onClick={() => setAction({ type: "use", item })}><ArrowUpFromLine size={17} /></button><button className="icon-button" title="Return gear" aria-label={`Return ${item.id}`} disabled={item.in_use_count < 1} onClick={() => setAction({ type: "return", item })}><ArrowDownToLine size={17} /></button><button className="icon-button danger-icon" title="Remove stock" aria-label={`Remove ${item.id}`} disabled={item.count < 1} onClick={() => setAction({ type: "remove", item })}><Minus size={17} /></button></div></td></tr>;
-        })}</tbody></table></div> : <EmptyState title="No matching items" message="Change the filters or add an item to this inventory." action={<button className="button button-primary" onClick={() => setAddOpen(true)}>Add item</button>} />}
+        })}</tbody></table></div> : <EmptyState title={inventory.summary.unique_items ? "No matching items" : "Your inventory is empty"} message={inventory.summary.unique_items ? "Change the filters or add an item to this inventory." : "Add an item manually, start from the catalog, or import an inventory CSV."} action={<div className="empty-actions"><button className="button button-primary" onClick={() => setAddOpen(true)}>Add inventory</button><button className="button button-secondary" onClick={() => navigate("/settings")}>Import CSV</button></div>} />}
       </section>
 
       <Modal open={addOpen} title="Add inventory item" description="Create sound, lighting, furniture, transport, logistics, or any other inventory item." onClose={() => setAddOpen(false)} size="lg">

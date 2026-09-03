@@ -42,6 +42,7 @@ class ServerHarness(AbstractContextManager):
         IsolatedServer.integrations = IntegrationStore(root / "integrations.json")
         IsolatedServer.sessions = {}
         IsolatedServer.login_attempts = {}
+        IsolatedServer.registration_attempts = {}
         self.handler = IsolatedServer
         self.owner_a = IsolatedServer.accounts.create_user(
             name="Owner A",

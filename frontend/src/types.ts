@@ -85,6 +85,7 @@ export interface UserAccount {
     font_scale: "compact" | "comfortable" | "large";
     density: "compact" | "comfortable";
     show_progress: boolean;
+    onboarding_dismissed: boolean;
   };
 }
 
@@ -267,6 +268,7 @@ export interface WorkspaceState {
     user: UserAccount | null;
     users: UserAccount[];
     demo_available: boolean;
+    registration_mode: "disabled" | "invite_only" | "open";
   };
   organization: Partial<Organization>;
   presence: PresenceAccount[];

@@ -24,6 +24,13 @@ interface WorkspaceContextValue {
   refresh: () => Promise<void>;
   signIn: (email: string, password: string) => Promise<void>;
   signInDemo: () => Promise<void>;
+  registerWorkspace: (fields: {
+    name: string;
+    email: string;
+    password: string;
+    organization_name: string;
+    accept_terms: boolean;
+  }) => Promise<void>;
   signOut: () => Promise<void>;
   mutate: <T extends Record<string, unknown>>(
     path: string,
@@ -121,14 +128,25 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     notify("Demo workspace ready.");
   }, [mutate, notify]);
 
+  const registerWorkspace = useCallback(async (fields: {
+    name: string;
+    email: string;
+    password: string;
+    organization_name: string;
+    accept_terms: boolean;
+  }) => {
+    await mutate<StateEnvelope>("/api/auth/register", fields);
+    notify("Workspace created.");
+  }, [mutate, notify]);
+
   const signOut = useCallback(async () => {
     await mutate<StateEnvelope>("/api/auth/signout");
     notify("Signed out.");
   }, [mutate, notify]);
 
   const value = useMemo<WorkspaceContextValue>(
-    () => ({ state, loading, busy, toast, refresh, signIn, signInDemo, signOut, mutate, notify }),
-    [state, loading, busy, toast, refresh, signIn, signInDemo, signOut, mutate, notify],
+    () => ({ state, loading, busy, toast, refresh, signIn, signInDemo, registerWorkspace, signOut, mutate, notify }),
+    [state, loading, busy, toast, refresh, signIn, signInDemo, registerWorkspace, signOut, mutate, notify],
   );
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;

@@ -1,47 +1,53 @@
-import { ArrowRight, CalendarCheck2, PackageCheck, ShieldCheck } from "lucide-react";
-import { type FormEvent, useState } from "react";
-import { useWorkspace } from "../context/WorkspaceContext";
+import { ArrowRight } from "lucide-react";
+import { type FormEvent, useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { Spinner } from "../components/ui";
+import { useWorkspace } from "../context/WorkspaceContext";
 
 export function SignInPage() {
   const { state, busy, signIn, signInDemo } = useWorkspace();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const errorBox = useRef<HTMLDivElement>(null);
 
-  async function submit(event: FormEvent) {
+  useEffect(() => {
+    document.title = "Sign in to Salamandra";
+  }, []);
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    await signIn(email, password).catch(() => undefined);
+    setError("");
+    try {
+      await signIn(email, password);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "Sign-in failed. Try again.");
+      window.setTimeout(() => errorBox.current?.focus(), 0);
+    }
   }
 
   return (
-    <main className="signin-page">
-      <section className="signin-product">
-        <div className="signin-brand"><span>S</span><strong>SALAMANDRA</strong></div>
-        <div className="signin-message">
-          <h1>Every event ready.<br />Every item accounted for.</h1>
-          <p>The operations workspace for event teams, production crews, and shared warehouses.</p>
-          <ul>
-            <li><CalendarCheck2 size={21} /><span><strong>Plan from the brief</strong>Turn plain-language requirements into a real stock plan.</span></li>
-            <li><PackageCheck size={21} /><span><strong>Control the warehouse</strong>Shared stock, personal gear, check-out, and returns.</span></li>
-            <li><ShieldCheck size={21} /><span><strong>Catch conflicts early</strong>Know what is missing or reserved before show day.</span></li>
-          </ul>
-        </div>
-        <small>Built for the people responsible when the doors open.</small>
-      </section>
-
-      <section className="signin-form-wrap">
-        <form className="signin-form" onSubmit={submit}>
-          <div className="signin-form-head"><span className="brand-symbol">S</span><div><strong>SALAMANDRA</strong><small>Event Operations</small></div></div>
-          <h2>Sign in</h2>
+    <main className="auth-page">
+      <section className="auth-form-section" aria-labelledby="signin-title">
+        <div className="auth-heading">
+          <h1 id="signin-title">Sign in</h1>
           <p>Open your company workspace.</p>
-          <label>Email<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="username" required /></label>
-          <label>Password<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" required /></label>
-          <button className="button button-primary button-large" type="submit" disabled={busy}>
-            {busy ? <Spinner label="Signing in" /> : null}<span>Sign in</span><ArrowRight size={18} />
+        </div>
+        {error ? <div className="form-error-summary" ref={errorBox} tabIndex={-1} role="alert"><strong>Could not sign in</strong><span>{error}</span></div> : null}
+        <form className="auth-form" onSubmit={submit}>
+          <label htmlFor="signin-email">Work email</label>
+          <input id="signin-email" name="email" type="email" inputMode="email" value={email} onChange={(event) => { setEmail(event.target.value); setError(""); }} autoComplete="username" maxLength={320} required />
+          <label htmlFor="signin-password">Password</label>
+          <input id="signin-password" name="password" type="password" value={password} onChange={(event) => { setPassword(event.target.value); setError(""); }} autoComplete="current-password" maxLength={256} required />
+          <button className="button button-primary public-cta auth-submit" type="submit" disabled={busy}>
+            {busy ? <Spinner label="Signing in" /> : null}<span>{busy ? "Signing in" : "Sign in"}</span><ArrowRight size={18} />
           </button>
-          {state?.auth.demo_available ? <><div className="signin-divider"><span>or</span></div><button className="button button-secondary button-large" type="button" onClick={() => void signInDemo().catch(() => undefined)} disabled={busy}>Open demo workspace</button></> : null}
-          <div className="signin-links"><a href="/legal">Privacy</a><a href="/contact">Contact</a></div>
+          {state?.auth.demo_available ? (
+            <button className="button button-secondary public-cta" type="button" onClick={() => void signInDemo().catch(() => undefined)} disabled={busy}>Open local demo workspace</button>
+          ) : null}
         </form>
+        <p className="auth-switch">Need a workspace? <Link to="/register">Create one</Link></p>
+        <div className="auth-help-links"><Link to="/legal#privacy">Privacy</Link><Link to="/contact">Contact support</Link></div>
       </section>
     </main>
   );

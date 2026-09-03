@@ -68,6 +68,7 @@ class UserModel(Base):
 
     __table_args__ = (
         CheckConstraint("status IN ('active', 'disabled')", name="ck_users_status"),
+        Index("uq_users_email_normalized", text("lower(email)"), unique=True),
     )
 
 

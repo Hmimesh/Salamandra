@@ -11,10 +11,11 @@ import threading
 import time
 import unittest
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import create_engine, func, select, text
+from sqlalchemy import create_engine, delete, event as sqlalchemy_event, func, select, text
 from sqlalchemy.orm import sessionmaker
 
 try:
@@ -86,6 +87,7 @@ def _serve_postgres(
     from database import create_database_engine, session_factory
     from postgres_runtime import PostgresRuntime
     from server import SalamandraServer
+    from web_config import WebConfig
     from event_templates import Kit, TemplateCatalog
     from Item_node import Requirement
 
@@ -135,6 +137,11 @@ def _serve_postgres(
     )
     DatabaseHandler.sessions = {}
     DatabaseHandler.login_attempts = {}
+    DatabaseHandler.registration_attempts = {}
+    DatabaseHandler.web_config = replace(
+        WebConfig.local_default(),
+        registration_mode="open",
+    )
     DatabaseHandler.operation_lock = threading.RLock()
     DatabaseHandler.readiness_probe = DatabaseReadiness(engine, ROOT)
 
@@ -290,6 +297,191 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         return headers["set-cookie"].split(";", 1)[0]
+
+    def test_workspace_registration_creates_an_empty_authoritative_workspace(self):
+        email = f"new-owner-{uuid4().hex}@example.test"
+        status, payload, headers = _request(
+            self.ports[0],
+            "POST",
+            "/api/auth/register",
+            {
+                "name": "New Owner",
+                "email": f"  {email.upper()}  ",
+                "password": "a valid registration password",
+                "organization_name": "Signal Works",
+                "accept_terms": True,
+                "role": "admin",
+                "organization_id": "forged-organization",
+                "user_id": "forged-user",
+            },
+        )
+
+        self.assertEqual(status, 201)
+        self.assertIn("salamandra_session=", headers["set-cookie"])
+        state = payload["state"]
+        registered = state["auth"]["user"]
+        self.assertEqual(registered["email"], email)
+        self.assertEqual(registered["role"], "owner")
+        self.assertNotEqual(registered["id"], "forged-user")
+        self.assertNotEqual(registered["organization_id"], "forged-organization")
+        self.assertEqual(state["organization"]["name"], "Signal Works")
+        self.assertEqual(state["auth"]["users"], [registered])
+        self.assertEqual(state["inventory"]["items"], [])
+        self.assertEqual(state["events"]["events"], [])
+        self.assertNotIn("password", json.dumps(payload).lower())
+
+        with self.factory() as session:
+            user = session.scalar(select(UserModel).where(UserModel.email == email))
+            self.assertIsNotNone(user)
+            membership = session.scalar(
+                select(MembershipModel).where(MembershipModel.user_id == user.id)
+            )
+            self.assertEqual(membership.role, "owner")
+            self.assertEqual(membership.organization_id, registered["organization_id"])
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(InventoryHoldingModel).where(
+                        InventoryHoldingModel.organization_id
+                        == registered["organization_id"]
+                    )
+                ),
+                0,
+            )
+        with self.factory.begin() as session:
+            session.execute(
+                delete(SessionModel).where(SessionModel.user_id == registered["id"])
+            )
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(EventModel).where(
+                        EventModel.organization_id == registered["organization_id"]
+                    )
+                ),
+                0,
+            )
+
+    @race_required
+    def test_concurrent_normalized_email_registration_commits_once(self):
+        email = f"registration-race-{uuid4().hex}@example.test"
+        barrier = threading.Barrier(2)
+        results: list[tuple[int, dict, dict[str, str]]] = []
+        result_lock = threading.Lock()
+
+        def register(port: int, supplied_email: str) -> None:
+            barrier.wait(timeout=5)
+            result = _request(
+                port,
+                "POST",
+                "/api/auth/register",
+                {
+                    "name": "Race Owner",
+                    "email": supplied_email,
+                    "password": "race registration password",
+                    "organization_name": "One Race Workspace",
+                    "accept_terms": True,
+                },
+            )
+            with result_lock:
+                results.append(result)
+
+        threads = [
+            threading.Thread(target=register, args=(self.ports[0], email.upper())),
+            threading.Thread(target=register, args=(self.ports[1], f" {email} ")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sorted(status for status, _, _ in results), [201, 409])
+        with self.factory() as session:
+            users = list(
+                session.scalars(
+                    select(UserModel).where(func.lower(UserModel.email) == email)
+                )
+            )
+            self.assertEqual(len(users), 1)
+            memberships = list(
+                session.scalars(
+                    select(MembershipModel).where(
+                        MembershipModel.user_id == users[0].id
+                    )
+                )
+            )
+            self.assertEqual(len(memberships), 1)
+            self.assertEqual(memberships[0].role, "owner")
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(OrganizationModel).where(
+                        OrganizationModel.name == "One Race Workspace"
+                    )
+                ),
+                1,
+            )
+        with self.factory.begin() as session:
+            session.execute(
+                delete(SessionModel).where(SessionModel.user_id == users[0].id)
+            )
+
+    def test_registration_failure_rolls_back_user_organization_and_membership(self):
+        from postgres_runtime import PostgresAccountStore
+
+        email = f"rollback-{uuid4().hex}@example.test"
+        workspace_name = f"Rollback Workspace {uuid4().hex}"
+
+        def reject_membership(_mapper, _connection, target):
+            if target.role == "owner":
+                raise RuntimeError("forced membership failure")
+
+        sqlalchemy_event.listen(MembershipModel, "before_insert", reject_membership)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "forced membership failure"):
+                PostgresAccountStore(self.factory).register_workspace(
+                    name="Rollback Owner",
+                    email=email,
+                    password="rollback registration password",
+                    organization_name=workspace_name,
+                )
+        finally:
+            sqlalchemy_event.remove(MembershipModel, "before_insert", reject_membership)
+
+        with self.factory() as session:
+            self.assertIsNone(
+                session.scalar(select(UserModel).where(UserModel.email == email))
+            )
+            self.assertIsNone(
+                session.scalar(
+                    select(OrganizationModel).where(
+                        OrganizationModel.name == workspace_name
+                    )
+                )
+            )
+
+    def test_registration_rejects_malformed_and_oversized_fields_without_writes(self):
+        from postgres_runtime import PostgresAccountStore
+
+        store = PostgresAccountStore(self.factory)
+        before = self._registration_row_counts()
+        cases = (
+            {"name": "", "email": "valid@example.test", "password": "valid password", "organization_name": "Workspace"},
+            {"name": "Owner", "email": "not-an-email", "password": "valid password", "organization_name": "Workspace"},
+            {"name": "Owner", "email": "valid@example.test", "password": "short", "organization_name": "Workspace"},
+            {"name": "Owner", "email": "valid@example.test", "password": "valid password", "organization_name": "W" * 201},
+        )
+        for values in cases:
+            with self.subTest(values={key: len(value) for key, value in values.items()}):
+                with self.assertRaises(ValueError):
+                    store.register_workspace(**values)
+        self.assertEqual(self._registration_row_counts(), before)
+
+    def _registration_row_counts(self) -> tuple[int, int, int]:
+        with self.factory() as session:
+            return (
+                session.scalar(select(func.count()).select_from(UserModel)),
+                session.scalar(select(func.count()).select_from(OrganizationModel)),
+                session.scalar(select(func.count()).select_from(MembershipModel)),
+            )
 
     @staticmethod
     def _definition_body(

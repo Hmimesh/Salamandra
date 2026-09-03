@@ -14,13 +14,13 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { useWorkspace } from "../context/WorkspaceContext";
 import { Avatar, Spinner } from "./ui";
 
 const navigation = [
-  { to: "/dashboard", label: "Dashboard", icon: Gauge },
+  { to: "/", label: "Dashboard", icon: Gauge },
   { to: "/events", label: "Events", icon: CalendarDays },
   { to: "/inventory", label: "Inventory", icon: Boxes },
   { to: "/kits", label: "Kits", icon: PackageOpen },
@@ -47,6 +47,7 @@ export function AppShell() {
   const { state, busy, signOut } = useWorkspace();
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [accountOpen, setAccountOpen] = useState(false);
+  const accountTriggerRef = useRef<HTMLButtonElement>(null);
   const location = useLocation();
   const navigate = useNavigate();
   const user = state!.auth.user!;
@@ -54,6 +55,20 @@ export function AppShell() {
   const routeRoot = location.pathname.split("/")[1] || "dashboard";
 
   const closeNavigation = () => setMobileNavOpen(false);
+
+  useEffect(() => {
+    if (!accountOpen) return undefined;
+
+    const closeAccountMenu = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setAccountOpen(false);
+        accountTriggerRef.current?.focus();
+      }
+    };
+
+    document.addEventListener("keydown", closeAccountMenu);
+    return () => document.removeEventListener("keydown", closeAccountMenu);
+  }, [accountOpen]);
 
   return (
     <div className={`application ${mobileNavOpen ? "nav-open" : ""}`}>
@@ -76,6 +91,7 @@ export function AppShell() {
               key={to}
               className={({ isActive }) => `nav-link ${isActive ? "active" : ""} ${divider ? "nav-divider" : ""}`}
               to={to}
+              end={to === "/"}
               onClick={closeNavigation}
             >
               <Icon size={19} strokeWidth={1.8} />
@@ -109,15 +125,23 @@ export function AppShell() {
               <span className="online-dot" />
             </button>
             <div className="account-menu">
-              <button className="account-trigger" type="button" onClick={() => setAccountOpen((value) => !value)} aria-expanded={accountOpen}>
+              <button
+                ref={accountTriggerRef}
+                className="account-trigger"
+                type="button"
+                onClick={() => setAccountOpen((value) => !value)}
+                aria-expanded={accountOpen}
+                aria-haspopup="menu"
+                aria-controls="account-menu-popover"
+              >
                 <Avatar user={user} />
                 <span><strong>{user.name}</strong><small>{user.title}</small></span>
                 <ChevronDown size={17} />
               </button>
               {accountOpen ? (
-                <div className="account-popover">
-                  <button type="button" onClick={() => { setAccountOpen(false); navigate("/settings"); }}><Settings size={16} />Account settings</button>
-                  <button type="button" onClick={() => { setAccountOpen(false); void signOut(); }}><LogOut size={16} />Sign out</button>
+                <div className="account-popover" id="account-menu-popover" role="menu">
+                  <button type="button" role="menuitem" onClick={() => { setAccountOpen(false); navigate("/settings"); }}><Settings size={16} />Account settings</button>
+                  <button type="button" role="menuitem" onClick={() => { setAccountOpen(false); void signOut(); }}><LogOut size={16} />Sign out</button>
                 </div>
               ) : null}
             </div>
@@ -131,4 +155,3 @@ export function AppShell() {
     </div>
   );
 }
-

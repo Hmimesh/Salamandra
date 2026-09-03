@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 PRODUCTION_LIKE_MODES = frozenset({"staging", "production"})
 VALID_MODES = frozenset({"development", "test", *PRODUCTION_LIKE_MODES})
 VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+VALID_REGISTRATION_MODES = frozenset({"disabled", "invite_only", "open"})
 
 
 class ConfigurationError(RuntimeError):
@@ -100,6 +101,7 @@ class WebConfig:
     log_level: str
     demo_enabled: bool
     json_dev_enabled: bool
+    registration_mode: str
 
     @property
     def production_like(self) -> bool:
@@ -127,6 +129,7 @@ class WebConfig:
             log_level="WARNING",
             demo_enabled=False,
             json_dev_enabled=True,
+            registration_mode="disabled",
         )
 
     @classmethod
@@ -191,6 +194,13 @@ class WebConfig:
         demo_enabled = _enabled(values, "SALAMANDRA_ENABLE_DEMO")
         json_dev_enabled = _enabled(values, "SALAMANDRA_ALLOW_JSON_DEV")
         database_url = str(values.get("SALAMANDRA_DATABASE_URL", "")).strip()
+        registration_mode = str(
+            values.get("SALAMANDRA_REGISTRATION_MODE", "disabled")
+        ).strip().lower()
+        if registration_mode not in VALID_REGISTRATION_MODES:
+            raise ConfigurationError(
+                "SALAMANDRA_REGISTRATION_MODE must be disabled, invite_only, or open."
+            )
 
         try:
             session_max_age = int(values.get("SALAMANDRA_SESSION_MAX_AGE_SECONDS", "43200"))
@@ -263,4 +273,5 @@ class WebConfig:
             log_level=log_level,
             demo_enabled=demo_enabled,
             json_dev_enabled=json_dev_enabled,
+            registration_mode=registration_mode,
         )

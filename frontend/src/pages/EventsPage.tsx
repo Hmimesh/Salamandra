@@ -230,7 +230,7 @@ export function EventsPage() {
               const date = formatEventDate(event.start_date);
               const crew = eventCrew(event, state!.auth.users);
               return <button className="event-list-row" type="button" key={event.id} onClick={() => setSearchParams({ event: event.id })}><span className="date-tile"><strong>{date.day}</strong><small>{date.month}</small></span><span className="event-list-title"><strong>{event.title}</strong><small><Clock3 size={14} />{event.start_time}<MapPin size={14} />{event.location || "Location TBD"}</small></span><Readiness value={eventReadiness(event)} /><span className="avatar-stack table-avatars">{crew.slice(0, 3).map((member) => <Avatar key={member.id} user={member} size="sm" />)}</span><ConflictState count={event.plan.total_missing || event.conflicts.length} /><StatusTag status={event.status} /><ChevronRight size={18} /></button>;
-            })}</div> : <EmptyState title="No events scheduled" message="Create an event from the production brief." />}
+            })}</div> : <EmptyState title="No events yet" message="Describe your first event to create its schedule and inventory plan." action={<button className="button button-primary" type="button" onClick={() => navigate("/events/new")}>Create event</button>} />}
           </section>
         </>
       )}

@@ -67,6 +67,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
     integrations = IntegrationStore(INTEGRATIONS_PATH)
     sessions: dict[str, dict[str, float | str]] = {}
     login_attempts: dict[str, list[float]] = {}
+    registration_attempts: dict[str, list[float]] = {}
     operation_lock = threading.RLock()
     database_runtime = None
     readiness_probe = None
@@ -180,6 +181,10 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
             if parsed_url.path == "/api/auth/signin":
                 self.handle_sign_in(body)
+                return
+
+            if parsed_url.path == "/api/auth/register":
+                self.handle_registration(body)
                 return
 
             if parsed_url.path == "/api/auth/demo":
@@ -538,6 +543,10 @@ class SalamandraServer(BaseHTTPRequestHandler):
                         "show_progress",
                         user.preferences.get("show_progress", True),
                     ),
+                    onboarding_dismissed=body.get(
+                        "onboarding_dismissed",
+                        user.preferences.get("onboarding_dismissed", False),
+                    ),
                 )
                 self.send_json(
                     {"user": updated_user.to_public_dict(), "state": self.state_payload(updated_user)}
@@ -692,7 +701,66 @@ class SalamandraServer(BaseHTTPRequestHandler):
         self.ensure_demo_workspace(user)
         self.create_session(user)
 
-    def create_session(self, user: UserAccount):
+    def handle_registration(self, body: dict):
+        if self.web_config.registration_mode != "open":
+            raise AccessDenied("Workspace registration is not available.")
+        if self.database_runtime is None:
+            raise ApiError(
+                "Workspace registration requires the PostgreSQL runtime.",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+
+        attempt_key = self.client_ip()
+        cutoff = time.time() - 600
+        attempts = [
+            attempt
+            for attempt in self.registration_attempts.get(attempt_key, [])
+            if attempt >= cutoff
+        ]
+        if len(attempts) >= 5:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "registration_throttled",
+                request_id=self.correlation_id(),
+                action="register",
+                result="throttled",
+            )
+            raise ApiError("Too many registration attempts. Try again later.", 429)
+        attempts.append(time.time())
+        self.registration_attempts[attempt_key] = attempts
+
+        values = {
+            field: body.get(field, "")
+            for field in ("name", "email", "password", "organization_name")
+        }
+        if any(not isinstance(value, str) for value in values.values()):
+            raise ValueError("Registration fields must be strings.")
+        if body.get("accept_terms") is not True:
+            raise ValueError(
+                "Accept the Terms and Privacy Policy to create a workspace."
+            )
+
+        user = self.database_runtime.register_workspace(**values)
+        self._request_actor = user
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "workspace_registered",
+            request_id=self.correlation_id(),
+            actor_id=user.id,
+            organization_id=user.organization_id,
+            action="register",
+            result="success",
+        )
+        self.create_session(user, status=HTTPStatus.CREATED)
+
+    def create_session(
+        self,
+        user: UserAccount,
+        *,
+        status: HTTPStatus = HTTPStatus.OK,
+    ):
         max_age = self.web_config.session_max_age_seconds
         if self.database_runtime is not None:
             token = self.database_runtime.create_session(user, max_age)
@@ -706,6 +774,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
         expires = email.utils.formatdate(time.time() + max_age, usegmt=True)
         self.send_json(
             {"state": self.state_payload(user)},
+            status=status,
             headers={
                 "Set-Cookie": (
                     f"salamandra_session={token}; Path=/; HttpOnly; SameSite=Lax; "
@@ -1031,6 +1100,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
                     "user": None,
                     "users": [],
                     "demo_available": self.accounts.allow_demo,
+                    "registration_mode": self.web_config.registration_mode,
                 },
                 "organization": {},
                 "presence": [],
@@ -1071,6 +1141,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
             "user": user.to_public_dict() if user else None,
             "users": [account.to_public_dict() for account in organization_users],
             "demo_available": self.accounts.allow_demo,
+            "registration_mode": self.web_config.registration_mode,
         }
         inventories = self.workspace.to_dict(
             user.id if user else None,
@@ -1118,9 +1189,9 @@ class SalamandraServer(BaseHTTPRequestHandler):
         return {
             "id": user.organization_id,
             "name": user.organization_name,
-            "plan": "Operations Pro" if user.organization_id == "northstar-live" else "Internal",
+            "plan": "",
             "seat_count": len(users),
-            "seat_limit": 12,
+            "seat_limit": 0,
             "warehouse": user.warehouse,
         }
 
@@ -1753,6 +1824,7 @@ def run(host: str = "127.0.0.1", port: int = 8000):
         SalamandraServer.integrations = IntegrationStore(INTEGRATIONS_PATH)
     SalamandraServer.sessions = {}
     SalamandraServer.login_attempts = {}
+    SalamandraServer.registration_attempts = {}
     SalamandraServer.operation_lock = threading.RLock()
     SalamandraServer.web_config = web_config
     SalamandraServer.readiness_probe = readiness_probe
