@@ -175,6 +175,28 @@ class TestSecurityPhaseOne(unittest.TestCase):
             self.assertIsNotNone(item)
             self.assertEqual((item.count, item.type.value, item.info), (4, "furniture", "Folding"))
 
+    def test_csv_id_column_preserves_existing_legacy_identifier(self):
+        with ServerHarness() as app:
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+            inventory = app.handler.workspace.inventory_for(
+                "shared", app.owner_a.id, "org-a"
+            )
+            inventory.add_item(ItemNode("ledger race item", ItemType.OTHER), amount=3)
+
+            status, payload, _ = app.request(
+                "POST",
+                "/api/inventory/import.csv",
+                {
+                    "csv": "id,type,count\nledger race item,other,5\n",
+                    "scope": "shared",
+                },
+                cookie,
+            )
+
+            self.assertEqual(status, 200, payload)
+            self.assertEqual(inventory.get_item("ledger race item").count, 5)
+            self.assertIsNone(inventory.get_item("ledger-race-item"))
+
     def test_workspace_kit_is_created_from_visible_inventory(self):
         with ServerHarness() as app:
             cookie = app.sign_in("owner-a@example.test", "owner-a-password")

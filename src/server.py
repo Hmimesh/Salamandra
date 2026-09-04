@@ -1794,7 +1794,11 @@ class SalamandraServer(BaseHTTPRequestHandler):
             item_name = str(row.get(columns["name"] or "", "")).strip()
             if not item_name:
                 continue
-            item_id = self.csv_item_id(item_name)
+            item_id = (
+                item_name
+                if (columns["name"] or "").casefold() == "id"
+                else self.csv_item_id(item_name)
+            )
             normalized_id = item_id.casefold()
             if normalized_id in seen_ids:
                 raise ValueError(f"Inventory CSV contains duplicate item name {item_name}.")
