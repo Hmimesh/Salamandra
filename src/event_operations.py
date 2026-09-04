@@ -11,11 +11,12 @@ from security import StateConflict
 
 
 EVENT_TRANSITIONS: dict[str, frozenset[str]] = {
-    "planning": frozenset({"confirmed"}),
-    "confirmed": frozenset({"packed"}),
-    "packed": frozenset({"out"}),
+    "planning": frozenset({"confirmed", "cancelled"}),
+    "confirmed": frozenset({"packed", "cancelled"}),
+    "packed": frozenset({"out", "cancelled"}),
     "out": frozenset({"returned"}),
     "returned": frozenset(),
+    "cancelled": frozenset(),
 }
 
 

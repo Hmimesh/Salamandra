@@ -24,6 +24,7 @@ from integrations import IntegrationStore
 from inventory_workspace import InventoryWorkspace
 from Item_node import ItemNode, ItemType, Requirement
 from item_classes import ItemClassCatalog
+from kits import KitStore
 from server import SalamandraServer
 
 
@@ -40,6 +41,7 @@ class ServerHarness(AbstractContextManager):
         IsolatedServer.memory = EventMemory(root / "events.json")
         IsolatedServer.item_classes = ItemClassCatalog(root / "item_classes.json")
         IsolatedServer.integrations = IntegrationStore(root / "integrations.json")
+        IsolatedServer.kits = KitStore(root / "kits.json")
         IsolatedServer.sessions = {}
         IsolatedServer.login_attempts = {}
         IsolatedServer.registration_attempts = {}
@@ -116,6 +118,122 @@ class ServerHarness(AbstractContextManager):
 
 
 class TestSecurityPhaseOne(unittest.TestCase):
+    def test_event_crew_is_same_workspace_only_and_persists(self):
+        with ServerHarness() as app:
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+            body = {
+                "description": "Small meeting on 2026-09-22 at 10:00 with no lighting.",
+                "overrides": {"assigned_user_ids": [app.tech_a.id]},
+                "idempotency_key": "crew-event-create",
+            }
+            status, payload, _ = app.request("POST", "/api/events/save", body, cookie)
+            self.assertEqual(status, 201, payload)
+            self.assertEqual(
+                payload["event"]["assigned_user_ids"],
+                [app.owner_a.id, app.tech_a.id],
+            )
+            before = len(app.handler.memory.list_events("org-a"))
+            rejected, _, _ = app.request(
+                "POST",
+                "/api/events/save",
+                {
+                    **body,
+                    "overrides": {"assigned_user_ids": [app.owner_b.id]},
+                    "idempotency_key": "foreign-crew-create",
+                },
+                cookie,
+            )
+            self.assertEqual(rejected, 400)
+            self.assertEqual(len(app.handler.memory.list_events("org-a")), before)
+
+    def test_csv_without_id_previews_and_imports_with_generated_identifier(self):
+        with ServerHarness() as app:
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+            csv_text = "Equipment,Qty,Category,Notes\nCoffee table,4,furniture,Folding\n"
+            preview_status, preview, _ = app.request(
+                "POST", "/api/inventory/import.preview", {"csv": csv_text}, cookie
+            )
+            self.assertEqual(preview_status, 200, preview)
+            self.assertEqual(preview["suggested_mapping"]["name"], "Equipment")
+            import_status, imported, _ = app.request(
+                "POST",
+                "/api/inventory/import.csv",
+                {
+                    "csv": csv_text,
+                    "scope": "shared",
+                    "column_mapping": {
+                        "name": "Equipment",
+                        "count": "Qty",
+                        "type": "Category",
+                        "info": "Notes",
+                    },
+                },
+                cookie,
+            )
+            self.assertEqual(import_status, 200, imported)
+            item = app.handler.workspace.inventory_for("shared", app.owner_a.id, "org-a").get_item("coffee-table")
+            self.assertIsNotNone(item)
+            self.assertEqual((item.count, item.type.value, item.info), (4, "furniture", "Folding"))
+
+    def test_workspace_kit_is_created_from_visible_inventory(self):
+        with ServerHarness() as app:
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+            app.handler.workspace.add_item(
+                ItemNode("event-table", ItemType.OTHER, count=6),
+                6,
+                "shared",
+                app.owner_a.id,
+                "org-a",
+            )
+            status, payload, _ = app.request(
+                "POST",
+                "/api/kits/create",
+                {
+                    "name": "Coffee house furniture",
+                    "description": "Reusable front-of-house package.",
+                    "notes": "Load last.",
+                    "items": [{"item_id": "event-table", "amount": 4}],
+                },
+                cookie,
+            )
+            self.assertEqual(status, 201, payload)
+            self.assertEqual(payload["kit"]["items"], [{"item_id": "event-table", "amount": 4}])
+            self.assertEqual(len(payload["state"]["templates"]["kits"]), 1)
+
+    def test_event_cancel_and_empty_draft_delete_are_distinct(self):
+        with ServerHarness() as app:
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+
+            def create(key: str) -> str:
+                status, payload, _ = app.request(
+                    "POST",
+                    "/api/events/save",
+                    {
+                        "description": "Small meeting on 2026-09-22 with no lighting.",
+                        "idempotency_key": key,
+                    },
+                    cookie,
+                )
+                self.assertEqual(status, 201, payload)
+                return payload["event"]["id"]
+
+            cancelled_id = create("cancel-event")
+            cancelled_status, cancelled, _ = app.request(
+                "POST", "/api/events/cancel", {"event_id": cancelled_id}, cookie
+            )
+            self.assertEqual(cancelled_status, 200, cancelled)
+            self.assertEqual(cancelled["event"]["status"], "cancelled")
+
+            deleted_id = create("delete-event")
+            delete_status, _, _ = app.request(
+                "POST",
+                "/api/events/delete",
+                {"event_id": deleted_id, "confirm": True},
+                cookie,
+            )
+            self.assertEqual(delete_status, 200)
+            self.assertIsNone(app.handler.memory.get_for_organization(deleted_id, "org-a"))
+
     def test_demo_sign_in_is_disabled_without_explicit_demo_mode(self):
         with ServerHarness() as app:
             status, _, _ = app.request("POST", "/api/auth/demo", {})

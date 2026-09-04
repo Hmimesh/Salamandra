@@ -7,7 +7,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from sqlalchemy import and_, delete, func, select
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -20,6 +20,7 @@ from database import (
     ItemClassRecordModel,
     MembershipModel,
     OrganizationModel,
+    SavedKitModel,
     SessionModel,
     StockMovementModel,
     TransactionalEventCreation,
@@ -37,7 +38,8 @@ from Inventory import Inventory
 from inventory_workspace import PERSONAL_SCOPE, SHARED_SCOPE
 from Item_node import ItemNode, Requirement, normalize_item_id
 from item_classes import ConfiguredItemClass, ItemClassCatalog
-from security import ResourceNotFound, StateConflict
+from kits import SavedKit, validate_kit_payload
+from security import Permission, ResourceNotFound, StateConflict, require_permission
 
 
 def _aware(value: datetime) -> datetime:
@@ -803,6 +805,86 @@ class PostgresIntegrationStore:
                 row.version += 1
 
 
+class PostgresKitStore:
+    def __init__(self, factory: sessionmaker[Session]):
+        self.factory = factory
+
+    def list_kits(self, organization_id: str) -> list[SavedKit]:
+        with self.factory() as session:
+            rows = session.scalars(
+                select(SavedKitModel)
+                .where(SavedKitModel.organization_id == organization_id)
+                .order_by(SavedKitModel.name, SavedKitModel.id)
+            )
+            return [SavedKit.from_dict(dict(row.data or {})) for row in rows]
+
+    def get(self, kit_id: str, organization_id: str) -> SavedKit | None:
+        with self.factory() as session:
+            row = session.scalar(
+                select(SavedKitModel).where(
+                    SavedKitModel.id == kit_id,
+                    SavedKitModel.organization_id == organization_id,
+                )
+            )
+            return SavedKit.from_dict(dict(row.data or {})) if row else None
+
+    def create(
+        self,
+        data: dict[str, Any],
+        organization_id: str,
+        actor_user_id: str,
+        request_id: str,
+    ) -> SavedKit:
+        kit = validate_kit_payload(data, organization_id)
+        with self.factory.begin() as session:
+            membership = session.scalar(
+                select(MembershipModel).where(
+                    MembershipModel.organization_id == organization_id,
+                    MembershipModel.user_id == actor_user_id,
+                    MembershipModel.status == "active",
+                )
+            )
+            if membership is None:
+                raise ResourceNotFound("Organization membership was not found.")
+            require_permission(membership.role, Permission.KITS_MANAGE)
+            visible_ids = set(
+                session.scalars(
+                    select(InventoryHoldingModel.legacy_item_id).where(
+                        InventoryHoldingModel.organization_id == organization_id,
+                        InventoryHoldingModel.active.is_(True),
+                        or_(
+                            InventoryHoldingModel.scope == SHARED_SCOPE,
+                            and_(
+                                InventoryHoldingModel.scope == PERSONAL_SCOPE,
+                                InventoryHoldingModel.owner_user_id == actor_user_id,
+                            ),
+                        ),
+                    )
+                )
+            )
+            if not {item.item_id for item in kit.items}.issubset(visible_ids):
+                raise ValueError("Choose only inventory available to this workspace account.")
+            row = SavedKitModel(
+                id=kit.id,
+                organization_id=organization_id,
+                name=kit.name,
+                data=kit.to_dict(),
+            )
+            session.add(row)
+            session.add(
+                AuditEventModel(
+                    organization_id=organization_id,
+                    actor_membership_id=membership.id,
+                    action="kit.created",
+                    resource_type="kit",
+                    resource_id=kit.id,
+                    request_id=request_id,
+                    changes={"name": kit.name, "item_count": len(kit.items)},
+                )
+            )
+        return kit
+
+
 class PostgresRuntime:
     def __init__(self, factory: sessionmaker[Session]):
         self.factory = factory
@@ -811,6 +893,7 @@ class PostgresRuntime:
         self.memory = PostgresEventMemory(factory)
         self.item_classes = PostgresItemClassCatalog(factory)
         self.integrations = PostgresIntegrationStore(factory)
+        self.kits = PostgresKitStore(factory)
         self.event_creation = TransactionalEventCreation(factory)
         self.operations = TransactionalEventOperations(factory)
         self.event_details = TransactionalEventDetails(factory)
@@ -905,6 +988,28 @@ class PostgresRuntime:
         if event is None:
             raise ResourceNotFound("Event was not found.")
         return event
+
+    def cancel_event(
+        self, event_id: str, user: UserAccount, request_id: str
+    ) -> EventRecord:
+        self.operations.cancel(
+            user.organization_id,
+            event_id,
+            user.id,
+            request_id,
+        )
+        event = self.memory.get_for_organization(event_id, user.organization_id)
+        if event is None:
+            raise ResourceNotFound("Event was not found.")
+        return event
+
+    def delete_event(self, event_id: str, user: UserAccount, request_id: str) -> None:
+        self.operations.delete_draft(
+            user.organization_id,
+            event_id,
+            user.id,
+            request_id,
+        )
 
     def create_event(
         self,

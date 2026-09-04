@@ -16,6 +16,9 @@ class Permission(StrEnum):
     EVENTS_PLAN = "events.plan"
     EVENTS_CREATE = "events.create"
     EVENTS_UPDATE = "events.update"
+    EVENTS_CANCEL = "events.cancel"
+    EVENTS_DELETE = "events.delete"
+    KITS_MANAGE = "kits.manage"
     OPERATIONS_PACK = "operations.pack"
     OPERATIONS_DISPATCH = "operations.dispatch"
     OPERATIONS_RETURN = "operations.return"
@@ -37,6 +40,8 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
             Permission.EVENTS_PLAN,
             Permission.EVENTS_CREATE,
             Permission.EVENTS_UPDATE,
+            Permission.EVENTS_CANCEL,
+            Permission.KITS_MANAGE,
             Permission.OPERATIONS_PACK,
             Permission.SYNC_RUN,
         }
@@ -53,6 +58,8 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
             Permission.EVENTS_PLAN,
             Permission.EVENTS_CREATE,
             Permission.EVENTS_UPDATE,
+            Permission.EVENTS_CANCEL,
+            Permission.KITS_MANAGE,
             Permission.OPERATIONS_PACK,
             Permission.OPERATIONS_DISPATCH,
             Permission.OPERATIONS_RETURN,

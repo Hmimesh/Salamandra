@@ -28,6 +28,7 @@ from inventory_workspace import PERSONAL_SCOPE, SHARED_SCOPE, InventoryWorkspace
 from integrations import IntegrationStore
 from Item_node import ItemNode, Requirement
 from item_classes import ConfiguredItemClass, DependencyRule, ItemClassCatalog
+from kits import KitStore
 from presets import PresetCatalog
 from security import (
     AccessDenied,
@@ -53,6 +54,7 @@ EVENTS_PATH = DOCS_DIR / "events.json"
 USERS_PATH = DOCS_DIR / "users.json"
 ITEM_CLASSES_PATH = DOCS_DIR / "item_classes.json"
 INTEGRATIONS_PATH = DOCS_DIR / "integrations.json"
+KITS_PATH = DOCS_DIR / "kits.json"
 MAX_JSON_BODY_BYTES = 1_000_000
 LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(logging.NullHandler())
@@ -66,6 +68,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
     memory = EventMemory(EVENTS_PATH)
     item_classes = ItemClassCatalog(ITEM_CLASSES_PATH)
     integrations = IntegrationStore(INTEGRATIONS_PATH)
+    kits = KitStore(KITS_PATH)
     sessions: dict[str, dict[str, float | str]] = {}
     login_attempts: dict[str, list[float]] = {}
     registration_attempts: dict[str, list[float]] = {}
@@ -161,7 +164,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
             self.send_json(
                 {
                     "templates": [],
-                    "kits": [],
+                    "kits": [kit.to_dict() for kit in self.kits.list_kits(user.organization_id)],
                     "suggested_templates": suggestions["templates"],
                     "suggested_kits": suggestions["kits"],
                 }
@@ -380,7 +383,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
             if parsed_url.path == "/api/events/template":
                 require_permission(user.role, Permission.EVENTS_PLAN)
-                plan_request = self.plan_request_from_template(body)
+                plan_request = self.plan_request_from_template(body, user)
                 plan = self.build_event_plan(plan_request, user)
                 self.send_json(
                     {
@@ -401,6 +404,23 @@ class SalamandraServer(BaseHTTPRequestHandler):
                         "state": self.state_payload(user),
                     },
                     HTTPStatus.CREATED if created else HTTPStatus.OK,
+                )
+                return
+
+            if parsed_url.path == "/api/kits/create":
+                require_permission(user.role, Permission.KITS_MANAGE)
+                if self.database_runtime is not None:
+                    kit = self.kits.create(
+                        body,
+                        user.organization_id,
+                        user.id,
+                        self.correlation_id(),
+                    )
+                else:
+                    kit = self.kits.create(body, user.organization_id)
+                self.send_json(
+                    {"kit": kit.to_dict(), "state": self.state_payload(user)},
+                    HTTPStatus.CREATED,
                 )
                 return
 
@@ -496,6 +516,54 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 self.send_json({"event": event.to_dict(), "state": self.state_payload(user)})
                 return
 
+            if parsed_url.path == "/api/events/cancel":
+                require_permission(user.role, Permission.EVENTS_CANCEL)
+                event_id = self.required_identifier(body.get("event_id"), "event_id")
+                if self.database_runtime is not None:
+                    event = self.database_runtime.cancel_event(
+                        event_id, user, self.correlation_id()
+                    )
+                else:
+                    with self.operation_lock:
+                        event = self.event_from_body(body, user)
+                        if event.status == "cancelled":
+                            pass
+                        elif event.status not in {"planning", "confirmed", "packed"}:
+                            raise StateConflict(
+                                "Dispatched and returned events cannot be cancelled."
+                            )
+                        else:
+                            event.status = "cancelled"
+                            event.version += 1
+                            event.add_history(
+                                "cancelled",
+                                user.id,
+                                "Event cancelled. Reserved inventory was released.",
+                            )
+                            self.memory.add(event)
+                self.send_json({"event": event.to_dict(), "state": self.state_payload(user)})
+                return
+
+            if parsed_url.path == "/api/events/delete":
+                require_permission(user.role, Permission.EVENTS_DELETE)
+                if body.get("confirm") is not True:
+                    raise ValueError("Confirm permanent deletion before continuing.")
+                event_id = self.required_identifier(body.get("event_id"), "event_id")
+                if self.database_runtime is not None:
+                    self.database_runtime.delete_event(
+                        event_id, user, self.correlation_id()
+                    )
+                else:
+                    with self.operation_lock:
+                        event = self.event_from_body(body, user)
+                        if event.status != "planning" or event.movements:
+                            raise StateConflict(
+                                "Only an unconfirmed planning event without operational history can be deleted."
+                            )
+                        self.memory.remove(event_id, user.organization_id)
+                self.send_json({"state": self.state_payload(user)})
+                return
+
             if parsed_url.path == "/api/events/describe":
                 require_permission(user.role, Permission.EVENTS_PLAN)
                 draft = EventDescriptionPlanner(
@@ -509,7 +577,9 @@ class SalamandraServer(BaseHTTPRequestHandler):
                     overrides=body.get("overrides"),
                 )
                 draft.record.owner_id = user.id
-                draft.record.assigned_user_ids = [user.id]
+                draft.record.assigned_user_ids = self.valid_event_assignees(
+                    draft.record.assigned_user_ids, user
+                )
                 self.send_json({"draft": draft.to_dict(), "state": self.state_payload(user)})
                 return
 
@@ -608,6 +678,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
                         exclude_event_id=event_id,
                         inventory_user_id=current.owner_id,
                         optimize_overlaps=False,
+                        owner_user_id=current.owner_id,
                     )
                     event = self.database_runtime.update_event(
                         event_id,
@@ -639,10 +710,10 @@ class SalamandraServer(BaseHTTPRequestHandler):
                             exclude_event_id=event_id,
                             inventory_user_id=current.owner_id,
                             optimize_overlaps=False,
+                            owner_user_id=current.owner_id,
                         )
                         event.id = current.id
                         event.owner_id = current.owner_id
-                        event.assigned_user_ids = list(current.assigned_user_ids)
                         event.source_type = current.source_type
                         event.source_id = current.source_id
                         event.created_at = current.created_at
@@ -713,6 +784,11 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 self.send_json(
                     {"imported": imported, "state": self.state_payload(user)}
                 )
+                return
+
+            if parsed_url.path == "/api/inventory/import.preview":
+                require_permission(user.role, Permission.INVENTORY_IMPORT)
+                self.send_json(self.inventory_csv_preview(body))
                 return
 
             if parsed_url.path == "/api/team/invite":
@@ -1032,17 +1108,24 @@ class SalamandraServer(BaseHTTPRequestHandler):
             organization_id=user.organization_id,
         ).build_plan(requests)
 
-    def plan_request_from_template(self, body: dict) -> dict:
+    def plan_request_from_template(self, body: dict, user: UserAccount | None = None) -> dict:
         source_type = body.get("source_type", "template")
         source_id = body.get("source_id", "")
         source = (
-            self.templates.get_kit(source_id)
+            self.kit_source(source_id, user)
             if source_type == "kit"
             else self.templates.get_template(source_id)
         )
         if source is None:
             raise ValueError("Template or kit was not found.")
         return {"items": [item.to_dict() for item in source.items]}
+
+    def kit_source(self, source_id: str, user: UserAccount | None):
+        if user is not None:
+            stored = self.kits.get(source_id, user.organization_id)
+            if stored is not None:
+                return stored
+        return self.templates.get_kit(source_id)
 
     def event_from_body(self, body: dict, user: UserAccount) -> EventRecord:
         event_id = self.required_identifier(body.get("event_id"), "event_id")
@@ -1062,7 +1145,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
         if self.database_runtime is not None:
             def build_authoritative_event() -> dict:
-                source = self.templates.get_kit(source_id)
+                source = self.kit_source(source_id, user)
                 if source is None:
                     raise ResourceNotFound("Kit was not found.")
                 plan = self.build_event_plan(
@@ -1108,7 +1191,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
                     )
                 return existing, False
 
-            source = self.templates.get_kit(source_id)
+            source = self.kit_source(source_id, user)
             if source is None:
                 raise ResourceNotFound("Kit was not found.")
             plan = self.build_event_plan(
@@ -1207,6 +1290,9 @@ class SalamandraServer(BaseHTTPRequestHandler):
                     "location",
                     "duration_minutes",
                     "attendee_count",
+                    "planning_mode",
+                    "capability_requirements",
+                    "assigned_user_ids",
                 )
                 if name in client_event or name in fallback_values
             }
@@ -1220,6 +1306,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 "location": fallback_event.location,
                 "duration_minutes": fallback_event.duration_minutes,
                 "attendee_count": fallback_event.attendee_count,
+                "assigned_user_ids": list(fallback_event.assigned_user_ids),
                 **overrides,
             }
         allowed_overrides = {
@@ -1231,6 +1318,9 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 "location",
                 "duration_minutes",
                 "attendee_count",
+                "planning_mode",
+                "capability_requirements",
+                "assigned_user_ids",
             )
             if name in overrides
         }
@@ -1245,6 +1335,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
         exclude_event_id: str | None = None,
         inventory_user_id: str | None = None,
         optimize_overlaps: bool = True,
+        owner_user_id: str | None = None,
     ) -> EventRecord:
         draft = EventDescriptionPlanner(
             self.workspace.combined_inventory(
@@ -1259,12 +1350,41 @@ class SalamandraServer(BaseHTTPRequestHandler):
         ).draft_from_description(description, overrides=overrides)
         event = draft.record
         event.organization_id = user.organization_id
-        event.owner_id = user.id
-        event.assigned_user_ids = [user.id]
+        event.owner_id = owner_user_id or user.id
+        event.assigned_user_ids = self.valid_event_assignees(
+            list(overrides.get("assigned_user_ids", [])),
+            user,
+            event.owner_id,
+        )
         event.status = "planning"
         event.history = []
         event.movements = []
         return event
+
+    def valid_event_assignees(
+        self,
+        requested_ids: list[str] | tuple[str, ...],
+        user: UserAccount,
+        owner_user_id: str | None = None,
+    ) -> list[str]:
+        if not isinstance(requested_ids, (list, tuple)):
+            raise ValueError("Event crew must be a list of workspace members.")
+        ordered = list(
+            dict.fromkeys(
+                [owner_user_id or user.id, *(str(value).strip() for value in requested_ids)]
+            )
+        )
+        if len(ordered) > 100 or any(not value for value in ordered):
+            raise ValueError("Event crew selection is invalid.")
+        active_ids = {
+            account.id
+            for account in self.accounts.list_organization_users(user.organization_id)
+        }
+        if not set(ordered).issubset(active_ids):
+            raise ValueError(
+                "Choose only active members of this workspace for the event crew."
+            )
+        return ordered
 
     def inventory_scope(self, body: dict) -> str:
         scope = body.get("scope", SHARED_SCOPE)
@@ -1360,7 +1480,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
             "presets": self.catalog.to_dict(),
             "templates": {
                 "templates": [],
-                "kits": [],
+                "kits": [kit.to_dict() for kit in self.kits.list_kits(user.organization_id)],
                 "suggested_templates": suggestion_catalog["templates"],
                 "suggested_kits": suggestion_catalog["kits"],
             },
@@ -1628,57 +1748,90 @@ class SalamandraServer(BaseHTTPRequestHandler):
         if not csv_text.strip():
             raise ValueError("Choose a non-empty CSV file to import.")
         reader = csv.DictReader(io.StringIO(csv_text.lstrip("\ufeff")))
-        if not reader.fieldnames or "id" not in reader.fieldnames:
-            raise ValueError("Inventory CSV must include an id column.")
+        if not reader.fieldnames:
+            raise ValueError("Inventory CSV must include a header row.")
+        mapping = body.get("column_mapping", {})
+        if not isinstance(mapping, dict):
+            raise ValueError("CSV column mapping must be an object.")
+        headers = {str(header).strip().casefold(): str(header) for header in reader.fieldnames}
+
+        def source(name: str, *aliases: str) -> str | None:
+            configured = str(mapping.get(name, "")).strip()
+            if configured:
+                if configured not in reader.fieldnames:
+                    raise ValueError(f"Mapped CSV column {configured} was not found.")
+                return configured
+            return next((headers[value.casefold()] for value in (name, *aliases) if value.casefold() in headers), None)
+
+        columns = {
+            "name": source("name", "item", "equipment", "id"),
+            "count": source("count", "quantity", "qty"),
+            "type": source("type", "category", "department"),
+            "info": source("info", "description", "notes"),
+            "class_id": source("class_id", "class"),
+            "manufacturer": source("manufacturer", "brand"),
+            "model": source("model"),
+            "condition": source("condition", "status"),
+            "capabilities": source("capabilities", "capability"),
+            "connectors": source("connectors", "connector"),
+            "weight_kg": source("weight_kg", "weight"),
+        }
+        if columns["name"] is None:
+            raise ValueError("Map a CSV column to Item name before importing.")
 
         scope = self.authorized_inventory_scope(body, user)
         inventory = self.workspace.inventory_for(scope, user.id, user.organization_id)
-        staged: list[ItemNode] = []
+        staged_by_id = {
+            item.id: ItemNode.from_dict(item.to_dict())
+            for item in inventory.list_items()
+        }
         seen_ids: set[str] = set()
         for row_number, row in enumerate(reader, start=2):
             if row_number > 10_001:
                 raise ValueError("Inventory CSV cannot contain more than 10,000 rows.")
             if any(len(str(value or "")) > 4_096 for value in row.values()):
                 raise ValueError(f"CSV row {row_number} contains a field that is too long.")
-            item_id = str(row.get("id", "")).strip()
-            if not item_id:
+            item_name = str(row.get(columns["name"] or "", "")).strip()
+            if not item_name:
                 continue
-            normalized_id = item_id.strip().lower()
+            item_id = self.csv_item_id(item_name)
+            normalized_id = item_id.casefold()
             if normalized_id in seen_ids:
-                raise ValueError(f"Inventory CSV contains duplicate item id {item_id}.")
+                raise ValueError(f"Inventory CSV contains duplicate item name {item_name}.")
             seen_ids.add(normalized_id)
-            count = int(row.get("count") or 0)
+            count = int(row.get(columns["count"] or "", "") or 0)
             if count < 0:
-                raise ValueError(f"Count cannot be negative for {item_id}.")
+                raise ValueError(f"Count cannot be negative for {item_name}.")
             existing = inventory.get_item(item_id)
             item = ItemNode(
                 id=item_id,
-                type=row.get("type") or (existing.type if existing else "other"),
+                type=row.get(columns["type"] or "", "") or (existing.type if existing else "other"),
                 count=count,
-                info=str(row.get("info", "")),
-                class_id=str(row.get("class_id", "")),
-                manufacturer=str(row.get("manufacturer", "")),
-                model=str(row.get("model", "")),
-                condition=str(row.get("condition", "ready")),
+                info=str(row.get(columns["info"] or "", "")),
+                class_id=str(row.get(columns["class_id"] or "", "")),
+                manufacturer=str(row.get(columns["manufacturer"] or "", "")),
+                model=str(row.get(columns["model"] or "", "")),
+                condition=str(row.get(columns["condition"] or "", "") or "ready"),
                 capabilities=tuple(
                     value.strip()
-                    for value in str(row.get("capabilities", "")).split(";")
+                    for value in str(row.get(columns["capabilities"] or "", "")).split(";")
                     if value.strip()
                 ),
                 connectors=tuple(
                     value.strip()
-                    for value in str(row.get("connectors", "")).split(";")
+                    for value in str(row.get(columns["connectors"] or "", "")).split(";")
                     if value.strip()
                 ),
-                quality_score=int(row.get("quality_score") or 0),
-                preference_score=int(row.get("preference_score") or 0),
-                weight_kg=float(row.get("weight_kg") or 0),
+                quality_score=existing.quality_score if existing else 70,
+                preference_score=existing.preference_score if existing else 70,
+                weight_kg=float(row.get(columns["weight_kg"] or "", "") or 0),
                 in_use_count=existing.in_use_count if existing else 0,
             )
-            staged.append(item)
+            staged_by_id[item.id] = item
 
-        if not staged:
+        if not seen_ids:
             raise ValueError("The CSV did not contain any inventory rows.")
+        staged = list(staged_by_id.values())
         self.workspace.replace_items(
             staged,
             scope,
@@ -1691,7 +1844,45 @@ class SalamandraServer(BaseHTTPRequestHandler):
         )
         self.save_workspace()
         self.integrations.record_transfer(user.organization_id, "imported")
-        return len(staged)
+        return len(seen_ids)
+
+    def inventory_csv_preview(self, body: dict) -> dict:
+        csv_text = str(body.get("csv", ""))
+        if not csv_text.strip():
+            raise ValueError("Choose a non-empty CSV file to preview.")
+        reader = csv.DictReader(io.StringIO(csv_text.lstrip("\ufeff")))
+        if not reader.fieldnames:
+            raise ValueError("Inventory CSV must include a header row.")
+        rows = []
+        for index, row in enumerate(reader):
+            if index >= 5:
+                break
+            rows.append({str(key): str(value or "") for key, value in row.items()})
+        headers = [str(header) for header in reader.fieldnames]
+        folded = {header.casefold(): header for header in headers}
+        aliases = {
+            "name": ("name", "item", "equipment", "id"),
+            "count": ("count", "quantity", "qty"),
+            "type": ("type", "category", "department"),
+            "info": ("info", "description", "notes"),
+            "manufacturer": ("manufacturer", "brand"),
+            "model": ("model",),
+            "condition": ("condition", "status"),
+        }
+        suggested = {
+            field: next((folded[name] for name in names if name in folded), "")
+            for field, names in aliases.items()
+        }
+        return {"headers": headers, "rows": rows, "suggested_mapping": suggested}
+
+    @staticmethod
+    def csv_item_id(name: str) -> str:
+        normalized = "-".join(
+            part for part in "".join(
+                character.lower() if character.isalnum() else " " for character in name
+            ).split() if part
+        )
+        return normalized[:96] or secrets.token_hex(8)
 
     def current_user(self) -> UserAccount | None:
         token = self.session_token()
@@ -2006,6 +2197,7 @@ def run(host: str = "127.0.0.1", port: int = 8000):
         SalamandraServer.memory = runtime.memory
         SalamandraServer.item_classes = runtime.item_classes
         SalamandraServer.integrations = runtime.integrations
+        SalamandraServer.kits = runtime.kits
     elif not web_config.json_dev_enabled and not web_config.demo_enabled:
         raise RuntimeError(
             "Set SALAMANDRA_DATABASE_URL for PostgreSQL, or explicitly enable "
@@ -2020,6 +2212,7 @@ def run(host: str = "127.0.0.1", port: int = 8000):
             allow_demo=demo_enabled,
         )
         SalamandraServer.workspace = InventoryWorkspace(WORKSPACE_PATH, INVENTORY_PATH)
+        SalamandraServer.kits = KitStore(KITS_PATH)
         SalamandraServer.workspace.migrate_preset_metadata(SalamandraServer.catalog)
         SalamandraServer.memory = EventMemory(EVENTS_PATH)
         SalamandraServer.item_classes = ItemClassCatalog(ITEM_CLASSES_PATH)

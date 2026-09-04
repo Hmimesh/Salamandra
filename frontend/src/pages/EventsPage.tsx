@@ -11,18 +11,36 @@ import {
   Pencil,
   Plus,
   RotateCcw,
+  SlidersHorizontal,
   Sparkles,
   Truck,
+  Trash2,
+  UserPlus,
   Users,
+  XCircle,
 } from "lucide-react";
 import { type FormEvent, useMemo, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { Avatar, ConflictState, EmptyState, Modal, PageHeader, Readiness, StatusTag } from "../components/ui";
 import { useWorkspace } from "../context/WorkspaceContext";
 import { eventCrew, eventReadiness, formatDateLong, formatEventDate, titleCase } from "../lib/format";
-import type { EventDraft, EventPlan, EventRecord, PlanLine, StateEnvelope } from "../types";
+import type { EventDraft, EventPlan, EventRecord, PlanLine, StateEnvelope, UserAccount } from "../types";
 
 const weekDays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const requirementOptions = [
+  ["pa.main", "Main PA", "Audio"],
+  ["monitor.stage", "Stage monitor", "Audio"],
+  ["microphone.vocal", "Vocal microphone", "Audio"],
+  ["di.instrument", "Instrument DI", "Audio"],
+  ["lighting.fixture", "Lighting fixture", "Lighting"],
+  ["transport.vehicle", "Transport vehicle", "Transport"],
+  ["furniture.table", "Table", "Furniture"],
+  ["furniture.chair", "Chair", "Furniture"],
+  ["power.distribution", "Power distribution", "Power & site"],
+  ["site.barrier", "Barrier", "Power & site"],
+  ["hospitality.service", "Hospitality service", "Hospitality"],
+] as const;
+type ManualRequirement = { id: string; capability: string; customCapability: string; amount: number; level: string };
 
 function monthCells(month: Date) {
   const first = new Date(month.getFullYear(), month.getMonth(), 1);
@@ -74,6 +92,29 @@ function TransportBand({ plan }: { plan: EventPlan }) {
   return <div className="transport-band"><span className="transport-icon"><Truck size={19} /></span><div><strong>Load & transport</strong><small>{transport.basis}</small></div><span><strong>{transport.vehicle_label}</strong><small>Vehicle</small></span><span><strong>{transport.cart_count} cart{transport.cart_count === 1 ? "" : "s"}</strong><small>Venue movement</small></span><span><strong>{transport.payload_kg} kg</strong><small>{transport.volume_m3} m3 estimated</small></span></div>;
 }
 
+function CrewPicker({ users, selected, requiredId, onChange }: { users: UserAccount[]; selected: string[]; requiredId: string; onChange: (ids: string[]) => void }) {
+  return (
+    <fieldset className="crew-picker">
+      <legend><UserPlus size={16} />Event crew</legend>
+      <p>Choose everyone who should see this event in their assigned work.</p>
+      <div>
+        {users.map((member) => (
+          <label key={member.id}>
+            <input
+              type="checkbox"
+              checked={selected.includes(member.id)}
+              disabled={member.id === requiredId}
+              onChange={(event) => onChange(event.target.checked ? [...selected, member.id] : selected.filter((id) => id !== member.id))}
+            />
+            <Avatar user={member} size="sm" />
+            <span><strong>{member.name}</strong><small>{titleCase(member.role)}</small></span>
+          </label>
+        ))}
+      </div>
+    </fieldset>
+  );
+}
+
 export function EventsPage() {
   const { state, mutate } = useWorkspace();
   const location = useLocation();
@@ -81,6 +122,9 @@ export function EventsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [month, setMonth] = useState(() => new Date());
   const [description, setDescription] = useState("");
+  const [planningMode, setPlanningMode] = useState<"describe" | "manual">("describe");
+  const [manualEvent, setManualEvent] = useState({ title: "", start_date: "", start_time: "", location: "", duration_minutes: 240, attendee_count: 0 });
+  const [manualRequirements, setManualRequirements] = useState<ManualRequirement[]>([{ id: crypto.randomUUID(), capability: "pa.main", customCapability: "", amount: 1, level: "required" }]);
   const [draft, setDraft] = useState<EventDraft | null>(null);
   const [draftDirty, setDraftDirty] = useState(false);
   const [planning, setPlanning] = useState(false);
@@ -88,16 +132,18 @@ export function EventsPage() {
   const [createKey, setCreateKey] = useState(() => crypto.randomUUID());
   const [editing, setEditing] = useState<EventRecord | null>(null);
   const [editingSaving, setEditingSaving] = useState(false);
+  const [overflowDate, setOverflowDate] = useState<string | null>(null);
+  const [destructiveAction, setDestructiveAction] = useState<"cancel" | "delete" | null>(null);
   const showComposer = location.pathname.endsWith("/new");
   const selectedEvent = state!.events.events.find((event) => event.id === searchParams.get("event")) || null;
   const calendarEvents = useMemo(() => {
     const grouped = new Map<string, EventRecord[]>();
-    for (const event of state!.events.events) grouped.set(event.start_date, [...(grouped.get(event.start_date) || []), event]);
+    for (const event of state!.events.events.filter((item) => item.status !== "cancelled")) grouped.set(event.start_date, [...(grouped.get(event.start_date) || []), event]);
     return grouped;
   }, [state]);
   const cells = useMemo(() => monthCells(month), [month]);
   const activeEvents = useMemo(
-    () => state!.events.events.filter((event) => event.status !== "returned").sort((a, b) => `${a.start_date}${a.start_time}`.localeCompare(`${b.start_date}${b.start_time}`)),
+    () => state!.events.events.filter((event) => !["returned", "cancelled"].includes(event.status)).sort((a, b) => `${a.start_date}${a.start_time}`.localeCompare(`${b.start_date}${b.start_time}`)),
     [state],
   );
 
@@ -105,7 +151,19 @@ export function EventsPage() {
     event.preventDefault();
     setPlanning(true);
     try {
-      const response = await mutate<{ draft: EventDraft }>("/api/events/describe", { description });
+      const eventDescription = planningMode === "manual"
+        ? `${manualEvent.title}. Manually structured event requirements.`
+        : description;
+      const response = await mutate<{ draft: EventDraft }>("/api/events/describe", {
+        description: eventDescription,
+        overrides: planningMode === "manual" ? {
+          ...manualEvent,
+          planning_mode: "manual",
+          capability_requirements: manualRequirements.map(({ capability, customCapability, amount, level }) => ({ capability: capability === "custom.resource" ? customCapability : capability, amount, level })),
+          assigned_user_ids: [state!.auth.user!.id],
+        } : { assigned_user_ids: [state!.auth.user!.id] },
+      });
+      setDescription(eventDescription);
       setDraft(response.draft);
       setDraftDirty(false);
       setCreateKey(crypto.randomUUID());
@@ -134,6 +192,8 @@ export function EventsPage() {
           location: draft.event.location,
           duration_minutes: draft.event.duration_minutes,
           attendee_count: draft.event.attendee_count,
+          assigned_user_ids: draft.event.assigned_user_ids,
+          ...(planningMode === "manual" ? { planning_mode: "manual", capability_requirements: manualRequirements.map(({ capability, customCapability, amount, level }) => ({ capability: capability === "custom.resource" ? customCapability : capability, amount, level })) } : {}),
         },
       });
       setDraft(response.draft);
@@ -158,6 +218,8 @@ export function EventsPage() {
           location: draft.event.location,
           duration_minutes: draft.event.duration_minutes,
           attendee_count: draft.event.attendee_count,
+          assigned_user_ids: draft.event.assigned_user_ids,
+          ...(planningMode === "manual" ? { planning_mode: "manual", capability_requirements: manualRequirements.map(({ capability, customCapability, amount, level }) => ({ capability: capability === "custom.resource" ? customCapability : capability, amount, level })) } : {}),
         },
         idempotency_key: createKey,
       }, { success: "Event saved to the workspace." });
@@ -193,6 +255,7 @@ export function EventsPage() {
           location: editing.location,
           duration_minutes: editing.duration_minutes,
           attendee_count: editing.attendee_count,
+          assigned_user_ids: editing.assigned_user_ids,
         },
       }, { success: "Event details and plan updated." });
       setEditing(null);
@@ -211,6 +274,16 @@ export function EventsPage() {
     await mutate("/api/events/status", { event_id: eventId, status }, { success: `Event marked ${titleCase(status).toLowerCase()}.` }).catch(() => undefined);
   }
 
+  async function confirmDestructiveAction() {
+    if (!selectedEvent || !destructiveAction) return;
+    const endpoint = destructiveAction === "cancel" ? "/api/events/cancel" : "/api/events/delete";
+    await mutate(endpoint, { event_id: selectedEvent.id, confirm: true }, {
+      success: destructiveAction === "cancel" ? "Event cancelled and reservations released." : "Draft event permanently deleted.",
+    });
+    setDestructiveAction(null);
+    setSearchParams({});
+  }
+
   return (
     <div className="page events-page">
       <PageHeader
@@ -224,10 +297,9 @@ export function EventsPage() {
           <button className="back-link" type="button" onClick={() => navigate("/events")}><ArrowLeft size={17} />Back to events</button>
           <div className="composer-grid">
             <form className="brief-editor" onSubmit={planEvent}>
-              <div className="brief-title"><span><Sparkles size={20} /></span><div><h2>Describe the event</h2><p>Write it the way the brief reaches you. Salamandra will use only stock in this workspace.</p></div></div>
-              <label className="field-label" htmlFor="event-brief">Event brief</label>
-              <textarea id="event-brief" value={description} onChange={(event) => { setDescription(event.target.value); if (draft) setDraftDirty(true); }} rows={8} placeholder="Conference for 120 guests on 2026-09-12 at 18:00, speeches, panel microphones, stage lighting, and power at Main Hall." required />
-              <div className="example-briefs"><span>Include:</span><span>date and time</span><span>venue</span><span>guest count</span><span>equipment, site, or transport needs</span></div>
+              <div className="brief-title"><span>{planningMode === "describe" ? <Sparkles size={20} /> : <SlidersHorizontal size={20} />}</span><div><h2>{planningMode === "describe" ? "Describe the event" : "Build manually"}</h2><p>{planningMode === "describe" ? "Write it the way the brief reaches you. Salamandra will use only stock in this workspace." : "Enter the schedule and operational needs directly. Inventory is still allocated by the same planner."}</p></div></div>
+              <div className="segmented-control composer-mode" aria-label="Event creation method"><button type="button" className={planningMode === "describe" ? "active" : ""} onClick={() => { setPlanningMode("describe"); setDraft(null); }}>Describe</button><button type="button" className={planningMode === "manual" ? "active" : ""} onClick={() => { setPlanningMode("manual"); setDraft(null); }}>Build manually</button></div>
+              {planningMode === "describe" ? <><label className="field-label" htmlFor="event-brief">Event brief</label><textarea id="event-brief" value={description} onChange={(event) => { setDescription(event.target.value); if (draft) setDraftDirty(true); }} rows={8} placeholder="Conference for 120 guests on 2026-09-12 at 18:00, speeches, panel microphones, stage lighting, and power at Main Hall." required /><div className="example-briefs"><span>Include:</span><span>date and time</span><span>venue</span><span>guest count</span><span>equipment, site, or transport needs</span></div></> : <div className="manual-builder"><div className="form-grid"><label className="form-field-wide">Event name<input value={manualEvent.title} onChange={(event) => setManualEvent({ ...manualEvent, title: event.target.value })} required /></label><label>Date<input type="date" value={manualEvent.start_date} onChange={(event) => setManualEvent({ ...manualEvent, start_date: event.target.value })} required /></label><label>Start time<input type="time" value={manualEvent.start_time} onChange={(event) => setManualEvent({ ...manualEvent, start_time: event.target.value })} required /></label><label>Duration (minutes)<input type="number" min="15" max="10080" value={manualEvent.duration_minutes} onChange={(event) => setManualEvent({ ...manualEvent, duration_minutes: Number(event.target.value) })} required /></label><label>Guests<input type="number" min="0" max="1000000" value={manualEvent.attendee_count || ""} onChange={(event) => setManualEvent({ ...manualEvent, attendee_count: Number(event.target.value || 0) })} /></label><label className="form-field-wide">Venue<input value={manualEvent.location} onChange={(event) => setManualEvent({ ...manualEvent, location: event.target.value })} /></label></div><div className="manual-requirements"><div className="subsection-title"><h3>Requirements</h3><button type="button" className="button button-secondary button-compact" onClick={() => setManualRequirements([...manualRequirements, { id: crypto.randomUUID(), capability: "pa.main", customCapability: "", amount: 1, level: "required" }])}><Plus size={15} />Add</button></div>{manualRequirements.map((requirement) => <div className="manual-requirement-row" key={requirement.id}><label>Department & item<select value={requirement.capability} onChange={(event) => setManualRequirements(manualRequirements.map((item) => item.id === requirement.id ? { ...item, capability: event.target.value } : item))}>{requirementOptions.map(([value, label, group]) => <option key={value} value={value}>{group} · {label}</option>)}<option value="custom.resource">Custom requirement</option></select></label>{requirement.capability === "custom.resource" ? <label>Custom capability<input value={requirement.customCapability} placeholder="example: catering.coffee" onChange={(event) => setManualRequirements(manualRequirements.map((item) => item.id === requirement.id ? { ...item, customCapability: event.target.value } : item))} required /></label> : null}<label>Quantity<input type="number" min="1" max="10000" value={requirement.amount} onChange={(event) => setManualRequirements(manualRequirements.map((item) => item.id === requirement.id ? { ...item, amount: Number(event.target.value) } : item))} required /></label><label>Priority<select value={requirement.level} onChange={(event) => setManualRequirements(manualRequirements.map((item) => item.id === requirement.id ? { ...item, level: event.target.value } : item))}><option value="required">Required</option><option value="recommended">Recommended</option><option value="optional">Optional</option></select></label><button type="button" className="icon-button" aria-label="Remove requirement" title="Remove requirement" disabled={manualRequirements.length === 1} onClick={() => setManualRequirements(manualRequirements.filter((item) => item.id !== requirement.id))}><Trash2 size={16} /></button></div>)}</div></div>}
               <button className="button button-primary button-large" type="submit" disabled={planning}>{planning ? "Building plan..." : "Build event plan"}<ChevronRight size={18} /></button>
             </form>
 
@@ -237,6 +309,7 @@ export function EventsPage() {
                   <div className="generated-plan-head"><div><span>Operations plan</span><h2>{draft.event.title}</h2><p><CalendarDays size={15} />{formatDateLong(draft.event.start_date)} at {draft.event.start_time}</p><p><MapPin size={15} />{draft.event.location || "Location not detected"}</p></div><StatusTag status={draft.event.plan.is_ready ? "confirmed" : "planning"} /></div>
                   <div className="event-facts"><span><small>Scale</small><strong>{titleCase(draft.event.event_size)}</strong></span><span><small>Guests</small><strong>{draft.event.attendee_count || "Not stated"}</strong></span><span><small>Planning focus</small><strong>{planningFocus(draft.event.priority_score)}</strong></span><span><small>Venue</small><strong>{draft.event.venue_kind ? titleCase(draft.event.venue_kind.replaceAll("_", " ")) : "Not stated"}</strong></span></div>
                   <div className="draft-fields"><label>Event name<input value={draft.event.title} onChange={(event) => updateDraft("title", event.target.value)} /></label><label>Date<input type="date" value={draft.event.start_date} onChange={(event) => updateDraft("start_date", event.target.value)} /></label><label>Start<input type="time" value={draft.event.start_time} onChange={(event) => updateDraft("start_time", event.target.value)} /></label><label>Guests<input type="number" min="0" value={draft.event.attendee_count || ""} onChange={(event) => updateDraft("attendee_count", Number(event.target.value || 0))} /></label><label className="draft-field-wide">Venue<input value={draft.event.location} onChange={(event) => updateDraft("location", event.target.value)} /></label></div>
+                  <CrewPicker users={state!.auth.users} selected={draft.event.assigned_user_ids} requiredId={state!.auth.user!.id} onChange={(assigned_user_ids) => setDraft({ ...draft, event: { ...draft.event, assigned_user_ids } })} />
                   {draftDirty ? <div className="recalculate-strip"><AlertTriangle size={16} /><span>Schedule details changed. Recalculate availability before saving.</span><button className="button button-secondary button-compact" type="button" onClick={() => void recalculateDraft()} disabled={planning}><RotateCcw size={15} />Recalculate</button></div> : null}
                   {draft.event.milestones.length ? <div className="run-of-show"><span>Run of show</span><div>{draft.event.milestones.map((milestone) => <div key={`${milestone.time}-${milestone.label}`}><strong>{milestone.time}</strong><span>{milestone.label}</span></div>)}</div></div> : null}
                   <div className="plan-summary"><div><span>Allocated lines</span><strong>{draft.event.plan.lines.filter((line) => line.item_id).length}</strong></div><div><span>Required missing</span><strong>{draft.event.plan.total_missing}</strong></div><div><span>Spare missing</span><strong>{draft.event.plan.recommended_missing}</strong></div></div>
@@ -268,7 +341,7 @@ export function EventsPage() {
                 const dayEvents = calendarEvents.get(key) || [];
                 const muted = date.getMonth() !== month.getMonth();
                 const today = key === isoDate(new Date());
-                return <div className={`calendar-cell ${muted ? "muted" : ""} ${today ? "today" : ""}`} key={key}><span>{date.getDate()}</span>{dayEvents.slice(0, 2).map((event) => <button type="button" className={`calendar-event status-border-${event.status}`} key={event.id} onClick={() => setSearchParams({ event: event.id })}><strong>{event.start_time}</strong>{event.title}</button>)}{dayEvents.length > 2 ? <small>+{dayEvents.length - 2} more</small> : null}</div>;
+                return <div className={`calendar-cell ${muted ? "muted" : ""} ${today ? "today" : ""}`} key={key}><span>{date.getDate()}</span>{dayEvents.slice(0, 2).map((event) => <button type="button" className={`calendar-event status-border-${event.status}`} key={event.id} onClick={() => setSearchParams({ event: event.id })}><strong>{event.start_time}</strong>{event.title}</button>)}{dayEvents.length > 2 ? <button type="button" className="calendar-more" onClick={() => setOverflowDate(key)} aria-label={`Show ${dayEvents.length - 2} more events on ${formatDateLong(key)}`}>+{dayEvents.length - 2} more</button> : null}</div>;
               })}
             </div>
           </section>
@@ -284,7 +357,7 @@ export function EventsPage() {
         </>
       )}
 
-      <Modal open={Boolean(selectedEvent)} title={editing ? "Edit event" : selectedEvent?.title || "Event"} description={selectedEvent ? `${formatDateLong(selectedEvent.start_date)} · ${selectedEvent.start_time} · ${selectedEvent.location || "Location TBD"}` : undefined} onClose={() => { setEditing(null); setSearchParams({}); }} size="lg">
+      <Modal open={Boolean(selectedEvent) && !destructiveAction} title={editing ? "Edit event" : selectedEvent?.title || "Event"} description={selectedEvent ? `${formatDateLong(selectedEvent.start_date)} · ${selectedEvent.start_time} · ${selectedEvent.location || "Location TBD"}` : undefined} onClose={() => { setEditing(null); setSearchParams({}); }} size="lg">
         {selectedEvent && editing ? (
           <form className="event-edit-form" onSubmit={saveEdit}>
             <p className="event-edit-intro">Update the brief or schedule. Salamandra will rebuild the inventory plan from current workspace stock when you save.</p>
@@ -297,6 +370,7 @@ export function EventsPage() {
               <label className="form-field-wide">Venue<input value={editing.location} onChange={(event) => setEditing({ ...editing, location: event.target.value })} /></label>
               <label className="form-field-wide">Event brief<textarea rows={7} value={editing.description} onChange={(event) => setEditing({ ...editing, description: event.target.value })} required /></label>
             </div>
+            <CrewPicker users={state!.auth.users} selected={editing.assigned_user_ids} requiredId={editing.owner_id} onChange={(assigned_user_ids) => setEditing({ ...editing, assigned_user_ids })} />
             <div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => setEditing(null)}>Cancel</button><button className="button button-primary" type="submit" disabled={editingSaving}>{editingSaving ? "Saving changes..." : "Save and rebuild plan"}</button></div>
           </form>
         ) : selectedEvent ? (
@@ -309,9 +383,17 @@ export function EventsPage() {
               <section><div className="subsection-title"><h3>Operations plan</h3><span>{selectedEvent.plan.lines.length} lines</span></div><div className="detail-gear-list">{selectedEvent.plan.lines.map((line, index) => <div key={`${line.level}-${line.capability}-${line.item_id}-${index}`}><span><strong>{line.amount}x {line.item_id ? titleCase(line.item_id) : capabilityName(line.capability)}</strong><small>{lineBreakdown(line)} · {titleCase(line.type || line.capability)}</small></span><span className={line.missing ? "line-missing" : "line-ready"}>{line.missing ? `${line.missing} missing` : "Ready"}</span></div>)}</div></section>
             </div>
             {selectedEvent.status !== "planning" ? <p className="event-edit-lock-note"><AlertTriangle size={16} />Editing is locked after confirmation to protect reservations and inventory movement history.</p> : null}
-            <div className="modal-actions"><button className="button button-secondary" onClick={() => setSearchParams({})}>Close</button>{selectedEvent.status === "planning" ? <button className="button button-secondary" type="button" onClick={() => beginEdit(selectedEvent)}><Pencil size={16} />Edit event</button> : null}{eventAction(selectedEvent) ? <button className="button button-primary" onClick={() => void changeStatus(selectedEvent.id, eventAction(selectedEvent)!.status)}>{eventAction(selectedEvent)!.label}</button> : null}</div>
+            <div className="modal-actions"><button className="button button-secondary" onClick={() => setSearchParams({})}>Close</button>{selectedEvent.status === "planning" && ["owner", "admin"].includes(state!.auth.user!.role) ? <button className="button button-danger" type="button" onClick={() => setDestructiveAction("delete")}><Trash2 size={16} />Delete draft</button> : null}{["planning", "confirmed", "packed"].includes(selectedEvent.status) ? <button className="button button-secondary" type="button" onClick={() => setDestructiveAction("cancel")}><XCircle size={16} />Cancel event</button> : null}{selectedEvent.status === "planning" ? <button className="button button-secondary" type="button" onClick={() => beginEdit(selectedEvent)}><Pencil size={16} />Edit event</button> : null}{eventAction(selectedEvent) ? <button className="button button-primary" onClick={() => void changeStatus(selectedEvent.id, eventAction(selectedEvent)!.status)}>{eventAction(selectedEvent)!.label}</button> : null}</div>
           </div>
         ) : null}
+      </Modal>
+      <Modal open={Boolean(overflowDate)} title={overflowDate ? `Events on ${formatDateLong(overflowDate)}` : "Events"} onClose={() => setOverflowDate(null)}>
+        <div className="calendar-overflow-list">
+          {(overflowDate ? calendarEvents.get(overflowDate) || [] : []).map((event) => <button type="button" key={event.id} onClick={() => { setOverflowDate(null); setSearchParams({ event: event.id }); }}><span><strong>{event.start_time}</strong><small>{event.location || "Location TBD"}</small></span><b>{event.title}</b><StatusTag status={event.status} /></button>)}
+        </div>
+      </Modal>
+      <Modal open={Boolean(destructiveAction)} title={destructiveAction === "delete" ? "Delete this draft?" : "Cancel this event?"} description={destructiveAction === "delete" ? "This permanently removes an unconfirmed draft. This cannot be undone." : "The event will move to history and any reserved inventory will be released."} onClose={() => setDestructiveAction(null)}>
+        <div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => setDestructiveAction(null)}>Keep event</button><button className="button button-danger" type="button" onClick={() => void confirmDestructiveAction()}>{destructiveAction === "delete" ? "Delete permanently" : "Cancel event"}</button></div>
       </Modal>
     </div>
   );

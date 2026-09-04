@@ -40,12 +40,13 @@ function categoryLabel(category: string): string {
 }
 
 function inventoryGroups(items: InventoryItem[]) {
-  const groups = new Map<string, { total: number; ready: number; unavailable: number }>();
+  const groups = new Map<string, { total: number; ready: number; out: number; attention: number }>();
   for (const item of items) {
-    const current = groups.get(item.type) || { total: 0, ready: 0, unavailable: 0 };
+    const current = groups.get(item.type) || { total: 0, ready: 0, out: 0, attention: 0 };
     current.total += item.count + item.in_use_count;
-    current.ready += item.count;
-    current.unavailable += item.in_use_count;
+    current.ready += item.condition === "ready" ? item.count : 0;
+    current.attention += item.condition === "ready" ? 0 : item.count;
+    current.out += item.in_use_count;
     groups.set(item.type, current);
   }
   return [...groups.entries()]
@@ -114,7 +115,7 @@ export function DashboardPage() {
   const user = state!.auth.user!;
   const isEmptyWorkspace = state!.events.events.length === 0 && state!.inventory.items.length === 0;
   const events = useMemo(
-    () => state!.events.events.filter((event) => event.status !== "returned").sort((a, b) => a.start_date.localeCompare(b.start_date)),
+    () => state!.events.events.filter((event) => !["returned", "cancelled"].includes(event.status)).sort((a, b) => a.start_date.localeCompare(b.start_date)),
     [state],
   );
   const activity = useMemo(() => allActivity(state!.events.events).slice(0, 5), [state]);
@@ -172,12 +173,11 @@ export function DashboardPage() {
 
       <div className="dashboard-lower-grid">
         <section className="data-section inventory-health-section">
-          <div className="section-title-row"><div><h2>Inventory health</h2><p>Availability across operational categories.</p></div><button className="text-button" type="button" onClick={() => navigate("/inventory")}>View inventory<ArrowRight size={16} /></button></div>
+          <div className="section-title-row"><div><h2>Inventory readiness</h2><p>What is ready, out, or needs attention.</p></div><button className="text-button" type="button" onClick={() => navigate("/inventory")}>View inventory<ArrowRight size={16} /></button></div>
           <div className="health-table">
-            <div className="health-row health-head"><span>Category</span><span>Total</span><span>Ready</span><span>Out</span><span>Health</span></div>
+            <div className="health-row health-head"><span>Category</span><span>Total</span><span>Ready</span><span>Out</span><span>Attention</span></div>
             {groups.map(([category, values]) => {
-              const health = values.total ? Math.round((values.ready / values.total) * 100) : 100;
-              return <div className="health-row" key={category}><strong>{categoryLabel(category)}</strong><span>{values.total}</span><span>{values.ready}</span><span>{values.unavailable}</span><span className="health-score">{health}%<i><i style={{ width: `${health}%` }} /></i></span></div>;
+              return <div className="health-row" key={category}><strong>{categoryLabel(category)}</strong><span>{values.total}</span><span>{values.ready}</span><span>{values.out}</span><span className={values.attention ? "line-missing" : "line-ready"}>{values.attention || "None"}</span></div>;
             })}
           </div>
         </section>

@@ -179,6 +179,14 @@ class EventMemory:
         self.events[event.id] = event
         self.save()
 
+    def remove(self, event_id: str, organization_id: str) -> bool:
+        event = self.get_for_organization(event_id, organization_id)
+        if event is None:
+            return False
+        del self.events[event_id]
+        self.save()
+        return True
+
     def get(self, event_id: str) -> EventRecord | None:
         return self.events.get(event_id)
 

@@ -188,7 +188,6 @@ class TestTransactionalDatabase(unittest.TestCase):
                 {**payload, "description": "A different event."},
                 event_data,
             )
-
         with self.factory() as session:
             events = session.scalar(
                 select(func.count()).select_from(EventModel).where(
@@ -213,6 +212,107 @@ class TestTransactionalDatabase(unittest.TestCase):
         self.assertEqual(events, 2)
         self.assertEqual(operations, 1)
         self.assertEqual(audits, 1)
+
+    def test_event_creation_validates_and_persists_same_workspace_crew(self):
+        with self.factory.begin() as session:
+            session.add(
+                UserModel(
+                    id="operator-org-a",
+                    email="operator@org-a.test",
+                    name="Operator A",
+                    password_hash="test-only",
+                )
+            )
+            session.flush()
+            session.add(
+                MembershipModel(
+                    id="membership-operator-org-a",
+                    organization_id="org-a",
+                    user_id="operator-org-a",
+                    role="operator",
+                )
+            )
+        data = {
+            "title": "Crew event",
+            "description": "Crew event on 2026-09-20.",
+            "start_date": "2026-09-20",
+            "start_time": "10:00",
+            "duration_minutes": 120,
+            "assigned_user_ids": ["operator-org-a"],
+            "plan": {"lines": []},
+        }
+        row, _ = TransactionalEventCreation(self.factory).create(
+            "org-a", "owner-org-a", "crew-event-key", "crew-request", {}, data
+        )
+        self.assertEqual(
+            row.data["assigned_user_ids"], ["owner-org-a", "operator-org-a"]
+        )
+        with self.assertRaises(ValueError):
+            TransactionalEventCreation(self.factory).create(
+                "org-a",
+                "owner-org-a",
+                "foreign-crew-key",
+                "foreign-crew-request",
+                {},
+                {**data, "assigned_user_ids": ["owner-org-b"]},
+            )
+
+    def test_cancel_releases_reservation_and_preserves_history(self):
+        self.transition("confirmed")
+        cancelled = TransactionalEventOperations(self.factory).cancel(
+            "org-a", "event-a", "owner-org-a", "cancel-request"
+        )
+        retried = TransactionalEventOperations(self.factory).cancel(
+            "org-a", "event-a", "owner-org-a", "cancel-retry"
+        )
+        with self.factory() as session:
+            holding = session.get(InventoryHoldingModel, "holding-a")
+            movement_count = session.scalar(
+                select(func.count(StockMovementModel.id)).where(
+                    StockMovementModel.organization_id == "org-a",
+                    StockMovementModel.event_id == "event-a",
+                    StockMovementModel.action == "cancelled",
+                )
+            )
+            allocation_count = session.scalar(
+                select(func.count(AllocationModel.id)).where(
+                    AllocationModel.event_id == "event-a"
+                )
+            )
+        self.assertEqual((cancelled.status, retried.status), ("cancelled", "cancelled"))
+        self.assertEqual((holding.available_quantity, holding.reserved_quantity), (1, 0))
+        self.assertEqual((movement_count, allocation_count), (1, 0))
+
+    def test_only_empty_planning_event_can_be_deleted(self):
+        service = TransactionalEventOperations(self.factory)
+        service.delete_draft("org-a", "event-a", "owner-org-a", "delete-request")
+        with self.factory() as session:
+            self.assertIsNone(session.get(EventModel, "event-a"))
+            self.assertEqual(
+                session.scalar(
+                    select(func.count(AuditEventModel.id)).where(
+                        AuditEventModel.action == "event.deleted",
+                        AuditEventModel.resource_id == "event-a",
+                    )
+                ),
+                1,
+            )
+
+    def test_saved_kit_is_scoped_and_uses_visible_inventory(self):
+        runtime = PostgresRuntime(self.factory)
+        kit = runtime.kits.create(
+            {
+                "name": "Microphone package",
+                "description": "A reusable package.",
+                "items": [{"item_id": "sm58", "amount": 1}],
+            },
+            "org-a",
+            "owner-org-a",
+            "kit-create-request",
+        )
+        self.assertEqual(runtime.kits.get(kit.id, "org-a").name, "Microphone package")
+        self.assertIsNone(runtime.kits.get(kit.id, "org-b"))
+        self.assertEqual([stored.id for stored in runtime.kits.list_kits("org-a")], [kit.id])
 
     def test_event_edit_is_versioned_scoped_and_lifecycle_safe(self):
         details = TransactionalEventDetails(self.factory)
@@ -1334,6 +1434,7 @@ class TestAlembicMigration(unittest.TestCase):
             "stock_movements",
             "audit_events",
             "sessions",
+            "saved_kits",
             "operation_requests",
             "inventory_adjustments",
         }

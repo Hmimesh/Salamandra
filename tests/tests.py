@@ -269,6 +269,30 @@ class TestEventDescriptionPlanner(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
+    def test_manual_event_uses_structured_capabilities_without_text_inference(self):
+        draft = self.description_planner.draft_from_description(
+            "Manual community dinner.",
+            overrides={
+                "planning_mode": "manual",
+                "start_date": "2026-09-21",
+                "start_time": "18:00",
+                "capability_requirements": [
+                    {"capability": "furniture.table", "amount": 8, "level": "required"},
+                    {"capability": "hospitality.service", "amount": 2, "level": "recommended"},
+                ],
+                "assigned_user_ids": ["owner", "operator"],
+            },
+        )
+        self.assertEqual(
+            [(need.capability, need.amount, need.level) for need in draft.record.capability_requirements],
+            [
+                ("furniture.table", 8, "required"),
+                ("hospitality.service", 2, "recommended"),
+            ],
+        )
+        self.assertEqual(draft.record.assigned_user_ids, ["owner", "operator"])
+        self.assertNotIn("pa.main", {need.capability for need in draft.record.capability_requirements})
+
     def test_description_generates_plan_and_google_payload(self):
         draft = self.description_planner.draft_from_description(
             "Outdoor conference for 120 people on 2026-09-12 at 18:00, "

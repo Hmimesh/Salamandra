@@ -86,12 +86,17 @@ class EventDescriptionPlanner:
         event_size = self._extract_event_size(clean_description, attendee_count)
         venue_kind = self._extract_venue_kind(clean_description)
         priority_score = self._priority_score(clean_description, event_size)
-        capability_requirements = self._capability_requests(
-            clean_description,
-            event_size,
-            attendee_count,
-            venue_kind,
-        )
+        if overrides.get("planning_mode") == "manual":
+            capability_requirements = self._manual_capability_requests(
+                overrides.get("capability_requirements", [])
+            )
+        else:
+            capability_requirements = self._capability_requests(
+                clean_description,
+                event_size,
+                attendee_count,
+                venue_kind,
+            )
         requested_items = self._legacy_requests_from_capabilities(capability_requirements)
         learned_items = self.memory.suggest_from_history(
             clean_description,
@@ -152,6 +157,7 @@ class EventDescriptionPlanner:
             duration_minutes=duration_minutes,
             location=overrides.get("location") or self._extract_location(clean_description),
             organization_id=self.organization_id,
+            assigned_user_ids=list(overrides.get("assigned_user_ids", [])),
             requested_items=requested_items,
             capability_requirements=capability_requirements,
             milestones=milestones,
@@ -164,6 +170,39 @@ class EventDescriptionPlanner:
         record.google_calendar_payload = self.google_calendar_payload(record)
         record.prepare_operations()
         return EventDraft(record=record, learned_items=learned_items)
+
+    def _manual_capability_requests(
+        self, values: Any
+    ) -> list[CapabilityRequirement]:
+        if not isinstance(values, list) or not values:
+            raise ValueError("Add at least one requirement to the manual event plan.")
+        requirements: list[CapabilityRequirement] = []
+        for value in values:
+            if not isinstance(value, dict):
+                raise ValueError("Each event requirement must be an object.")
+            capability = str(value.get("capability", "")).strip().lower()
+            if not capability or len(capability) > 120 or not re.fullmatch(
+                r"[a-z0-9][a-z0-9._-]*", capability
+            ):
+                raise ValueError("Each manual requirement needs a valid capability.")
+            try:
+                amount = int(value.get("amount", 0))
+            except (TypeError, ValueError) as error:
+                raise ValueError("Requirement quantity must be a whole number.") from error
+            if amount < 1 or amount > 10_000:
+                raise ValueError("Requirement quantity must be between 1 and 10,000.")
+            level = str(value.get("level", "required")).strip().lower()
+            if level not in {"required", "recommended", "optional"}:
+                raise ValueError("Requirement priority is invalid.")
+            requirements.append(
+                CapabilityRequirement(
+                    capability=capability,
+                    amount=amount,
+                    level=level,
+                    source="manual",
+                )
+            )
+        return self._merge_capability_requirements(requirements)
 
     def google_calendar_payload(self, event: EventRecord) -> dict[str, Any]:
         start = datetime.fromisoformat(f"{event.start_date}T{event.start_time}:00")

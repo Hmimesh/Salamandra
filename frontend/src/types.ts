@@ -235,7 +235,7 @@ export interface EventRecord {
   location: string;
   source_type: string;
   source_id: string;
-  status: "planning" | "confirmed" | "packed" | "out" | "returned";
+  status: "planning" | "confirmed" | "packed" | "out" | "returned" | "cancelled";
   organization_id: string;
   owner_id: string;
   assigned_user_ids: string[];

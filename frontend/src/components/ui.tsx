@@ -91,6 +91,8 @@ export function Modal({
     panel?.querySelector<HTMLElement>("button, input, select, textarea, a[href], [tabindex]:not([tabindex='-1'])")?.focus();
 
     function handleKeyDown(event: KeyboardEvent) {
+      const dialogs = [...document.querySelectorAll<HTMLElement>("[role='dialog'][aria-modal='true']")];
+      if (dialogs.at(-1) !== panel) return;
       if (event.key === "Escape") {
         event.preventDefault();
         closeHandler.current();

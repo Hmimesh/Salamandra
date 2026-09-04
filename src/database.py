@@ -18,6 +18,7 @@ from sqlalchemy import (
     UniqueConstraint,
     and_,
     create_engine,
+    delete,
     or_,
     select,
     text,
@@ -178,7 +179,7 @@ class EventModel(Base):
     __table_args__ = (
         UniqueConstraint("id", "organization_id", name="uq_events_id_org"),
         CheckConstraint(
-            "status IN ('planning', 'confirmed', 'packed', 'out', 'returned')",
+            "status IN ('planning', 'confirmed', 'packed', 'out', 'returned', 'cancelled')",
             name="ck_events_status",
         ),
         CheckConstraint("version > 0", name="ck_events_version"),
@@ -189,6 +190,25 @@ class EventModel(Base):
             name="fk_events_owner_same_org",
         ),
         Index("ix_events_org_window", "organization_id", "status", "starts_at", "ends_at"),
+    )
+
+
+class SavedKitModel(Base):
+    __tablename__ = "saved_kits"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("id", "organization_id", name="uq_saved_kits_id_org"),
+        CheckConstraint("version > 0", name="ck_saved_kits_version"),
+        Index("ix_saved_kits_org_name", "organization_id", "name"),
     )
 
 
@@ -497,6 +517,32 @@ def active_membership(
     return membership
 
 
+def active_assignee_ids(
+    session: Session,
+    organization_id: str,
+    owner_user_id: str,
+    requested_ids: list[str] | tuple[str, ...],
+) -> list[str]:
+    ordered = list(dict.fromkeys([owner_user_id, *(str(value).strip() for value in requested_ids)]))
+    if len(ordered) > 100 or any(not value for value in ordered):
+        raise ValueError("Event crew selection is invalid.")
+    active_ids = set(
+        session.scalars(
+            select(MembershipModel.user_id)
+            .join(UserModel, UserModel.id == MembershipModel.user_id)
+            .where(
+                MembershipModel.organization_id == organization_id,
+                MembershipModel.user_id.in_(ordered),
+                MembershipModel.status == "active",
+                UserModel.status == "active",
+            )
+        )
+    )
+    if active_ids != set(ordered):
+        raise ValueError("Choose only active members of this workspace for the event crew.")
+    return ordered
+
+
 class TransactionalEventCreation:
     """Idempotent server-owned event creation."""
 
@@ -558,12 +604,18 @@ class TransactionalEventCreation:
 
                 event_id = new_id()
                 authoritative_data = dict(event_data)
+                assigned_user_ids = active_assignee_ids(
+                    session,
+                    organization_id,
+                    owner_user_id,
+                    list(authoritative_data.get("assigned_user_ids", [])),
+                )
                 authoritative_data.update(
                     {
                         "id": event_id,
                         "organization_id": organization_id,
                         "owner_id": owner_user_id,
-                        "assigned_user_ids": [owner_user_id],
+                        "assigned_user_ids": assigned_user_ids,
                         "status": "planning",
                         "movements": [],
                         "plan_verified": True,
@@ -852,16 +904,23 @@ class TransactionalEventDetails:
                 "description": previous_data.get("description", ""),
             }
             authoritative_data = dict(event_data)
+            assigned_user_ids = active_assignee_ids(
+                session,
+                organization_id,
+                event.owner_user_id,
+                list(
+                    authoritative_data.get(
+                        "assigned_user_ids",
+                        previous_data.get("assigned_user_ids", [event.owner_user_id]),
+                    )
+                ),
+            )
             authoritative_data.update(
                 {
                     "id": event.id,
                     "organization_id": organization_id,
                     "owner_id": event.owner_user_id,
-                    "assigned_user_ids": list(
-                        previous_data.get(
-                            "assigned_user_ids", [event.owner_user_id]
-                        )
-                    ),
+                    "assigned_user_ids": assigned_user_ids,
                     "source_type": previous_data.get("source_type", ""),
                     "source_id": previous_data.get("source_id", ""),
                     "status": "planning",
@@ -1049,6 +1108,190 @@ class TransactionalEventOperations:
             )
         )
         return event
+
+    def cancel(
+        self,
+        organization_id: str,
+        event_id: str,
+        actor_user_id: str,
+        request_id: str,
+    ) -> EventModel:
+        with self.factory.begin() as session:
+            membership = active_membership(session, organization_id, actor_user_id)
+            require_permission(membership.role, Permission.EVENTS_CANCEL)
+            event = session.scalar(
+                select(EventModel)
+                .where(
+                    EventModel.id == event_id,
+                    EventModel.organization_id == organization_id,
+                )
+                .with_for_update()
+            )
+            if event is None:
+                raise ResourceNotFound("Event was not found.")
+            if event.status == "cancelled":
+                return event
+            if event.status not in {"planning", "confirmed", "packed"}:
+                raise StateConflict(
+                    "Dispatched and returned events cannot be cancelled. Preserve their operational history."
+                )
+
+            released = self._release_allocation(session, event)
+            event.status = "cancelled"
+            event.version += 1
+            data = dict(event.data or {})
+            data["status"] = "cancelled"
+            history = list(data.get("history", []))
+            history.append(
+                {
+                    "action": "cancelled",
+                    "actor_id": actor_user_id,
+                    "note": "Event cancelled. Reserved inventory was released.",
+                    "timestamp": utc_now().isoformat(),
+                }
+            )
+            data["history"] = history
+            event.data = data
+            if released:
+                session.add(
+                    StockMovementModel(
+                        organization_id=organization_id,
+                        event_id=event.id,
+                        action="cancelled",
+                        idempotency_key=f"{event.id}:cancelled",
+                        actor_membership_id=membership.id,
+                        lines=released,
+                    )
+                )
+            session.add(
+                AuditEventModel(
+                    organization_id=organization_id,
+                    actor_membership_id=membership.id,
+                    action="event.cancelled",
+                    resource_type="event",
+                    resource_id=event.id,
+                    request_id=request_id,
+                    changes={"released": released, "version": event.version},
+                )
+            )
+            return event
+
+    def delete_draft(
+        self,
+        organization_id: str,
+        event_id: str,
+        actor_user_id: str,
+        request_id: str,
+    ) -> None:
+        with self.factory.begin() as session:
+            membership = active_membership(session, organization_id, actor_user_id)
+            require_permission(membership.role, Permission.EVENTS_DELETE)
+            event = session.scalar(
+                select(EventModel)
+                .where(
+                    EventModel.id == event_id,
+                    EventModel.organization_id == organization_id,
+                )
+                .with_for_update()
+            )
+            if event is None:
+                raise ResourceNotFound("Event was not found.")
+            if event.status != "planning":
+                raise StateConflict("Only an unconfirmed planning event can be deleted permanently.")
+            if session.scalar(
+                select(AllocationModel.id).where(
+                    AllocationModel.organization_id == organization_id,
+                    AllocationModel.event_id == event.id,
+                )
+            ) or session.scalar(
+                select(StockMovementModel.id).where(
+                    StockMovementModel.organization_id == organization_id,
+                    StockMovementModel.event_id == event.id,
+                )
+            ):
+                raise StateConflict("This event has operational history and cannot be deleted.")
+            session.execute(
+                delete(OperationRequestModel).where(
+                    OperationRequestModel.organization_id == organization_id,
+                    OperationRequestModel.resource_id == event.id,
+                )
+            )
+            session.delete(event)
+            session.add(
+                AuditEventModel(
+                    organization_id=organization_id,
+                    actor_membership_id=membership.id,
+                    action="event.deleted",
+                    resource_type="event",
+                    resource_id=event_id,
+                    request_id=request_id,
+                    changes={"status": "planning"},
+                )
+            )
+
+    def _release_allocation(
+        self, session: Session, event: EventModel
+    ) -> list[dict[str, Any]]:
+        allocation = session.scalar(
+            select(AllocationModel)
+            .where(
+                AllocationModel.organization_id == event.organization_id,
+                AllocationModel.event_id == event.id,
+            )
+            .with_for_update()
+        )
+        if allocation is None:
+            return []
+        if allocation.status not in {"reserved", "packed"}:
+            raise StateConflict("This event allocation cannot be released safely.")
+        lines = list(
+            session.scalars(
+                select(AllocationLineModel)
+                .where(
+                    AllocationLineModel.organization_id == event.organization_id,
+                    AllocationLineModel.allocation_id == allocation.id,
+                )
+                .order_by(AllocationLineModel.holding_id)
+                .with_for_update()
+            )
+        )
+        holding_ids = [line.holding_id for line in lines]
+        holdings = {
+            holding.id: holding
+            for holding in session.scalars(
+                select(InventoryHoldingModel)
+                .where(
+                    InventoryHoldingModel.organization_id == event.organization_id,
+                    InventoryHoldingModel.id.in_(holding_ids),
+                )
+                .order_by(InventoryHoldingModel.id)
+                .with_for_update()
+            )
+        }
+        bucket = f"{allocation.status}_quantity"
+        released: list[dict[str, Any]] = []
+        for line in lines:
+            holding = holdings.get(line.holding_id)
+            if holding is None or line.state != allocation.status:
+                raise StateConflict("Event allocation is inconsistent and cannot be cancelled.")
+            quantity = int(getattr(holding, bucket))
+            if quantity < line.quantity:
+                raise StateConflict("Event allocation quantity is inconsistent.")
+            setattr(holding, bucket, quantity - line.quantity)
+            holding.available_quantity += line.quantity
+            holding.version += 1
+            released.append(
+                {
+                    "scope": holding.scope,
+                    "owner_user_id": holding.owner_user_id or "",
+                    "item_id": holding.legacy_item_id,
+                    "amount": line.quantity,
+                    "from": allocation.status,
+                    "to": "available",
+                }
+            )
+        session.delete(allocation)
+        return released
 
     def _reserve_plan(self, session: Session, event: EventModel):
         if event.data.get("plan_verified") is not True:
