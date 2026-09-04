@@ -138,6 +138,7 @@ def _serve_postgres(
     DatabaseHandler.sessions = {}
     DatabaseHandler.login_attempts = {}
     DatabaseHandler.registration_attempts = {}
+    DatabaseHandler.event_create_requests = {}
     DatabaseHandler.web_config = replace(
         WebConfig.local_default(),
         registration_mode="open",
@@ -328,6 +329,10 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         self.assertEqual(state["auth"]["users"], [registered])
         self.assertEqual(state["inventory"]["items"], [])
         self.assertEqual(state["events"]["events"], [])
+        self.assertEqual(state["templates"]["kits"], [])
+        self.assertEqual(state["templates"]["templates"], [])
+        self.assertGreater(len(state["templates"]["suggested_kits"]), 0)
+        self.assertGreater(len(state["templates"]["suggested_templates"]), 0)
         self.assertNotIn("password", json.dumps(payload).lower())
 
         with self.factory() as session:
@@ -359,6 +364,184 @@ class TestPostgresHttpRuntime(unittest.TestCase):
                 ),
                 0,
             )
+
+    @race_required
+    def test_concurrent_duplicate_event_creation_commits_once(self):
+        cookie = self._sign_in(self.ports[0])
+        suffix = uuid4().hex
+        body = {
+            "description": (
+                f"A small internal meeting {suffix} for 10 guests on "
+                "2026-09-28 with no lighting."
+            ),
+            "overrides": {"title": f"Retry-safe event {suffix}"},
+            "idempotency_key": f"event-create-race-{suffix}",
+        }
+        barrier = threading.Barrier(2)
+        results: list[tuple[int, dict, dict[str, str]]] = []
+        result_lock = threading.Lock()
+
+        def create(port: int) -> None:
+            barrier.wait(timeout=5)
+            result = _request(port, "POST", "/api/events/save", body, cookie)
+            with result_lock:
+                results.append(result)
+
+        threads = [
+            threading.Thread(target=create, args=(self.ports[0],)),
+            threading.Thread(target=create, args=(self.ports[1],)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(sorted(status for status, _, _ in results), [200, 201])
+        event_ids = {payload["event"]["id"] for _, payload, _ in results}
+        self.assertEqual(len(event_ids), 1)
+        event_id = next(iter(event_ids))
+        with self.factory() as session:
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(EventModel).where(
+                        EventModel.id == event_id,
+                        EventModel.organization_id == "runtime-org",
+                    )
+                ),
+                1,
+            )
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(OperationRequestModel).where(
+                        OperationRequestModel.organization_id == "runtime-org",
+                        OperationRequestModel.operation == "event.create",
+                        OperationRequestModel.idempotency_key
+                        == body["idempotency_key"],
+                    )
+                ),
+                1,
+            )
+            self.assertEqual(
+                session.scalar(
+                    select(func.count()).select_from(AuditEventModel).where(
+                        AuditEventModel.organization_id == "runtime-org",
+                        AuditEventModel.resource_id == event_id,
+                        AuditEventModel.action == "event.created",
+                    )
+                ),
+                1,
+            )
+
+        conflict_status, _, _ = _request(
+            self.ports[0],
+            "POST",
+            "/api/events/save",
+            {**body, "description": "A different event on 2026-09-29."},
+            cookie,
+        )
+        self.assertEqual(conflict_status, 409)
+
+    def test_event_edit_http_is_versioned_scoped_and_lifecycle_safe(self):
+        port = self.ports[0]
+        cookie = self._sign_in(port)
+        other_cookie = self._sign_in_other(port)
+        suffix = uuid4().hex
+        create_status, created, _ = _request(
+            port,
+            "POST",
+            "/api/events/save",
+            {
+                "description": f"Small meeting {suffix} on 2026-09-26.",
+                "overrides": {"title": f"Editable {suffix}"},
+                "idempotency_key": f"editable-{suffix}",
+            },
+            cookie,
+        )
+        self.assertEqual(create_status, 201, created)
+        event = created["event"]
+        edit = {
+            "event_id": event["id"],
+            "version": event["version"],
+            "description": f"Edited meeting {suffix} for 45 guests on 2026-09-27.",
+            "overrides": {
+                "title": f"Edited {suffix}",
+                "start_date": "2026-09-27",
+                "start_time": "19:00",
+                "location": "Updated venue",
+                "attendee_count": 45,
+            },
+        }
+
+        unauthorized_status, _, _ = _request(
+            port, "POST", "/api/events/update", edit, other_cookie
+        )
+        updated_status, updated, _ = _request(
+            port, "POST", "/api/events/update", edit, cookie
+        )
+        stale_status, _, _ = _request(
+            self.ports[1], "POST", "/api/events/update", edit, cookie
+        )
+
+        self.assertEqual(unauthorized_status, 403)
+        self.assertEqual(updated_status, 200, updated)
+        self.assertEqual(updated["event"]["title"], f"Edited {suffix}")
+        self.assertEqual(updated["event"]["attendee_count"], 45)
+        self.assertEqual(stale_status, 409)
+
+        foreign_org_id = f"foreign-edit-org-{suffix}"
+        foreign_user_id = f"foreign-edit-user-{suffix}"
+        foreign_event_id = f"foreign-edit-event-{suffix}"
+        with self.factory.begin() as session:
+            session.add(OrganizationModel(id=foreign_org_id, name="Foreign edit org"))
+            session.add(
+                UserModel(
+                    id=foreign_user_id,
+                    email=f"foreign-edit-{suffix}@example.test",
+                    name="Foreign edit owner",
+                    password_hash=AccountStore.hash_password("foreign-password"),
+                )
+            )
+            session.flush()
+            session.add(
+                MembershipModel(
+                    organization_id=foreign_org_id,
+                    user_id=foreign_user_id,
+                    role="owner",
+                )
+            )
+            session.flush()
+            session.add(
+                EventModel(
+                    id=foreign_event_id,
+                    organization_id=foreign_org_id,
+                    owner_user_id=foreign_user_id,
+                    title="Foreign event",
+                    status="planning",
+                    data={"description": "Private", "plan": {"lines": []}},
+                )
+            )
+        cross_status, _, _ = _request(
+            port,
+            "POST",
+            "/api/events/update",
+            {**edit, "event_id": foreign_event_id},
+            cookie,
+        )
+        self.assertEqual(cross_status, 404)
+
+        with self.factory.begin() as session:
+            row = session.get(EventModel, event["id"])
+            row.status = "confirmed"
+        restricted_status, restricted, _ = _request(
+            port,
+            "POST",
+            "/api/events/update",
+            {**edit, "version": updated["event"]["version"]},
+            cookie,
+        )
+        self.assertEqual(restricted_status, 409)
+        self.assertIn("Only planning events", restricted["error"])
 
     @race_required
     def test_concurrent_normalized_email_registration_commits_once(self):

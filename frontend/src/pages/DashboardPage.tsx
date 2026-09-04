@@ -7,7 +7,6 @@ import {
   PackageCheck,
   PackagePlus,
   RotateCcw,
-  Trophy,
   UserPlus,
 } from "lucide-react";
 import { useMemo } from "react";
@@ -125,11 +124,6 @@ export function DashboardPage() {
   const readyPercent = events.length ? Math.round((tracked / events.length) * 100) : 100;
   const totalStock = state!.inventory.summary.in_stock + state!.inventory.summary.in_use;
   const inventoryPercent = totalStock ? Math.round((state!.inventory.summary.in_stock / totalStock) * 100) : 100;
-  const completedEvents = state!.events.events.filter((event) => event.status === "returned").length;
-  const closedChecks = state!.events.events.flatMap((event) => [...event.checklist, ...event.return_checklist]).filter((item) => item.done).length;
-  const operationsPoints = completedEvents * 100 + closedChecks * 5 + tracked * 20;
-  const operationsLevel = Math.floor(operationsPoints / 250) + 1;
-  const levelProgress = operationsPoints % 250;
 
   if (isEmptyWorkspace) return <FirstRunDashboard />;
 
@@ -146,8 +140,6 @@ export function DashboardPage() {
         <article><span className="metric-icon amber"><AlertTriangle size={22} /></span><div><strong>{conflictCount}</strong><span>Stock conflicts</span><small>{conflictCount ? "Needs attention" : "No blockers"}</small></div></article>
         <article><span className="metric-icon green"><PackageCheck size={22} /></span><div><strong>{inventoryPercent}%</strong><span>Inventory ready</span><small>{state!.inventory.summary.in_use} items out</small></div></article>
       </section>
-
-      {user.preferences.show_progress ? <section className="operations-progress" aria-label="Operations progress"><span className="progress-mark"><Trophy size={20} /></span><div className="progress-copy"><span><strong>Operations level {operationsLevel}</strong><small>{operationsPoints} points from completed jobs and checklists</small></span><div className="operations-progress-track"><span style={{ width: `${(levelProgress / 250) * 100}%` }} /></div></div><div className="progress-facts"><span><strong>{completedEvents}</strong>jobs returned</span><span><strong>{closedChecks}</strong>checks closed</span><span><strong>{250 - levelProgress}</strong>to next level</span></div></section> : null}
 
       <section className="data-section upcoming-section">
         <div className="section-title-row"><div><h2>Upcoming events</h2><p>Readiness, crew, and stock position at a glance.</p></div><button className="text-button" type="button" onClick={() => navigate("/events")}>View calendar<ArrowRight size={16} /></button></div>

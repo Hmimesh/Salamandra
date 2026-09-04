@@ -8,6 +8,7 @@ import {
   ChevronRight,
   Clock3,
   MapPin,
+  Pencil,
   Plus,
   RotateCcw,
   Sparkles,
@@ -61,6 +62,12 @@ function lineBreakdown(line: PlanLine): string {
   return parts.join(" + ") || `${line.amount} planned`;
 }
 
+function planningFocus(score: number): string {
+  if (score >= 75) return "Reliability first";
+  if (score >= 55) return "Balanced operation";
+  return "Standard operation";
+}
+
 function TransportBand({ plan }: { plan: EventPlan }) {
   const transport = plan.transport_summary;
   if (!transport?.vehicle_label) return null;
@@ -77,6 +84,10 @@ export function EventsPage() {
   const [draft, setDraft] = useState<EventDraft | null>(null);
   const [draftDirty, setDraftDirty] = useState(false);
   const [planning, setPlanning] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [createKey, setCreateKey] = useState(() => crypto.randomUUID());
+  const [editing, setEditing] = useState<EventRecord | null>(null);
+  const [editingSaving, setEditingSaving] = useState(false);
   const showComposer = location.pathname.endsWith("/new");
   const selectedEvent = state!.events.events.find((event) => event.id === searchParams.get("event")) || null;
   const calendarEvents = useMemo(() => {
@@ -97,6 +108,7 @@ export function EventsPage() {
       const response = await mutate<{ draft: EventDraft }>("/api/events/describe", { description });
       setDraft(response.draft);
       setDraftDirty(false);
+      setCreateKey(crypto.randomUUID());
     } catch {
       // The workspace provider reports the API message.
     } finally {
@@ -104,7 +116,7 @@ export function EventsPage() {
     }
   }
 
-  function updateDraft(field: "title" | "start_date" | "start_time" | "location", value: string) {
+  function updateDraft(field: "title" | "start_date" | "start_time" | "location" | "attendee_count", value: string | number) {
     setDraft((current) => current ? { ...current, event: { ...current.event, [field]: value } } : current);
     setDraftDirty(true);
   }
@@ -121,6 +133,7 @@ export function EventsPage() {
           start_time: draft.event.start_time,
           location: draft.event.location,
           duration_minutes: draft.event.duration_minutes,
+          attendee_count: draft.event.attendee_count,
         },
       });
       setDraft(response.draft);
@@ -133,7 +146,8 @@ export function EventsPage() {
   }
 
   async function saveDraft() {
-    if (!draft) return;
+    if (!draft || saving) return;
+    setSaving(true);
     try {
       await mutate<StateEnvelope & { event: EventRecord }>("/api/events/save", {
         description,
@@ -143,14 +157,49 @@ export function EventsPage() {
           start_time: draft.event.start_time,
           location: draft.event.location,
           duration_minutes: draft.event.duration_minutes,
+          attendee_count: draft.event.attendee_count,
         },
+        idempotency_key: createKey,
       }, { success: "Event saved to the workspace." });
       setDraft(null);
       setDescription("");
       setDraftDirty(false);
+      setCreateKey(crypto.randomUUID());
       navigate("/events");
     } catch {
       // The workspace provider reports the API message.
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function beginEdit(event: EventRecord) {
+    setEditing({ ...event });
+  }
+
+  async function saveEdit(event: FormEvent) {
+    event.preventDefault();
+    if (!editing || editingSaving) return;
+    setEditingSaving(true);
+    try {
+      await mutate<StateEnvelope & { event: EventRecord }>("/api/events/update", {
+        event_id: editing.id,
+        version: editing.version,
+        description: editing.description,
+        overrides: {
+          title: editing.title,
+          start_date: editing.start_date,
+          start_time: editing.start_time,
+          location: editing.location,
+          duration_minutes: editing.duration_minutes,
+          attendee_count: editing.attendee_count,
+        },
+      }, { success: "Event details and plan updated." });
+      setEditing(null);
+    } catch {
+      // The workspace provider reports the API message.
+    } finally {
+      setEditingSaving(false);
     }
   }
 
@@ -177,7 +226,7 @@ export function EventsPage() {
             <form className="brief-editor" onSubmit={planEvent}>
               <div className="brief-title"><span><Sparkles size={20} /></span><div><h2>Describe the event</h2><p>Write it the way the brief reaches you. Salamandra will use only stock in this workspace.</p></div></div>
               <label className="field-label" htmlFor="event-brief">Event brief</label>
-              <textarea id="event-brief" value={description} onChange={(event) => setDescription(event.target.value)} rows={8} placeholder="Conference for 120 guests on 2026-09-12 at 18:00, speeches, panel microphones, stage lighting, and power at Main Hall." required />
+              <textarea id="event-brief" value={description} onChange={(event) => { setDescription(event.target.value); if (draft) setDraftDirty(true); }} rows={8} placeholder="Conference for 120 guests on 2026-09-12 at 18:00, speeches, panel microphones, stage lighting, and power at Main Hall." required />
               <div className="example-briefs"><span>Include:</span><span>date and time</span><span>venue</span><span>guest count</span><span>equipment, site, or transport needs</span></div>
               <button className="button button-primary button-large" type="submit" disabled={planning}>{planning ? "Building plan..." : "Build event plan"}<ChevronRight size={18} /></button>
             </form>
@@ -186,8 +235,8 @@ export function EventsPage() {
               {draft ? (
                 <>
                   <div className="generated-plan-head"><div><span>Operations plan</span><h2>{draft.event.title}</h2><p><CalendarDays size={15} />{formatDateLong(draft.event.start_date)} at {draft.event.start_time}</p><p><MapPin size={15} />{draft.event.location || "Location not detected"}</p></div><StatusTag status={draft.event.plan.is_ready ? "confirmed" : "planning"} /></div>
-                  <div className="event-facts"><span><small>Scale</small><strong>{titleCase(draft.event.event_size)}</strong></span><span><small>Guests</small><strong>{draft.event.attendee_count || "Not stated"}</strong></span><span><small>Priority</small><strong>{draft.event.priority_score}/100</strong></span><span><small>Venue</small><strong>{draft.event.venue_kind ? titleCase(draft.event.venue_kind.replaceAll("_", " ")) : "Not stated"}</strong></span></div>
-                  <div className="draft-fields"><label>Event name<input value={draft.event.title} onChange={(event) => updateDraft("title", event.target.value)} /></label><label>Date<input type="date" value={draft.event.start_date} onChange={(event) => updateDraft("start_date", event.target.value)} /></label><label>Start<input type="time" value={draft.event.start_time} onChange={(event) => updateDraft("start_time", event.target.value)} /></label><label>Venue<input value={draft.event.location} onChange={(event) => updateDraft("location", event.target.value)} /></label></div>
+                  <div className="event-facts"><span><small>Scale</small><strong>{titleCase(draft.event.event_size)}</strong></span><span><small>Guests</small><strong>{draft.event.attendee_count || "Not stated"}</strong></span><span><small>Planning focus</small><strong>{planningFocus(draft.event.priority_score)}</strong></span><span><small>Venue</small><strong>{draft.event.venue_kind ? titleCase(draft.event.venue_kind.replaceAll("_", " ")) : "Not stated"}</strong></span></div>
+                  <div className="draft-fields"><label>Event name<input value={draft.event.title} onChange={(event) => updateDraft("title", event.target.value)} /></label><label>Date<input type="date" value={draft.event.start_date} onChange={(event) => updateDraft("start_date", event.target.value)} /></label><label>Start<input type="time" value={draft.event.start_time} onChange={(event) => updateDraft("start_time", event.target.value)} /></label><label>Guests<input type="number" min="0" value={draft.event.attendee_count || ""} onChange={(event) => updateDraft("attendee_count", Number(event.target.value || 0))} /></label><label className="draft-field-wide">Venue<input value={draft.event.location} onChange={(event) => updateDraft("location", event.target.value)} /></label></div>
                   {draftDirty ? <div className="recalculate-strip"><AlertTriangle size={16} /><span>Schedule details changed. Recalculate availability before saving.</span><button className="button button-secondary button-compact" type="button" onClick={() => void recalculateDraft()} disabled={planning}><RotateCcw size={15} />Recalculate</button></div> : null}
                   {draft.event.milestones.length ? <div className="run-of-show"><span>Run of show</span><div>{draft.event.milestones.map((milestone) => <div key={`${milestone.time}-${milestone.label}`}><strong>{milestone.time}</strong><span>{milestone.label}</span></div>)}</div></div> : null}
                   <div className="plan-summary"><div><span>Allocated lines</span><strong>{draft.event.plan.lines.filter((line) => line.item_id).length}</strong></div><div><span>Required missing</span><strong>{draft.event.plan.total_missing}</strong></div><div><span>Spare missing</span><strong>{draft.event.plan.recommended_missing}</strong></div></div>
@@ -198,11 +247,11 @@ export function EventsPage() {
                       const name = line.item_id ? titleCase(line.item_id) : capabilityName(line.capability);
                       const details = line.reasons.join(" · ") || (line.source === "event" ? "From the event brief" : `Required by ${titleCase(line.source)}`);
                       const missing = line.required_missing || line.recommended_missing || line.optional_missing;
-                      return <div className={`plan-line level-${line.level}`} key={`${line.level}-${line.capability}-${line.item_id}-${index}`}><span><strong>{line.amount}x {name}</strong><small className="line-breakdown">{lineBreakdown(line)}</small><small title={details}>{line.item_id ? details : "No matching inventory item is available"}</small>{line.alternatives.length ? <small className="alternative-copy">Alternatives: {line.alternatives.slice(0, 2).map((item) => `${titleCase(item.item_id)} (${Math.round(item.score)})`).join(", ")}</small> : null}</span><span><em>{line.required_amount && line.recommended_amount ? "required + spare" : line.level}</em><b className={missing ? "line-missing" : "line-ready"}>{missing ? `${missing} missing` : line.substitution ? "Substitute" : "Allocated"}</b></span></div>;
+                      return <div className={`plan-line level-${line.level}`} key={`${line.level}-${line.capability}-${line.item_id}-${index}`}><span><strong>{line.amount}x {name}</strong><small className="line-breakdown">{lineBreakdown(line)}</small><small title={details}>{line.item_id ? details : "No matching inventory item is available"}</small>{line.alternatives.length ? <small className="alternative-copy">Other suitable stock: {line.alternatives.slice(0, 2).map((item) => titleCase(item.item_id)).join(", ")}</small> : null}</span><span><em>{line.required_amount && line.recommended_amount ? "required + spare" : line.level}</em><b className={missing ? "line-missing" : "line-ready"}>{missing ? `${missing} missing` : line.substitution ? "Substitute" : "Allocated"}</b></span></div>;
                     })}
                   </div>
                   {draft.event.plan.total_missing ? <div className="planning-warning"><AlertTriangle size={17} /><span><strong>Required stock is still missing</strong><small>The event can be saved in planning so the team can resolve rentals or inventory changes.</small></span></div> : null}
-                  <div className="composer-actions"><button className="button button-secondary" type="button" onClick={() => { setDraft(null); setDraftDirty(false); }}>Revise brief</button><button className="button button-primary" type="button" onClick={() => void saveDraft()} disabled={draftDirty}>{draft.event.plan.total_missing ? "Save as planning" : "Save event"}</button></div>
+                  <div className="composer-actions"><button className="button button-secondary" type="button" onClick={() => { setDraft(null); setDraftDirty(false); setCreateKey(crypto.randomUUID()); }}>Revise brief</button><button className="button button-primary" type="button" onClick={() => void saveDraft()} disabled={draftDirty || saving || planning}>{saving ? "Saving event..." : draft.event.plan.total_missing ? "Save as planning" : "Save event"}</button></div>
                 </>
               ) : <EmptyState title="Your operations plan will appear here" message="Salamandra detects the schedule, venue, equipment, site needs, transport, linked requirements, and stock conflicts from the brief." />}
             </section>
@@ -235,8 +284,22 @@ export function EventsPage() {
         </>
       )}
 
-      <Modal open={Boolean(selectedEvent)} title={selectedEvent?.title || "Event"} description={selectedEvent ? `${formatDateLong(selectedEvent.start_date)} · ${selectedEvent.start_time} · ${selectedEvent.location || "Location TBD"}` : undefined} onClose={() => setSearchParams({})} size="lg">
-        {selectedEvent ? (
+      <Modal open={Boolean(selectedEvent)} title={editing ? "Edit event" : selectedEvent?.title || "Event"} description={selectedEvent ? `${formatDateLong(selectedEvent.start_date)} · ${selectedEvent.start_time} · ${selectedEvent.location || "Location TBD"}` : undefined} onClose={() => { setEditing(null); setSearchParams({}); }} size="lg">
+        {selectedEvent && editing ? (
+          <form className="event-edit-form" onSubmit={saveEdit}>
+            <p className="event-edit-intro">Update the brief or schedule. Salamandra will rebuild the inventory plan from current workspace stock when you save.</p>
+            <div className="form-grid event-edit-grid">
+              <label className="form-field-wide">Event name<input value={editing.title} onChange={(event) => setEditing({ ...editing, title: event.target.value })} required /></label>
+              <label>Date<input type="date" value={editing.start_date} onChange={(event) => setEditing({ ...editing, start_date: event.target.value })} required /></label>
+              <label>Start time<input type="time" value={editing.start_time} onChange={(event) => setEditing({ ...editing, start_time: event.target.value })} required /></label>
+              <label>Duration (minutes)<input type="number" min="15" max="10080" value={editing.duration_minutes} onChange={(event) => setEditing({ ...editing, duration_minutes: Number(event.target.value) })} required /></label>
+              <label>Guests<input type="number" min="0" max="1000000" value={editing.attendee_count} onChange={(event) => setEditing({ ...editing, attendee_count: Number(event.target.value) })} /></label>
+              <label className="form-field-wide">Venue<input value={editing.location} onChange={(event) => setEditing({ ...editing, location: event.target.value })} /></label>
+              <label className="form-field-wide">Event brief<textarea rows={7} value={editing.description} onChange={(event) => setEditing({ ...editing, description: event.target.value })} required /></label>
+            </div>
+            <div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => setEditing(null)}>Cancel</button><button className="button button-primary" type="submit" disabled={editingSaving}>{editingSaving ? "Saving changes..." : "Save and rebuild plan"}</button></div>
+          </form>
+        ) : selectedEvent ? (
           <div className="event-detail">
             <div className="event-detail-summary"><div><StatusTag status={selectedEvent.status} /><Readiness value={eventReadiness(selectedEvent)} /></div><div><Users size={17} />{eventCrew(selectedEvent, state!.auth.users).map((member) => member.name).join(", ") || "No crew assigned"}</div></div>
             <p className="event-description">{selectedEvent.description}</p>
@@ -245,7 +308,8 @@ export function EventsPage() {
               <section><div className="subsection-title"><h3>{selectedEvent.status === "out" ? "Return checklist" : "Packing checklist"}</h3><span>{(selectedEvent.status === "out" ? selectedEvent.return_checklist : selectedEvent.checklist).filter((item) => item.done).length}/{(selectedEvent.status === "out" ? selectedEvent.return_checklist : selectedEvent.checklist).length}</span></div><div className="checklist-list">{(selectedEvent.status === "out" ? selectedEvent.return_checklist : selectedEvent.checklist).map((item) => <label key={item.id}><input type="checkbox" checked={item.done} onChange={(event) => void toggleChecklist(selectedEvent.id, item.phase, item.item_id, event.target.checked)} /><span><strong>{item.amount}x {titleCase(item.item_id)}</strong><small>{item.phase === "return" ? "Inspect and return to stock" : "Pack and verify"}</small></span><CheckCircle2 size={18} /></label>)}</div></section>
               <section><div className="subsection-title"><h3>Operations plan</h3><span>{selectedEvent.plan.lines.length} lines</span></div><div className="detail-gear-list">{selectedEvent.plan.lines.map((line, index) => <div key={`${line.level}-${line.capability}-${line.item_id}-${index}`}><span><strong>{line.amount}x {line.item_id ? titleCase(line.item_id) : capabilityName(line.capability)}</strong><small>{lineBreakdown(line)} · {titleCase(line.type || line.capability)}</small></span><span className={line.missing ? "line-missing" : "line-ready"}>{line.missing ? `${line.missing} missing` : "Ready"}</span></div>)}</div></section>
             </div>
-            <div className="modal-actions"><button className="button button-secondary" onClick={() => setSearchParams({})}>Close</button>{eventAction(selectedEvent) ? <button className="button button-primary" onClick={() => void changeStatus(selectedEvent.id, eventAction(selectedEvent)!.status)}>{eventAction(selectedEvent)!.label}</button> : null}</div>
+            {selectedEvent.status !== "planning" ? <p className="event-edit-lock-note"><AlertTriangle size={16} />Editing is locked after confirmation to protect reservations and inventory movement history.</p> : null}
+            <div className="modal-actions"><button className="button button-secondary" onClick={() => setSearchParams({})}>Close</button>{selectedEvent.status === "planning" ? <button className="button button-secondary" type="button" onClick={() => beginEdit(selectedEvent)}><Pencil size={16} />Edit event</button> : null}{eventAction(selectedEvent) ? <button className="button button-primary" onClick={() => void changeStatus(selectedEvent.id, eventAction(selectedEvent)!.status)}>{eventAction(selectedEvent)!.label}</button> : null}</div>
           </div>
         ) : null}
       </Modal>

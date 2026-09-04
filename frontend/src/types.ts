@@ -82,7 +82,7 @@ export interface UserAccount {
   avatar_url: string;
   preferences: {
     theme: "system" | "light" | "dark";
-    font_scale: "compact" | "comfortable" | "large";
+    font_scale: "compact" | "comfortable" | "large" | "largest";
     density: "compact" | "comfortable";
     show_progress: boolean;
     onboarding_dismissed: boolean;
@@ -254,6 +254,7 @@ export interface EventRecord {
   movements: StockMovement[];
   sync_status: string;
   google_calendar_payload: Record<string, unknown>;
+  version: number;
   created_at: string;
 }
 
@@ -275,7 +276,12 @@ export interface WorkspaceState {
   inventory: InventoryCollection;
   inventories: Record<InventoryScope, InventoryCollection>;
   presets: { presets: Preset[]; tags: string[] };
-  templates: { templates: EventTemplate[]; kits: EventTemplate[] };
+  templates: {
+    templates: EventTemplate[];
+    kits: EventTemplate[];
+    suggested_templates: EventTemplate[];
+    suggested_kits: EventTemplate[];
+  };
   item_classes: { classes: ItemClass[] };
   integrations: Record<"crm" | "google_sheets" | "excel", {
     id: string;

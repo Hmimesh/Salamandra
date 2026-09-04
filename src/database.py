@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -497,6 +497,179 @@ def active_membership(
     return membership
 
 
+class TransactionalEventCreation:
+    """Idempotent server-owned event creation."""
+
+    OPERATION = "event.create"
+
+    def __init__(self, factory: sessionmaker[Session]):
+        self.factory = factory
+
+    def create(
+        self,
+        organization_id: str,
+        owner_user_id: str,
+        idempotency_key: str,
+        request_id: str,
+        request_payload: dict[str, Any],
+        event_data: dict[str, Any],
+    ) -> tuple[EventModel, bool]:
+        idempotency_key = idempotency_key.strip()
+        if not organization_id or not owner_user_id:
+            raise ValueError("Event creation context is incomplete.")
+        if not idempotency_key or len(idempotency_key) > 160:
+            raise ValueError("Event creation idempotency key is invalid.")
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                request_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        try:
+            with self.factory.begin() as session:
+                membership = active_membership(
+                    session, organization_id, owner_user_id
+                )
+                require_permission(membership.role, Permission.EVENTS_CREATE)
+                organization = session.scalar(
+                    select(OrganizationModel)
+                    .where(OrganizationModel.id == organization_id)
+                    .with_for_update()
+                )
+                if organization is None:
+                    raise ResourceNotFound("Organization was not found.")
+
+                existing = self._request(
+                    session, organization_id, idempotency_key, lock=True
+                )
+                if existing is not None:
+                    return self._existing_result(session, existing, fingerprint)
+
+                operation = OperationRequestModel(
+                    organization_id=organization_id,
+                    operation=self.OPERATION,
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=fingerprint,
+                )
+                session.add(operation)
+                session.flush()
+
+                event_id = new_id()
+                authoritative_data = dict(event_data)
+                authoritative_data.update(
+                    {
+                        "id": event_id,
+                        "organization_id": organization_id,
+                        "owner_id": owner_user_id,
+                        "assigned_user_ids": [owner_user_id],
+                        "status": "planning",
+                        "movements": [],
+                        "plan_verified": True,
+                        "version": 1,
+                    }
+                )
+                starts_at = self._event_start(authoritative_data)
+                duration_minutes = int(
+                    authoritative_data.get("duration_minutes", 240)
+                )
+                event = EventModel(
+                    id=event_id,
+                    organization_id=organization_id,
+                    owner_user_id=owner_user_id,
+                    title=str(authoritative_data.get("title", "Untitled event")),
+                    status="planning",
+                    starts_at=starts_at,
+                    ends_at=(
+                        starts_at + timedelta(minutes=duration_minutes)
+                        if starts_at
+                        else None
+                    ),
+                    priority_score=int(authoritative_data.get("priority_score", 50)),
+                    version=1,
+                    data=authoritative_data,
+                )
+                session.add(event)
+                session.flush()
+
+                operation.status = "completed"
+                operation.resource_id = event.id
+                operation.response = {"event_id": event.id}
+                operation.completed_at = utc_now()
+                session.add(
+                    AuditEventModel(
+                        organization_id=organization_id,
+                        actor_membership_id=membership.id,
+                        action="event.created",
+                        resource_type="event",
+                        resource_id=event.id,
+                        request_id=request_id,
+                        changes={
+                            "idempotency_key": idempotency_key,
+                            "version": event.version,
+                        },
+                    )
+                )
+                return event, True
+        except IntegrityError:
+            with self.factory() as session:
+                existing = self._request(
+                    session, organization_id, idempotency_key, lock=False
+                )
+                if existing is None:
+                    raise
+                return self._existing_result(session, existing, fingerprint)
+
+    def _request(
+        self,
+        session: Session,
+        organization_id: str,
+        idempotency_key: str,
+        *,
+        lock: bool,
+    ) -> OperationRequestModel | None:
+        statement = select(OperationRequestModel).where(
+            OperationRequestModel.organization_id == organization_id,
+            OperationRequestModel.operation == self.OPERATION,
+            OperationRequestModel.idempotency_key == idempotency_key,
+        )
+        if lock:
+            statement = statement.with_for_update()
+        return session.scalar(statement)
+
+    @staticmethod
+    def _existing_result(
+        session: Session,
+        request: OperationRequestModel,
+        fingerprint: str,
+    ) -> tuple[EventModel, bool]:
+        if request.request_fingerprint != fingerprint:
+            raise StateConflict(
+                "This idempotency key was already used for another event."
+            )
+        if request.status != "completed" or not request.resource_id:
+            raise StateConflict("This event creation is still being processed.")
+        event = session.scalar(
+            select(EventModel).where(
+                EventModel.id == request.resource_id,
+                EventModel.organization_id == request.organization_id,
+            )
+        )
+        if event is None:
+            raise StateConflict("The completed event is unavailable.")
+        return event, False
+
+    @staticmethod
+    def _event_start(data: dict[str, Any]) -> datetime | None:
+        try:
+            return datetime.fromisoformat(
+                f"{data.get('start_date', '')}T{data.get('start_time', '10:00')}:00"
+            ).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+
+
 class TransactionalEventDetails:
     """Narrow commands for event fields that do not own operational state."""
 
@@ -633,6 +806,116 @@ class TransactionalEventDetails:
                     resource_id=event.id,
                     request_id=request_id,
                     changes={"version": event.version},
+                )
+            )
+            return event
+
+    def update_event(
+        self,
+        organization_id: str,
+        event_id: str,
+        expected_version: int,
+        event_data: dict[str, Any],
+        actor_user_id: str,
+        request_id: str,
+    ) -> EventModel:
+        if expected_version < 1:
+            raise ValueError("Event version is invalid.")
+        with self.factory.begin() as session:
+            membership = active_membership(session, organization_id, actor_user_id)
+            require_permission(membership.role, Permission.EVENTS_UPDATE)
+            event = self._event(session, organization_id, event_id)
+            if event.status != "planning":
+                raise StateConflict(
+                    "Only planning events can be edited. Confirmed, packed, "
+                    "dispatched, and returned events are locked to protect inventory history."
+                )
+            if event.version != expected_version:
+                raise StateConflict(
+                    "This event changed after you opened it. Reload and review the latest version."
+                )
+            if session.scalar(
+                select(AllocationModel.id).where(
+                    AllocationModel.organization_id == organization_id,
+                    AllocationModel.event_id == event.id,
+                )
+            ):
+                raise StateConflict("An allocated event cannot be edited in place.")
+
+            previous_data = dict(event.data or {})
+            previous = {
+                "title": event.title,
+                "start_date": previous_data.get("start_date", ""),
+                "start_time": previous_data.get("start_time", ""),
+                "location": previous_data.get("location", ""),
+                "attendee_count": previous_data.get("attendee_count", 0),
+                "description": previous_data.get("description", ""),
+            }
+            authoritative_data = dict(event_data)
+            authoritative_data.update(
+                {
+                    "id": event.id,
+                    "organization_id": organization_id,
+                    "owner_id": event.owner_user_id,
+                    "assigned_user_ids": list(
+                        previous_data.get(
+                            "assigned_user_ids", [event.owner_user_id]
+                        )
+                    ),
+                    "source_type": previous_data.get("source_type", ""),
+                    "source_id": previous_data.get("source_id", ""),
+                    "status": "planning",
+                    "movements": [],
+                    "created_at": previous_data.get("created_at", utc_now().isoformat()),
+                    "plan_verified": True,
+                }
+            )
+            history = list(previous_data.get("history", []))
+            history.append(
+                {
+                    "action": "edited",
+                    "actor_id": actor_user_id,
+                    "note": "Event details and plan updated.",
+                    "timestamp": utc_now().isoformat(),
+                }
+            )
+            authoritative_data["history"] = history
+
+            starts_at = TransactionalEventCreation._event_start(authoritative_data)
+            duration_minutes = int(authoritative_data.get("duration_minutes", 240))
+            event.title = str(authoritative_data.get("title", "Untitled event"))
+            event.starts_at = starts_at
+            event.ends_at = (
+                starts_at + timedelta(minutes=duration_minutes) if starts_at else None
+            )
+            event.priority_score = int(authoritative_data.get("priority_score", 50))
+            event.version += 1
+            authoritative_data["version"] = event.version
+            event.data = authoritative_data
+
+            current = {
+                "title": event.title,
+                "start_date": authoritative_data.get("start_date", ""),
+                "start_time": authoritative_data.get("start_time", ""),
+                "location": authoritative_data.get("location", ""),
+                "attendee_count": authoritative_data.get("attendee_count", 0),
+                "description": authoritative_data.get("description", ""),
+            }
+            changed_fields = sorted(
+                field for field in current if current[field] != previous[field]
+            )
+            session.add(
+                AuditEventModel(
+                    organization_id=organization_id,
+                    actor_membership_id=membership.id,
+                    action="event.edited",
+                    resource_type="event",
+                    resource_id=event.id,
+                    request_id=request_id,
+                    changes={
+                        "changed_fields": changed_fields,
+                        "version": event.version,
+                    },
                 )
             )
             return event

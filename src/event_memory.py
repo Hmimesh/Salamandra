@@ -40,6 +40,7 @@ class EventRecord:
     movements: list[dict[str, Any]] = field(default_factory=list)
     sync_status: str = "local"
     google_calendar_payload: dict[str, Any] = field(default_factory=dict)
+    version: int = 1
     id: str = field(default_factory=lambda: uuid4().hex)
     created_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
@@ -80,6 +81,7 @@ class EventRecord:
             "movements": self.movements,
             "sync_status": self.sync_status,
             "google_calendar_payload": self.google_calendar_payload,
+            "version": self.version,
             "created_at": self.created_at,
         }
 
@@ -120,6 +122,7 @@ class EventRecord:
             movements=list(data.get("movements", [])),
             sync_status=data.get("sync_status", "local"),
             google_calendar_payload=data.get("google_calendar_payload", {}),
+            version=int(data.get("version", 1)),
             created_at=data.get("created_at", datetime.now(timezone.utc).isoformat()),
         )
 

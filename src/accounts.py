@@ -189,7 +189,7 @@ class AccountStore:
 
         allowed = {
             "theme": {"system", "light", "dark"},
-            "font_scale": {"compact", "comfortable", "large"},
+            "font_scale": {"compact", "comfortable", "large", "largest"},
             "density": {"compact", "comfortable"},
         }
         updated = {**default_preferences(), **user.preferences}

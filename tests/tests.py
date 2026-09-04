@@ -710,14 +710,14 @@ class TestAccountsAndWorkspace(unittest.TestCase):
             updated = store.update_preferences(
                 "admin",
                 theme="dark",
-                font_scale="large",
+                font_scale="largest",
                 density="compact",
                 show_progress=False,
             )
             reloaded = AccountStore(path, allow_demo=True).get("admin")
 
         self.assertEqual(updated.preferences["theme"], "dark")
-        self.assertEqual(reloaded.preferences["font_scale"], "large")
+        self.assertEqual(reloaded.preferences["font_scale"], "largest")
         self.assertFalse(reloaded.preferences["show_progress"])
 
     def test_integrations_are_scoped_to_the_organization(self):

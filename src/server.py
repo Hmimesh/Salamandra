@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import email.utils
+import hashlib
 import io
 import ipaddress
 import json
@@ -68,6 +69,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
     sessions: dict[str, dict[str, float | str]] = {}
     login_attempts: dict[str, list[float]] = {}
     registration_attempts: dict[str, list[float]] = {}
+    event_create_requests: dict[tuple[str, str], dict[str, str]] = {}
     operation_lock = threading.RLock()
     database_runtime = None
     readiness_probe = None
@@ -155,7 +157,15 @@ class SalamandraServer(BaseHTTPRequestHandler):
         if parsed_url.path == "/api/templates":
             user = self.require_user()
             require_permission(user.role, Permission.EVENTS_PLAN)
-            self.send_json(self.templates.to_dict())
+            suggestions = self.templates.to_dict()
+            self.send_json(
+                {
+                    "templates": [],
+                    "kits": [],
+                    "suggested_templates": suggestions["templates"],
+                    "suggested_kits": suggestions["kits"],
+                }
+            )
             return
 
         if parsed_url.path == "/api/sync/status":
@@ -505,13 +515,145 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
             if parsed_url.path == "/api/events/save":
                 require_permission(user.role, Permission.EVENTS_CREATE)
-                event = self.create_event_from_request(body, user)
-                self.apply_allocation_updates(event, user)
+                description, overrides = self.event_request_parts(body)
+                request_payload = {
+                    "description": description,
+                    "overrides": overrides,
+                }
+                idempotency_key = self.operation_request_id(body)
+                event = self.build_event_from_description(
+                    description, overrides, user
+                )
                 event.prepare_operations(user.id)
-                self.memory.add(event)
+                if self.database_runtime is not None:
+                    event, created = self.database_runtime.create_event(
+                        event,
+                        user,
+                        idempotency_key,
+                        self.correlation_id(),
+                        request_payload,
+                    )
+                else:
+                    fingerprint = hashlib.sha256(
+                        json.dumps(
+                            request_payload,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    ).hexdigest()
+                    key = (user.organization_id, idempotency_key)
+                    with self.operation_lock:
+                        existing = self.event_create_requests.get(key)
+                        if existing is not None:
+                            if existing["fingerprint"] != fingerprint:
+                                raise StateConflict(
+                                    "This idempotency key was already used for another event."
+                                )
+                            event = self.memory.get_for_organization(
+                                existing["event_id"], user.organization_id
+                            )
+                            if event is None:
+                                raise StateConflict(
+                                    "The completed event is unavailable."
+                                )
+                            created = False
+                        else:
+                            self.apply_allocation_updates(event, user)
+                            self.memory.add(event)
+                            self.event_create_requests[key] = {
+                                "fingerprint": fingerprint,
+                                "event_id": event.id,
+                            }
+                            created = True
+                if (
+                    created
+                    and self.database_runtime is not None
+                    and event.plan.get("allocation_updates")
+                ):
+                    self.apply_allocation_updates(event, user)
+                    event = self.database_runtime.update_planning_plan(
+                        event,
+                        user,
+                        self.correlation_id(),
+                        "Overlap allocations updated when the event was created.",
+                    )
                 self.send_json(
                     {"event": event.to_dict(), "state": self.state_payload(user)},
-                    status=HTTPStatus.CREATED,
+                    status=HTTPStatus.CREATED if created else HTTPStatus.OK,
+                )
+                return
+
+            if parsed_url.path == "/api/events/update":
+                require_permission(user.role, Permission.EVENTS_UPDATE)
+                event_id = self.required_identifier(body.get("event_id"), "event_id")
+                current = self.memory.get_for_organization(
+                    event_id, user.organization_id
+                )
+                if current is None:
+                    raise ResourceNotFound("Event was not found.")
+                try:
+                    expected_version = int(body.get("version"))
+                except (TypeError, ValueError) as error:
+                    raise ValueError("Event version is invalid.") from error
+                description, overrides = self.event_request_parts(
+                    body,
+                    reject_ids=False,
+                    fallback_event=current,
+                )
+                if self.database_runtime is not None:
+                    updated = self.build_event_from_description(
+                        description,
+                        overrides,
+                        user,
+                        exclude_event_id=event_id,
+                        inventory_user_id=current.owner_id,
+                        optimize_overlaps=False,
+                    )
+                    event = self.database_runtime.update_event(
+                        event_id,
+                        expected_version,
+                        updated,
+                        user,
+                        self.correlation_id(),
+                    )
+                else:
+                    with self.operation_lock:
+                        current = self.memory.get_for_organization(
+                            event_id, user.organization_id
+                        )
+                        if current is None:
+                            raise ResourceNotFound("Event was not found.")
+                        if current.status != "planning":
+                            raise StateConflict(
+                                "Only planning events can be edited. Confirmed, packed, "
+                                "dispatched, and returned events are locked to protect inventory history."
+                            )
+                        if current.version != expected_version:
+                            raise StateConflict(
+                                "This event changed after you opened it. Reload and review the latest version."
+                            )
+                        event = self.build_event_from_description(
+                            description,
+                            overrides,
+                            user,
+                            exclude_event_id=event_id,
+                            inventory_user_id=current.owner_id,
+                            optimize_overlaps=False,
+                        )
+                        event.id = current.id
+                        event.owner_id = current.owner_id
+                        event.assigned_user_ids = list(current.assigned_user_ids)
+                        event.source_type = current.source_type
+                        event.source_id = current.source_id
+                        event.created_at = current.created_at
+                        event.version = current.version + 1
+                        event.history = list(current.history)
+                        event.add_history(
+                            "edited", user.id, "Event details and plan updated."
+                        )
+                        self.memory.add(event)
+                self.send_json(
+                    {"event": event.to_dict(), "state": self.state_payload(user)}
                 )
                 return
 
@@ -1011,22 +1153,32 @@ class SalamandraServer(BaseHTTPRequestHandler):
         body: dict,
         user: UserAccount,
     ) -> EventRecord:
+        description, overrides = self.event_request_parts(body)
+        return self.build_event_from_description(description, overrides, user)
+
+    def event_request_parts(
+        self,
+        body: dict,
+        *,
+        reject_ids: bool = True,
+        fallback_event: EventRecord | None = None,
+    ) -> tuple[str, dict]:
         client_event = body.get("event", {})
         if client_event is not None and not isinstance(client_event, dict):
             raise ValueError("Event data must be an object.")
         client_event = client_event or {}
 
-        supplied_ids = (
-            body.get("id"),
-            body.get("event_id"),
-            client_event.get("id"),
-        )
-        if any(value not in (None, "") for value in supplied_ids):
+        supplied_ids = (body.get("id"), body.get("event_id"), client_event.get("id"))
+        if reject_ids and any(value not in (None, "") for value in supplied_ids):
             raise ValueError(
                 "Client-selected event IDs are not accepted for event creation."
             )
 
-        description = body.get("description", client_event.get("description", ""))
+        fallback_description = fallback_event.description if fallback_event else ""
+        description = body.get(
+            "description",
+            client_event.get("description", fallback_description),
+        )
         if not isinstance(description, str) or not description.strip():
             raise ValueError("Event description is required.")
         if len(description) > 20_000:
@@ -1034,19 +1186,42 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
         overrides = body.get("overrides")
         if overrides is None:
+            fallback_values = (
+                {
+                    "title": fallback_event.title,
+                    "start_date": fallback_event.start_date,
+                    "start_time": fallback_event.start_time,
+                    "location": fallback_event.location,
+                    "duration_minutes": fallback_event.duration_minutes,
+                    "attendee_count": fallback_event.attendee_count,
+                }
+                if fallback_event
+                else {}
+            )
             overrides = {
-                name: client_event[name]
+                name: client_event.get(name, fallback_values.get(name))
                 for name in (
                     "title",
                     "start_date",
                     "start_time",
                     "location",
                     "duration_minutes",
+                    "attendee_count",
                 )
-                if name in client_event
+                if name in client_event or name in fallback_values
             }
         if not isinstance(overrides, dict):
             raise ValueError("Event overrides must be an object.")
+        if fallback_event is not None:
+            overrides = {
+                "title": fallback_event.title,
+                "start_date": fallback_event.start_date,
+                "start_time": fallback_event.start_time,
+                "location": fallback_event.location,
+                "duration_minutes": fallback_event.duration_minutes,
+                "attendee_count": fallback_event.attendee_count,
+                **overrides,
+            }
         allowed_overrides = {
             name: overrides[name]
             for name in (
@@ -1055,17 +1230,33 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 "start_time",
                 "location",
                 "duration_minutes",
+                "attendee_count",
             )
             if name in overrides
         }
+        return description.strip(), allowed_overrides
 
+    def build_event_from_description(
+        self,
+        description: str,
+        overrides: dict,
+        user: UserAccount,
+        *,
+        exclude_event_id: str | None = None,
+        inventory_user_id: str | None = None,
+        optimize_overlaps: bool = True,
+    ) -> EventRecord:
         draft = EventDescriptionPlanner(
-            self.workspace.combined_inventory(user.id, user.organization_id),
+            self.workspace.combined_inventory(
+                inventory_user_id or user.id, user.organization_id
+            ),
             self.catalog,
             self.memory,
             organization_id=user.organization_id,
             item_classes=self.item_classes,
-        ).draft_from_description(description, overrides=allowed_overrides)
+            exclude_event_id=exclude_event_id,
+            optimize_overlaps=optimize_overlaps,
+        ).draft_from_description(description, overrides=overrides)
         event = draft.record
         event.organization_id = user.organization_id
         event.owner_id = user.id
@@ -1107,7 +1298,12 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 "inventory": inventories["combined"],
                 "inventories": inventories,
                 "presets": {"presets": [], "tags": []},
-                "templates": {"templates": [], "kits": []},
+                "templates": {
+                    "templates": [],
+                    "kits": [],
+                    "suggested_templates": [],
+                    "suggested_kits": [],
+                },
                 "item_classes": {"classes": []},
                 "integrations": {},
                 "events": {
@@ -1148,6 +1344,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
             user.organization_id if user else None,
         )
         events = self.memory.to_dict(user.organization_id if user else None)
+        suggestion_catalog = self.templates.to_dict()
         return {
             "auth": auth_payload,
             "organization": self.organization_payload(user, organization_users),
@@ -1161,7 +1358,12 @@ class SalamandraServer(BaseHTTPRequestHandler):
             "inventory": inventories["combined"],
             "inventories": inventories,
             "presets": self.catalog.to_dict(),
-            "templates": self.templates.to_dict(),
+            "templates": {
+                "templates": [],
+                "kits": [],
+                "suggested_templates": suggestion_catalog["templates"],
+                "suggested_kits": suggestion_catalog["kits"],
+            },
             "item_classes": self.item_classes.to_dict(
                 user.organization_id if user else None
             ),
@@ -1825,6 +2027,7 @@ def run(host: str = "127.0.0.1", port: int = 8000):
     SalamandraServer.sessions = {}
     SalamandraServer.login_attempts = {}
     SalamandraServer.registration_attempts = {}
+    SalamandraServer.event_create_requests = {}
     SalamandraServer.operation_lock = threading.RLock()
     SalamandraServer.web_config = web_config
     SalamandraServer.readiness_probe = readiness_probe

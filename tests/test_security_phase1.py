@@ -43,6 +43,7 @@ class ServerHarness(AbstractContextManager):
         IsolatedServer.sessions = {}
         IsolatedServer.login_attempts = {}
         IsolatedServer.registration_attempts = {}
+        IsolatedServer.event_create_requests = {}
         self.handler = IsolatedServer
         self.owner_a = IsolatedServer.accounts.create_user(
             name="Owner A",
@@ -360,6 +361,190 @@ class TestSecurityPhaseOne(unittest.TestCase):
                 line.get("item_id") for line in payload["event"]["plan"].get("lines", [])
             }
             self.assertNotIn("nonexistent gold console", planned_ids)
+
+    def test_duplicate_event_creation_returns_the_original_event(self):
+        with ServerHarness() as app:
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+            body = {
+                "description": "Small speech for 20 guests on 2026-09-10 at 18:00.",
+                "overrides": {"title": "Retry-safe event"},
+                "idempotency_key": "create-event-retry-1",
+            }
+
+            first_status, first_payload, _ = app.request(
+                "POST", "/api/events/save", body, cookie
+            )
+            second_status, second_payload, _ = app.request(
+                "POST", "/api/events/save", body, cookie
+            )
+
+            self.assertEqual((first_status, second_status), (201, 200))
+            self.assertEqual(first_payload["event"]["id"], second_payload["event"]["id"])
+            self.assertEqual(len(app.handler.memory.list_events("org-a")), 1)
+
+    def test_event_creation_key_reuse_with_different_payload_conflicts(self):
+        with ServerHarness() as app:
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+            key = "create-event-conflict-1"
+            first_status, _, _ = app.request(
+                "POST",
+                "/api/events/save",
+                {
+                    "description": "Small speech on 2026-09-10.",
+                    "idempotency_key": key,
+                },
+                cookie,
+            )
+            second_status, payload, _ = app.request(
+                "POST",
+                "/api/events/save",
+                {
+                    "description": "Different concert on 2026-09-11.",
+                    "idempotency_key": key,
+                },
+                cookie,
+            )
+
+            self.assertEqual(first_status, 201)
+            self.assertEqual(second_status, 409)
+            self.assertIn("another event", payload["error"])
+            self.assertEqual(len(app.handler.memory.list_events("org-a")), 1)
+
+    def test_concurrent_duplicate_event_creation_persists_once(self):
+        with ServerHarness() as app:
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+            body = {
+                "description": "Small speech for 20 guests on 2026-09-10 at 18:00.",
+                "overrides": {"title": "Double-click event"},
+                "idempotency_key": "create-event-race-1",
+            }
+            start = threading.Barrier(3)
+            results: list[tuple[int, dict[str, Any]]] = []
+
+            def create():
+                start.wait(timeout=5)
+                status, payload, _ = app.request(
+                    "POST", "/api/events/save", body, cookie
+                )
+                results.append((status, payload))
+
+            threads = [threading.Thread(target=create) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            start.wait(timeout=5)
+            for thread in threads:
+                thread.join(timeout=5)
+
+            self.assertEqual(sorted(status for status, _ in results), [200, 201])
+            self.assertEqual(
+                len({payload["event"]["id"] for _, payload in results}), 1
+            )
+            self.assertEqual(len(app.handler.memory.list_events("org-a")), 1)
+
+    def test_planning_event_can_be_edited_and_stale_edit_is_rejected(self):
+        with ServerHarness() as app:
+            event = EventRecord(
+                id="editable-event",
+                title="Original title",
+                description="Small event on 2026-09-10.",
+                start_date="2026-09-10",
+                organization_id="org-a",
+                owner_id=app.owner_a.id,
+            )
+            app.handler.memory.add(event)
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+            edit = {
+                "event_id": event.id,
+                "version": 1,
+                "description": "Small event for 45 guests on 2026-09-12 at 19:00.",
+                "overrides": {
+                    "title": "Updated title",
+                    "start_date": "2026-09-12",
+                    "start_time": "19:00",
+                    "location": "New venue",
+                    "attendee_count": 45,
+                },
+            }
+
+            status, payload, _ = app.request(
+                "POST", "/api/events/update", edit, cookie
+            )
+            stale_status, stale_payload, _ = app.request(
+                "POST", "/api/events/update", edit, cookie
+            )
+
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["event"]["title"], "Updated title")
+            self.assertEqual(payload["event"]["attendee_count"], 45)
+            self.assertEqual(payload["event"]["version"], 2)
+            self.assertEqual(stale_status, 409)
+            self.assertIn("Reload", stale_payload["error"])
+
+    def test_event_edit_is_scoped_authorized_and_lifecycle_restricted(self):
+        with ServerHarness() as app:
+            event_b = EventRecord(
+                id="org-b-edit-event",
+                title="Org B event",
+                description="Private event on 2026-09-10.",
+                start_date="2026-09-10",
+                organization_id="org-b",
+                owner_id=app.owner_b.id,
+            )
+            confirmed_a = EventRecord(
+                id="confirmed-edit-event",
+                title="Confirmed event",
+                description="Confirmed event on 2026-09-10.",
+                start_date="2026-09-10",
+                organization_id="org-a",
+                owner_id=app.owner_a.id,
+                status="confirmed",
+            )
+            app.handler.memory.add(event_b)
+            app.handler.memory.add(confirmed_a)
+            owner_cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+            tech_cookie = app.sign_in("tech-a@example.test", "tech-a-password")
+            edit = {
+                "version": 1,
+                "description": "Changed event on 2026-09-12.",
+                "overrides": {"title": "Changed"},
+            }
+
+            cross_status, _, _ = app.request(
+                "POST",
+                "/api/events/update",
+                {**edit, "event_id": event_b.id},
+                owner_cookie,
+            )
+            restricted_status, restricted_payload, _ = app.request(
+                "POST",
+                "/api/events/update",
+                {**edit, "event_id": confirmed_a.id},
+                owner_cookie,
+            )
+            unauthorized_status, _, _ = app.request(
+                "POST",
+                "/api/events/update",
+                {**edit, "event_id": confirmed_a.id},
+                tech_cookie,
+            )
+
+            self.assertEqual(cross_status, 404)
+            self.assertEqual(restricted_status, 409)
+            self.assertIn("Only planning events", restricted_payload["error"])
+            self.assertEqual(unauthorized_status, 403)
+            self.assertEqual(app.handler.memory.get(event_b.id).title, "Org B event")
+
+    def test_signed_in_workspace_does_not_claim_suggested_kits_or_templates(self):
+        with ServerHarness() as app:
+            cookie = app.sign_in("owner-a@example.test", "owner-a-password")
+
+            status, payload, _ = app.request("GET", "/api/state", cookie=cookie)
+
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["templates"]["kits"], [])
+            self.assertEqual(payload["templates"]["templates"], [])
+            self.assertGreater(len(payload["templates"]["suggested_kits"]), 0)
+            self.assertGreater(len(payload["templates"]["suggested_templates"]), 0)
 
     def test_invalid_status_transition_is_rejected(self):
         with ServerHarness() as app:

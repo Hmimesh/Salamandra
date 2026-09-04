@@ -40,6 +40,7 @@ from database import (
     OperationRequestModel,
     OrganizationModel,
     StockMovementModel,
+    TransactionalEventCreation,
     TransactionalEventDetails,
     TransactionalEventOperations,
     TransactionalInventoryOperations,
@@ -143,6 +144,136 @@ class TestTransactionalDatabase(unittest.TestCase):
             "membership-org-a",
             f"request-{status}",
         )
+
+    def test_event_creation_is_idempotent_and_payload_bound(self):
+        service = TransactionalEventCreation(self.factory)
+        payload = {
+            "description": "Small event on 2026-09-10.",
+            "overrides": {"title": "Retry-safe event"},
+        }
+        event_data = {
+            "title": "Retry-safe event",
+            "description": payload["description"],
+            "start_date": "2026-09-10",
+            "start_time": "18:00",
+            "duration_minutes": 120,
+            "plan": {"lines": []},
+            "checklist": [],
+            "return_checklist": [],
+            "history": [],
+        }
+
+        first, created = service.create(
+            "org-a",
+            "owner-org-a",
+            "event-create-key",
+            "request-one",
+            payload,
+            event_data,
+        )
+        retried, retry_created = service.create(
+            "org-a",
+            "owner-org-a",
+            "event-create-key",
+            "request-two",
+            payload,
+            event_data,
+        )
+        with self.assertRaises(StateConflict):
+            service.create(
+                "org-a",
+                "owner-org-a",
+                "event-create-key",
+                "request-three",
+                {**payload, "description": "A different event."},
+                event_data,
+            )
+
+        with self.factory() as session:
+            events = session.scalar(
+                select(func.count()).select_from(EventModel).where(
+                    EventModel.organization_id == "org-a"
+                )
+            )
+            operations = session.scalar(
+                select(func.count()).select_from(OperationRequestModel).where(
+                    OperationRequestModel.organization_id == "org-a",
+                    OperationRequestModel.operation == "event.create",
+                )
+            )
+            audits = session.scalar(
+                select(func.count()).select_from(AuditEventModel).where(
+                    AuditEventModel.organization_id == "org-a",
+                    AuditEventModel.action == "event.created",
+                )
+            )
+        self.assertTrue(created)
+        self.assertFalse(retry_created)
+        self.assertEqual(first.id, retried.id)
+        self.assertEqual(events, 2)
+        self.assertEqual(operations, 1)
+        self.assertEqual(audits, 1)
+
+    def test_event_edit_is_versioned_scoped_and_lifecycle_safe(self):
+        details = TransactionalEventDetails(self.factory)
+        edited_data = {
+            "title": "Edited event",
+            "description": "Edited brief",
+            "start_date": "2026-09-12",
+            "start_time": "19:00",
+            "duration_minutes": 180,
+            "location": "New venue",
+            "attendee_count": 45,
+            "priority_score": 60,
+            "plan": {"lines": []},
+            "checklist": [],
+            "return_checklist": [],
+            "history": [],
+        }
+
+        updated = details.update_event(
+            "org-a",
+            "event-a",
+            1,
+            edited_data,
+            "owner-org-a",
+            "edit-event-a",
+        )
+        with self.assertRaises(StateConflict):
+            details.update_event(
+                "org-a",
+                "event-a",
+                1,
+                edited_data,
+                "owner-org-a",
+                "stale-edit-event-a",
+            )
+        with self.assertRaises(ResourceNotFound):
+            details.update_event(
+                "org-a",
+                "event-b",
+                1,
+                edited_data,
+                "owner-org-a",
+                "cross-org-edit",
+            )
+        with self.factory.begin() as session:
+            event = session.get(EventModel, "event-a")
+            event.status = "confirmed"
+        with self.assertRaises(StateConflict):
+            details.update_event(
+                "org-a",
+                "event-a",
+                2,
+                edited_data,
+                "owner-org-a",
+                "restricted-edit-event-a",
+            )
+
+        self.assertEqual(updated.title, "Edited event")
+        self.assertEqual(updated.version, 2)
+        self.assertEqual(updated.data["attendee_count"], 45)
+        self.assertEqual(updated.data["history"][-1]["action"], "edited")
 
     def test_full_transition_moves_each_quantity_exactly_once(self):
         self.transition("confirmed")

@@ -22,6 +22,7 @@ from database import (
     OrganizationModel,
     SessionModel,
     StockMovementModel,
+    TransactionalEventCreation,
     TransactionalEventDetails,
     TransactionalEventOperations,
     TransactionalInventoryOperations,
@@ -275,7 +276,7 @@ class PostgresAccountStore:
     def update_preferences(self, user_id: str, **values: Any) -> UserAccount:
         allowed = {
             "theme": {"system", "light", "dark"},
-            "font_scale": {"compact", "comfortable", "large"},
+            "font_scale": {"compact", "comfortable", "large", "largest"},
             "density": {"compact", "comfortable"},
         }
         with self.factory.begin() as session:
@@ -682,7 +683,7 @@ class PostgresEventMemory:
 
     def _record(self, session: Session, row: EventModel) -> EventRecord:
         data = dict(row.data or {})
-        data.update({"id": row.id, "organization_id": row.organization_id, "owner_id": row.owner_user_id, "title": row.title, "status": row.status})
+        data.update({"id": row.id, "organization_id": row.organization_id, "owner_id": row.owner_user_id, "title": row.title, "status": row.status, "version": row.version})
         movements = session.scalars(select(StockMovementModel).where(StockMovementModel.organization_id == row.organization_id, StockMovementModel.event_id == row.id).order_by(StockMovementModel.created_at, StockMovementModel.id))
         data["movements"] = [
             {
@@ -810,6 +811,7 @@ class PostgresRuntime:
         self.memory = PostgresEventMemory(factory)
         self.item_classes = PostgresItemClassCatalog(factory)
         self.integrations = PostgresIntegrationStore(factory)
+        self.event_creation = TransactionalEventCreation(factory)
         self.operations = TransactionalEventOperations(factory)
         self.event_details = TransactionalEventDetails(factory)
         self.kit_operations = TransactionalKitOperations(factory)
@@ -904,6 +906,29 @@ class PostgresRuntime:
             raise ResourceNotFound("Event was not found.")
         return event
 
+    def create_event(
+        self,
+        event: EventRecord,
+        user: UserAccount,
+        idempotency_key: str,
+        request_id: str,
+        request_payload: dict[str, Any],
+    ) -> tuple[EventRecord, bool]:
+        event_row, created = self.event_creation.create(
+            user.organization_id,
+            user.id,
+            idempotency_key,
+            request_id,
+            request_payload,
+            event.to_dict(),
+        )
+        stored = self.memory.get_for_organization(
+            event_row.id, user.organization_id
+        )
+        if stored is None:
+            raise ResourceNotFound("Created event was not found.")
+        return stored, created
+
     def update_checklist(
         self,
         event_id: str,
@@ -945,6 +970,27 @@ class PostgresRuntime:
             note,
         )
         stored = self.memory.get_for_organization(event.id, user.organization_id)
+        if stored is None:
+            raise ResourceNotFound("Event was not found.")
+        return stored
+
+    def update_event(
+        self,
+        event_id: str,
+        expected_version: int,
+        event: EventRecord,
+        user: UserAccount,
+        request_id: str,
+    ) -> EventRecord:
+        self.event_details.update_event(
+            user.organization_id,
+            event_id,
+            expected_version,
+            event.to_dict(),
+            user.id,
+            request_id,
+        )
+        stored = self.memory.get_for_organization(event_id, user.organization_id)
         if stored is None:
             raise ResourceNotFound("Event was not found.")
         return stored

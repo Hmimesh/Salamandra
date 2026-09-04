@@ -41,6 +41,8 @@ class EventDescriptionPlanner:
         reserved_counts: dict[str, int] | None = None,
         organization_id: str = "salamandra",
         item_classes: ItemClassCatalog | None = None,
+        exclude_event_id: str | None = None,
+        optimize_overlaps: bool = True,
     ):
         self.inventory = inventory
         self.catalog = catalog
@@ -48,6 +50,8 @@ class EventDescriptionPlanner:
         self.reserved_counts = reserved_counts or {}
         self.organization_id = organization_id
         self.item_classes = item_classes or ItemClassCatalog()
+        self.exclude_event_id = exclude_event_id
+        self.optimize_overlaps = optimize_overlaps
 
     def draft_from_description(
         self,
@@ -72,7 +76,13 @@ class EventDescriptionPlanner:
             overrides.get("duration_minutes")
             or self._extract_duration(clean_description, milestones)
         )
-        attendee_count = self._extract_attendees(clean_description.lower())
+        attendee_count = (
+            int(overrides["attendee_count"])
+            if overrides.get("attendee_count") not in (None, "")
+            else self._extract_attendees(clean_description.lower())
+        )
+        if attendee_count < 0 or attendee_count > 1_000_000:
+            raise ValueError("Guest count is invalid.")
         event_size = self._extract_event_size(clean_description, attendee_count)
         venue_kind = self._extract_venue_kind(clean_description)
         priority_score = self._priority_score(clean_description, event_size)
@@ -109,11 +119,17 @@ class EventDescriptionPlanner:
             start_time,
             duration_minutes,
             self.organization_id,
+            exclude_event_id=self.exclude_event_id,
         )
-        optimizable_events = [
-            event for event in overlapping_events if event.capability_requirements
-        ]
-        legacy_reservations = self._legacy_overlap_reservations(overlapping_events)
+        optimizable_events = (
+            [event for event in overlapping_events if event.capability_requirements]
+            if self.optimize_overlaps
+            else []
+        )
+        legacy_reservations = self._legacy_overlap_reservations(
+            overlapping_events,
+            include_capability_events=not self.optimize_overlaps,
+        )
         planner = EventPlanner(
             self.inventory,
             self.catalog,
@@ -423,10 +439,12 @@ class EventDescriptionPlanner:
     def _legacy_overlap_reservations(
         self,
         events: list[EventRecord],
+        *,
+        include_capability_events: bool = False,
     ) -> dict[str, int]:
         reservations: dict[str, int] = {}
         for event in events:
-            if event.capability_requirements:
+            if event.capability_requirements and not include_capability_events:
                 continue
             for item_id, amount in self._allocation_counts(event.plan).items():
                 reservations[item_id] = reservations.get(item_id, 0) + amount
