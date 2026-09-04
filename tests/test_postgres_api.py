@@ -12,6 +12,7 @@ import time
 import unittest
 from copy import deepcopy
 from dataclasses import replace
+from functools import wraps
 from pathlib import Path
 from uuid import uuid4
 
@@ -46,6 +47,20 @@ from database import (
     UserModel,
 )
 from readiness import DatabaseReadiness
+
+
+def isolated_database_inserts(test):
+    @wraps(test)
+    def wrapped(self, *args, **kwargs):
+        row_ids = self._database_row_ids()
+        state = self._database_state_snapshot()
+        try:
+            return test(self, *args, **kwargs)
+        finally:
+            self._delete_inserted_rows(row_ids)
+            self.assertEqual(self._database_state_snapshot(), state)
+
+    return wrapped
 
 
 def _request(
@@ -273,6 +288,38 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             if path.exists()
         }
 
+    def _database_row_ids(self) -> dict[str, frozenset[str]]:
+        with self.engine.connect() as connection:
+            return {
+                table.name: frozenset(connection.execute(select(table.c.id)).scalars())
+                for table in Base.metadata.sorted_tables
+            }
+
+    def _database_state_snapshot(self) -> dict[str, str]:
+        preparer = self.engine.dialect.identifier_preparer
+        with self.engine.connect() as connection:
+            return {
+                table.name: connection.execute(
+                    text(
+                        "SELECT COALESCE(jsonb_agg(to_jsonb(row_data) "
+                        "ORDER BY row_data.id), '[]'::jsonb)::text "
+                        f"FROM {preparer.quote(table.name)} AS row_data"
+                    )
+                ).scalar_one()
+                for table in Base.metadata.sorted_tables
+            }
+
+    def _delete_inserted_rows(
+        self, baseline_ids: dict[str, frozenset[str]]
+    ) -> None:
+        with self.engine.begin() as connection:
+            for table in reversed(Base.metadata.sorted_tables):
+                ids = baseline_ids[table.name]
+                statement = delete(table)
+                if ids:
+                    statement = statement.where(table.c.id.not_in(ids))
+                connection.execute(statement)
+
     def _sign_in(self, port: int) -> str:
         status, _, headers = _request(
             port,
@@ -366,6 +413,7 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             )
 
     @race_required
+    @isolated_database_inserts
     def test_concurrent_duplicate_event_creation_commits_once(self):
         cookie = self._sign_in(self.ports[0])
         suffix = uuid4().hex
@@ -442,6 +490,7 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         )
         self.assertEqual(conflict_status, 409)
 
+    @isolated_database_inserts
     def test_event_edit_http_is_versioned_scoped_and_lifecycle_safe(self):
         port = self.ports[0]
         cookie = self._sign_in(port)
@@ -1841,6 +1890,7 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             session.get(MembershipModel, "runtime-membership").status = "active"
         _request(first_port, "POST", "/api/auth/signout", {}, membership_cookie)
 
+    @isolated_database_inserts
     def test_event_creation_ids_are_rejected_without_disclosure_or_mutation(self):
         port = self.ports[0]
         cookie = self._sign_in(port)
