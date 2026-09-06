@@ -24,6 +24,44 @@ the infrastructure and account gates pass:
 
 Do not paste passwords, cookies, database URLs, or tokens into this document.
 
+## Reproducible Browser QA
+
+The browser suite uses Playwright Chromium against an isolated local Salamandra
+server at `http://127.0.0.1:4173`. It never uses staging credentials or staging
+data. Prerequisites: Python 3.12 with `requirements.txt` installed, Node 22+,
+pnpm, and an unused port 4173. On Windows the runner uses `.venv/Scripts/python.exe`;
+on other platforms it uses `python` from PATH. From the repository root:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+pnpm install
+pnpm exec playwright install chromium
+pnpm qa:browser
+```
+
+The command builds the production frontend before starting the disposable test
+server. Automated coverage includes 360px mobile, 768px tablet, 1280px desktop,
+and 1440px wide layouts. A fifth project emulates a 1280x900 browser at 200% zoom
+using 640x450 CSS pixels and device scale factor 2. Every project runs all eight
+scenarios (40 tests, no intentional skips): navigation links, focus trapping and
+restoration, Escape handling, manual planning and crew assignment, kit creation,
+preset and custom inventory, dependency selection, account popovers, calendar
+overflow, cancellation/delete confirmations, CSV mapping and import, and appearance.
+Every test checks console/page errors; key states check document overflow.
+
+Default/large/largest text and light/dark themes are exercised at every viewport.
+Zoom emulation tests reflow and pixel scaling; native browser chrome zoom and
+non-Chromium browsers still require the manual staging check. Screenshots and
+failure traces are written under ignored `test-results/`; CI uploads these along
+with its Playwright report. No pixel-perfect screenshot baseline is required.
+
+The test server uses disposable local compatibility stores and fake accounts,
+not the production database. PostgreSQL authorization, transactions, and races
+are independently required by `python tests/run_production_core_acceptance.py`
+with `SALAMANDRA_TEST_POSTGRES_URL` and `SALAMANDRA_REQUIRE_POSTGRES_TESTS=1`.
+Do not use the browser fixture server as a deployment entrypoint.
+
 ## Code Gate Before Environment Testing
 
 Confirm the release candidate includes all of these before beginning the checklist:
@@ -180,6 +218,10 @@ Expected:
 - Same-origin POST succeeds when authorized.
 - Mismatched origin receives HTTP 403.
 - Forged Host does not make the backend accept an unapproved origin.
+- A `404 Application not found` is also an acceptable result for this forged-Host
+  probe only: Railway may reject the unknown Host at its routing edge before the
+  Salamandra application receives the request. Do not accept `404` as success for
+  health, readiness, authentication, or any other smoke check.
 - `SALAMANDRA_ALLOWED_ORIGINS` is explicitly set to the staging origin.
 
 Evidence:

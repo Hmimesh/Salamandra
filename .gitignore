@@ -8,3 +8,5 @@ __pycache__/
 *.sqlite3
 docs/*.json
 docs/design/
+test-results/
+playwright-report/

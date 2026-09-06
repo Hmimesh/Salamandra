@@ -1,6 +1,4 @@
 import {
-  ArrowDownToLine,
-  ArrowUpFromLine,
   Boxes,
   Copy,
   Info,
@@ -19,13 +17,11 @@ import { useWorkspace } from "../context/WorkspaceContext";
 import { titleCase } from "../lib/format";
 import type { InventoryItem, InventoryScope, ItemClass } from "../types";
 
-type ItemAction = "use" | "return" | "remove";
+type ItemAction = "remove";
 
 const itemTypes = ["mixer", "pa", "microphone", "lighting", "power", "rigging", "video", "di", "backline", "stand", "cable", "case", "accessory", "furniture", "decor", "catering", "tool", "transport", "display", "barrier", "other"];
 
 function actionCopy(action: ItemAction) {
-  if (action === "use") return { title: "Check item out", button: "Mark item out", icon: ArrowUpFromLine };
-  if (action === "return") return { title: "Return item", button: "Return to stock", icon: ArrowDownToLine };
   return { title: "Remove stock", button: "Remove from inventory", icon: Minus };
 }
 
@@ -55,9 +51,10 @@ export function InventoryPage() {
   const [editItem, setEditItem] = useState<InventoryItem | null>(null);
   const [action, setAction] = useState<{ type: ItemAction; item: InventoryItem } | null>(null);
   const inventory = state!.inventories[scope];
+  const canManageDefinitions = ["owner", "admin", "operator"].includes(state!.auth.user!.role);
   const itemClasses = state!.item_classes.classes;
   const filtered = useMemo(() => inventory.items.filter((item) => {
-    const matchesSearch = !search || `${item.id} ${item.type} ${item.info} ${item.model}`.toLowerCase().includes(search.toLowerCase());
+    const matchesSearch = !search || `${item.id} ${item.type} ${item.info} ${item.model}`.toLowerCase().replace(/[-_]/g, " ").includes(search.toLowerCase().replace(/[-_]/g, " "));
     const matchesType = typeFilter === "all" || item.type === typeFilter;
     return matchesSearch && matchesType;
   }), [inventory.items, search, typeFilter]);
@@ -71,21 +68,24 @@ export function InventoryPage() {
   function itemPayload(form: FormData) {
     const requirementIds = form.getAll("requirement_id").map((value) => String(value).trim());
     const requirementAmounts = form.getAll("requirement_amount");
-    return {
+    const payload = {
       id: String(form.get("id") || ""),
       type: String(form.get("type") || "other"),
       amount: Number(form.get("amount") || 1),
       scope: String(form.get("scope") || "shared"),
       info: String(form.get("info") || ""),
-      class_id: String(form.get("class_id") || ""),
       manufacturer: String(form.get("manufacturer") || ""),
       model: String(form.get("model") || ""),
       condition: String(form.get("condition") || "ready"),
-      quality_score: Number(form.get("quality_score") || 70),
-      preference_score: Number(form.get("preference_score") || 70),
       weight_kg: Number(form.get("weight_kg") || 0),
       requirements: requirementIds.flatMap((itemId, index) => itemId ? [{ item_id: itemId, amount: Number(requirementAmounts[index] || 1) }] : []),
     };
+    return canManageDefinitions ? {
+      ...payload,
+      class_id: String(form.get("class_id") || ""),
+      quality_score: Number(form.get("quality_score") || 70),
+      preference_score: Number(form.get("preference_score") || 70),
+    } : payload;
   }
 
   async function addItem(event: FormEvent<HTMLFormElement>) {
@@ -143,7 +143,7 @@ export function InventoryPage() {
   }
 
   async function addPreset(presetId: string) {
-    const targetScope = scope === "personal" ? "personal" : "shared";
+    const targetScope = scope === "personal" || !canManageDefinitions ? "personal" : "shared";
     await mutate("/api/inventory/presets", { preset_id: presetId, scope: targetScope }, { success: "Preset added to inventory." }).catch(() => undefined);
   }
 
@@ -151,9 +151,8 @@ export function InventoryPage() {
     event.preventDefault();
     if (!action) return;
     const form = new FormData(event.currentTarget);
-    const path = action.type === "use" ? "/api/inventory/use" : action.type === "return" ? "/api/inventory/return" : "/api/inventory/remove";
     try {
-      await mutate(path, { item_id: action.item.id, amount: Number(form.get("amount") || 1), scope: actionScope(action.item) }, { success: `${titleCase(action.item.id)} updated.` });
+      await mutate("/api/inventory/remove", { item_id: action.item.id, amount: Number(form.get("amount") || 1), scope: actionScope(action.item) }, { success: `${titleCase(action.item.id)} updated.` });
       setAction(null);
     } catch {
       // The workspace provider reports the API message.
@@ -175,7 +174,7 @@ export function InventoryPage() {
 
   return (
     <div className="page inventory-page">
-      <PageHeader title="Inventory" description="Work from real shared stock and personal items in your account." actions={<><button className="button button-secondary" onClick={() => setClassesOpen(true)}><Shapes size={17} />Item classes</button><button className="button button-primary" onClick={() => { setAddMode(null); setAddOpen(true); }}><Plus size={17} />Add item</button></>} />
+      <PageHeader title="Inventory" description="Work from real shared stock and personal items in your account." actions={<>{canManageDefinitions ? <button className="button button-secondary" onClick={() => setClassesOpen(true)}><Shapes size={17} />Item classes</button> : null}<button className="button button-primary" onClick={() => { setAddMode(null); setAddOpen(true); }}><Plus size={17} />Add item</button></>} />
 
       <section className="inventory-summary">
         <div><span className="summary-icon"><Boxes size={20} /></span><span><small>Item types</small><strong>{inventory.summary.unique_items}</strong></span></div>
@@ -183,6 +182,8 @@ export function InventoryPage() {
         <div><span><small>Out now</small><strong>{inventory.summary.in_use}</strong></span></div>
         <div><span><small>Linked requirements</small><strong>{inventory.summary.requirements}</strong></span></div>
       </section>
+
+      <section className="inventory-workflow-guide" aria-label="Inventory movement workflow"><div><PackagePlus size={20} /><span><strong>Move stock through an event or kit</strong><small>Pack, dispatch, and return keep every inventory movement attached to an operation.</small></span></div><div><button className="button button-secondary" type="button" onClick={() => navigate("/kits")}>Open kits</button><button className="button button-primary" type="button" onClick={() => navigate("/events/new")}>Create event</button></div></section>
 
       <div className="toolbar-row inventory-toolbar">
         <div className="segmented-control" aria-label="Inventory ownership">
@@ -197,19 +198,19 @@ export function InventoryPage() {
         {filtered.length ? <div className="table-scroll"><table className="operations-table inventory-table"><thead><tr><th>Gear</th><th>Class</th><th>Available</th><th>Out</th><th>Linked needs</th><th>Status</th><th>Actions</th></tr></thead><tbody>{filtered.map((item) => {
           const reserved = state!.events.active_reservations[item.id] || 0;
           const status = item.count === 0 ? "Out of stock" : reserved ? "Planned" : "Ready";
-          return <tr key={item.id}><td><div className="item-name"><span className={`category-icon type-${item.type}`}>{item.id.slice(0, 1).toUpperCase()}</span><span><strong>{titleCase(item.id)}</strong><small>{[item.manufacturer, item.model, item.info].filter(Boolean).join(" · ") || "No equipment note"}</small></span>{item.info ? <span className="info-tooltip" title={item.info}><Info size={15} /></span> : null}</div></td><td><strong>{item.class_id ? titleCase(item.class_id) : titleCase(item.type)}</strong><small>{item.weight_kg ? `${item.weight_kg} kg · ${titleCase(item.condition)}` : titleCase(item.condition)}</small></td><td><strong>{item.count}</strong>{reserved ? <small>{reserved} planned across events</small> : null}</td><td>{item.in_use_count}</td><td>{item.requirements.length ? item.requirements.map((need) => `${need.amount}x ${titleCase(need.item_id)}`).join(", ") : "By class"}</td><td><span className={`stock-status stock-${status.toLowerCase().replaceAll(" ", "-")}`}>{status}</span></td><td><div className="row-actions"><button className="icon-button" title="Edit equipment" aria-label={`Edit ${item.id}`} onClick={() => setEditItem(item)}><Pencil size={16} /></button><button className="icon-button" title="Check gear out" aria-label={`Check out ${item.id}`} disabled={item.count < 1} onClick={() => setAction({ type: "use", item })}><ArrowUpFromLine size={17} /></button><button className="icon-button" title="Return gear" aria-label={`Return ${item.id}`} disabled={item.in_use_count < 1} onClick={() => setAction({ type: "return", item })}><ArrowDownToLine size={17} /></button><button className="icon-button danger-icon" title="Remove stock" aria-label={`Remove ${item.id}`} disabled={item.count < 1} onClick={() => setAction({ type: "remove", item })}><Minus size={17} /></button></div></td></tr>;
+          return <tr key={item.id}><td><div className="item-name"><span className={`category-icon type-${item.type}`}>{item.id.slice(0, 1).toUpperCase()}</span><span><strong>{titleCase(item.id)}</strong><small>{[item.manufacturer, item.model, item.info].filter(Boolean).join(" · ") || "No equipment note"}</small></span>{item.info ? <span className="info-tooltip" title={item.info}><Info size={15} /></span> : null}</div></td><td><strong>{item.class_id ? titleCase(item.class_id) : titleCase(item.type)}</strong><small>{item.weight_kg ? `${item.weight_kg} kg · ${titleCase(item.condition)}` : titleCase(item.condition)}</small></td><td><strong>{item.count}</strong>{reserved ? <small>{reserved} planned across events</small> : null}</td><td>{item.in_use_count}</td><td>{item.requirements.length ? item.requirements.map((need) => `${need.amount}x ${titleCase(need.item_id)}`).join(", ") : "By class"}</td><td><span className={`stock-status stock-${status.toLowerCase().replaceAll(" ", "-")}`}>{status}</span></td><td><div className="row-actions">{canManageDefinitions ? <button className="icon-button" title="Edit equipment" aria-label={`Edit ${item.id}`} onClick={() => setEditItem(item)}><Pencil size={16} /></button> : null}<button className="icon-button danger-icon" title="Remove stock" aria-label={`Remove ${item.id}`} disabled={item.count < 1} onClick={() => setAction({ type: "remove", item })}><Minus size={17} /></button></div></td></tr>;
         })}</tbody></table></div> : <EmptyState title={inventory.summary.unique_items ? "No matching items" : "Your inventory is empty"} message={inventory.summary.unique_items ? "Change the filters or add an item to this inventory." : "Add an item manually, start from the catalog, or import an inventory CSV."} action={<div className="empty-actions"><button className="button button-primary" onClick={() => setAddOpen(true)}>Add inventory</button><button className="button button-secondary" onClick={() => navigate("/settings")}>Import CSV</button></div>} />}
       </section>
 
       <Modal open={addOpen} title={addMode === "custom" ? "Add custom item" : "Add inventory"} description={addMode === "custom" ? "Record the item first; planning details stay optional." : "Choose the quickest way to add real stock."} onClose={() => setAddOpen(false)} size="lg">
-        {addMode === "custom" ? <ItemForm inventoryItems={state!.inventory.items} itemClasses={itemClasses} scope={scope} onSubmit={addItem} onCancel={() => setAddMode(null)} /> : <div className="add-inventory-choices"><button type="button" onClick={() => { setAddOpen(false); setCatalogOpen(true); }}><PackagePlus size={23} /><span><strong>Start from a preset</strong><small>Choose a common item with planning behavior already configured.</small></span></button><button type="button" onClick={() => setAddMode("custom")}><Plus size={23} /><span><strong>Create a custom item</strong><small>Enter your own equipment, furniture, transport, or site resource.</small></span></button></div>}
+        {addMode === "custom" ? <ItemForm sharedItems={state!.inventories.shared.items} inventoryItems={state!.inventory.items} itemClasses={itemClasses} scope={scope} canManageDefinitions={canManageDefinitions} onSubmit={addItem} onCancel={() => setAddMode(null)} /> : <div className="add-inventory-choices"><button type="button" onClick={() => { setAddOpen(false); setCatalogOpen(true); }}><PackagePlus size={23} /><span><strong>Start from a preset</strong><small>Choose a common item with planning behavior already configured.</small></span></button><button type="button" onClick={() => setAddMode("custom")}><Plus size={23} /><span><strong>Create a custom item</strong><small>Enter your own equipment, furniture, transport, or site resource.</small></span></button></div>}
       </Modal>
 
       <Modal open={Boolean(editItem)} title="Edit equipment" description={editItem ? titleCase(editItem.id) : undefined} onClose={() => setEditItem(null)} size="lg">
-        {editItem ? <ItemForm item={editItem} inventoryItems={state!.inventory.items} itemClasses={itemClasses} scope={actionScope(editItem)} onSubmit={updateItem} onCancel={() => setEditItem(null)} /> : null}
+        {editItem ? <ItemForm item={editItem} sharedItems={state!.inventories.shared.items} inventoryItems={state!.inventory.items} itemClasses={itemClasses} scope={actionScope(editItem)} canManageDefinitions={canManageDefinitions} onSubmit={updateItem} onCancel={() => setEditItem(null)} /> : null}
       </Modal>
 
-      <Modal open={catalogOpen} title="Item catalog" description={`Add proven presets to ${scope === "personal" ? "your inventory" : "shared inventory"}.`} onClose={() => setCatalogOpen(false)} size="lg">
+      <Modal open={catalogOpen} title="Item catalog" description={`Add proven presets to ${scope === "personal" || !canManageDefinitions ? "your inventory" : "shared inventory"}.`} onClose={() => setCatalogOpen(false)} size="lg">
         <div className="catalog-grid">{state!.presets.presets.map((preset) => <article className="catalog-item" key={preset.id}><span className={`category-icon type-${preset.type}`}>{preset.name.slice(0, 1)}</span><div><strong>{preset.name}</strong><span>{titleCase(preset.class_id || preset.type)}</span><p>{preset.description}</p><small>{preset.weight_kg ? `${preset.weight_kg} kg · ready-to-use preset` : "Ready-to-use preset"}</small></div><button className="icon-button" title={`Add ${preset.name}`} aria-label={`Add ${preset.name}`} onClick={() => void addPreset(preset.id)}><Plus size={18} /></button></article>)}</div>
         <div className="modal-actions"><button className="button button-secondary" onClick={() => setCatalogOpen(false)}>Done</button></div>
       </Modal>
@@ -228,20 +229,21 @@ export function InventoryPage() {
       </Modal>
 
       <Modal open={Boolean(action)} title={actionDetails?.title || "Update gear"} description={action ? titleCase(action.item.id) : undefined} onClose={() => setAction(null)} size="sm">
-        {action && actionDetails && ActionIcon ? <form className="form-stack" onSubmit={runAction}><div className="action-summary"><ActionIcon size={22} /><span><strong>{actionDetails.button}</strong><small>{action.type === "return" ? `${action.item.in_use_count} currently out` : `${action.item.count} currently available`}</small></span></div><label>Quantity<input name="amount" type="number" min="1" max={action.type === "return" ? action.item.in_use_count : action.item.count} defaultValue="1" required /></label><div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => setAction(null)}>Cancel</button><button className={`button ${action.type === "remove" ? "button-danger" : "button-primary"}`} type="submit">{actionDetails.button}</button></div></form> : null}
+        {action && actionDetails && ActionIcon ? <form className="form-stack" onSubmit={runAction}><div className="action-summary"><ActionIcon size={22} /><span><strong>{actionDetails.button}</strong><small>{action.item.count} currently available</small></span></div><label>Quantity<input name="amount" type="number" min="1" max={action.item.count} defaultValue="1" required /></label><div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => setAction(null)}>Cancel</button><button className="button button-danger" type="submit">{actionDetails.button}</button></div></form> : null}
       </Modal>
     </div>
   );
 }
 
-function ItemForm({ item, inventoryItems, itemClasses, scope, onSubmit, onCancel }: { item?: InventoryItem; inventoryItems: InventoryItem[]; itemClasses: ItemClass[]; scope: InventoryScope; onSubmit: (event: FormEvent<HTMLFormElement>) => void; onCancel: () => void }) {
+function ItemForm({ item, inventoryItems, sharedItems, itemClasses, scope, canManageDefinitions, onSubmit, onCancel }: { item?: InventoryItem; inventoryItems: InventoryItem[]; sharedItems: InventoryItem[]; itemClasses: ItemClass[]; scope: InventoryScope; canManageDefinitions: boolean; onSubmit: (event: FormEvent<HTMLFormElement>) => void; onCancel: () => void }) {
+  const [selectedScope, setSelectedScope] = useState<"shared" | "personal">(canManageDefinitions && scope !== "personal" ? "shared" : "personal");
   const [dependencies, setDependencies] = useState(() => item?.requirements.length ? item.requirements.map((requirement) => ({ key: crypto.randomUUID(), ...requirement })) : [{ key: crypto.randomUUID(), item_id: "", amount: 1 }]);
   return <form className="form-stack item-builder" onSubmit={onSubmit}>
-    <section className="item-builder-section"><div className="item-builder-heading"><span>1</span><div><strong>Basic information</strong><small>Identify the item and where it belongs.</small></div></div><div className="form-grid"><label>Item name<input name="id" defaultValue={item?.id || ""} placeholder="EV ZLX-15P pair A" required /></label><label>Category<select name="type" defaultValue={item?.type || "other"}>{itemTypes.map((type) => <option key={type} value={type}>{titleCase(type)}</option>)}</select></label><label>Manufacturer<input name="manufacturer" defaultValue={item?.manufacturer || ""} placeholder="Electro-Voice" /></label><label>Model<input name="model" defaultValue={item?.model || ""} placeholder="ZLX-15P" /></label><label>Quantity<input name="amount" type="number" min="1" defaultValue={item?.count || 1} required disabled={Boolean(item)} /></label><label>Inventory<select name="scope" defaultValue={scope === "personal" ? "personal" : "shared"}><option value="shared">Shared inventory</option><option value="personal">My inventory</option></select></label><label>Condition<select name="condition" defaultValue={item?.condition || "ready"}><option value="ready">Ready</option><option value="service">Needs service</option><option value="retired">Retired</option></select></label></div></section>
-    <section className="item-builder-section"><div className="item-builder-heading"><span>2</span><div><strong>Capabilities</strong><small>Choose the closest use so event planning can match it.</small></div></div><label>Primary use<select name="class_id" defaultValue={item?.class_id || ""}><option value="">General {titleCase(item?.type || "equipment")}</option>{itemClasses.map((itemClass) => <option key={`${itemClass.organization_id}-${itemClass.id}`} value={itemClass.id}>{itemClass.name} · {titleCase(itemClass.family)}</option>)}</select></label></section>
-    <section className="item-builder-section"><div className="item-builder-heading"><span>3</span><div><strong>Dependencies</strong><small>Add stock that must travel with this item.</small></div></div><div className="dependency-list">{dependencies.map((dependency) => <div className="dependency-row" key={dependency.key}><label>Linked inventory item<select name="requirement_id" value={dependency.item_id} onChange={(event) => setDependencies(dependencies.map((entry) => entry.key === dependency.key ? { ...entry, item_id: event.target.value } : entry))}><option value="">Choose an item</option>{inventoryItems.filter((candidate) => candidate.id !== item?.id).map((candidate) => <option key={candidate.id} value={candidate.id}>{titleCase(candidate.id)} · {candidate.count} ready</option>)}</select></label><label>Minimum quantity<input name="requirement_amount" type="number" min="1" value={dependency.amount} onChange={(event) => setDependencies(dependencies.map((entry) => entry.key === dependency.key ? { ...entry, amount: Number(event.target.value) } : entry))} /></label><button className="icon-button" type="button" aria-label="Remove dependency" title="Remove dependency" disabled={dependencies.length === 1} onClick={() => setDependencies(dependencies.filter((entry) => entry.key !== dependency.key))}><Trash2 size={16} /></button></div>)}</div><button className="button button-secondary button-compact" type="button" onClick={() => setDependencies([...dependencies, { key: crypto.randomUUID(), item_id: "", amount: 1 }])}><Plus size={15} />Add dependency</button></section>
+    <section className="item-builder-section"><div className="item-builder-heading"><span>1</span><div><strong>Basic information</strong><small>Identify the item and where it belongs.</small></div></div><div className="form-grid"><label>Item name<input name="id" defaultValue={item?.id || ""} placeholder="EV ZLX-15P pair A" required /></label><label>Category<select name="type" defaultValue={item?.type || "other"}>{itemTypes.map((type) => <option key={type} value={type}>{titleCase(type)}</option>)}</select></label><label>Manufacturer<input name="manufacturer" defaultValue={item?.manufacturer || ""} placeholder="Electro-Voice" /></label><label>Model<input name="model" defaultValue={item?.model || ""} placeholder="ZLX-15P" /></label><label>Quantity<input name="amount" type="number" min="1" defaultValue={item?.count || 1} required disabled={Boolean(item)} /></label><label>Inventory<select name="scope" value={selectedScope} onChange={(event) => { const next = event.target.value as "shared" | "personal"; setSelectedScope(next); if (next === "shared") setDependencies(dependencies.map((entry) => sharedItems.some((candidate) => candidate.id === entry.item_id) ? entry : { ...entry, item_id: "" })); }}>{canManageDefinitions ? <option value="shared">Shared inventory</option> : null}<option value="personal">My inventory</option></select></label><label>Condition<select name="condition" defaultValue={item?.condition || "ready"}><option value="ready">Ready</option><option value="service">Needs service</option><option value="retired">Retired</option></select></label></div></section>
+    {canManageDefinitions ? <section className="item-builder-section"><div className="item-builder-heading"><span>2</span><div><strong>Capabilities</strong><small>Choose the closest use so event planning can match it.</small></div></div><label>Primary use<select name="class_id" defaultValue={item?.class_id || ""}><option value="">General {titleCase(item?.type || "equipment")}</option>{itemClasses.map((itemClass) => <option key={`${itemClass.organization_id}-${itemClass.id}`} value={itemClass.id}>{itemClass.name} · {titleCase(itemClass.family)}</option>)}</select></label></section> : null}
+    <section className="item-builder-section"><div className="item-builder-heading"><span>3</span><div><strong>Dependencies</strong><small>Add stock that must travel with this item.</small></div></div><div className="dependency-list">{dependencies.map((dependency) => <div className="dependency-row" key={dependency.key}><label>Linked inventory item<select name="requirement_id" value={dependency.item_id} onChange={(event) => setDependencies(dependencies.map((entry) => entry.key === dependency.key ? { ...entry, item_id: event.target.value } : entry))}><option value="">Choose an item</option>{(selectedScope === "shared" ? sharedItems : inventoryItems).filter((candidate) => candidate.id !== item?.id).map((candidate) => <option key={candidate.id} value={candidate.id}>{titleCase(candidate.id)} · {candidate.count} ready</option>)}</select></label><label>Minimum quantity<input name="requirement_amount" type="number" min="1" value={dependency.amount} onChange={(event) => setDependencies(dependencies.map((entry) => entry.key === dependency.key ? { ...entry, amount: Number(event.target.value) } : entry))} /></label><button className="icon-button" type="button" aria-label="Remove dependency" title="Remove dependency" disabled={dependencies.length === 1} onClick={() => setDependencies(dependencies.filter((entry) => entry.key !== dependency.key))}><Trash2 size={16} /></button></div>)}</div><button className="button button-secondary button-compact" type="button" onClick={() => setDependencies([...dependencies, { key: crypto.randomUUID(), item_id: "", amount: 1 }])}><Plus size={15} />Add dependency</button></section>
     <details className="advanced-fields"><summary>Advanced</summary><div className="form-grid"><label>Weight (kg)<input name="weight_kg" type="number" min="0" step="0.1" defaultValue={item?.weight_kg || 0} /></label><label className="span-2">Operator note<input name="info" defaultValue={item?.info || ""} placeholder="Packing, handling, or identification note" /></label></div></details>
-    <input type="hidden" name="quality_score" value={item?.quality_score || 70} /><input type="hidden" name="preference_score" value={item?.preference_score || 70} />
+    {canManageDefinitions ? <><input type="hidden" name="quality_score" value={item?.quality_score || 70} /><input type="hidden" name="preference_score" value={item?.preference_score || 70} /></> : null}
     <div className="modal-actions"><button className="button button-secondary" type="button" onClick={onCancel}>Cancel</button><button className="button button-primary" type="submit">{item ? "Save changes" : "Add equipment"}</button></div>
   </form>;
 }

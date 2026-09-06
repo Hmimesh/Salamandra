@@ -109,7 +109,8 @@ def verify_forged_host_rejected(base_url: str, timeout: float) -> None:
             status = response.status
     except HTTPError as error:
         status = error.code
-    if status not in {400, 403, 421}:
+    # Railway can reject an unknown Host at its routing edge before Salamandra runs.
+    if status not in {400, 403, 404, 421}:
         raise AssertionError(f"Forged Host was not rejected (got HTTP {status}).")
 
 

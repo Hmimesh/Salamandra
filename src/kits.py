@@ -7,6 +7,11 @@ from typing import Any
 from uuid import uuid4
 
 from Item_node import Requirement, normalize_item_id
+from security import StateConflict
+
+
+def normalize_kit_name(value: str) -> str:
+    return " ".join(value.split()).casefold()
 
 
 @dataclass
@@ -41,7 +46,7 @@ class SavedKit:
 
 
 def validate_kit_payload(data: dict[str, Any], organization_id: str) -> SavedKit:
-    name = str(data.get("name", "")).strip()
+    name = " ".join(str(data.get("name", "")).split())
     description = str(data.get("description", "")).strip()
     notes = str(data.get("notes", "")).strip()
     if not name or len(name) > 200:
@@ -88,6 +93,11 @@ class KitStore:
 
     def create(self, data: dict[str, Any], organization_id: str) -> SavedKit:
         kit = validate_kit_payload(data, organization_id)
+        if any(
+            normalize_kit_name(existing.name) == normalize_kit_name(kit.name)
+            for existing in self.list_kits(organization_id)
+        ):
+            raise StateConflict("A kit with this name already exists in the workspace.")
         self.kits[kit.id] = kit
         self.save()
         return kit

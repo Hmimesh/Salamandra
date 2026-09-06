@@ -18,6 +18,7 @@ export function KitsPage() {
   const [selected, setSelected] = useState<SelectedPlan | null>(null);
   const [creating, setCreating] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [createKey, setCreateKey] = useState(() => crypto.randomUUID());
   const [newKit, setNewKit] = useState({ name: "", description: "", notes: "", items: [{ id: crypto.randomUUID(), item_id: "", amount: 1 }] });
   const sources = tab === "kits" ? state!.templates.kits : state!.templates.templates;
   const suggestions = tab === "kits" ? state!.templates.suggested_kits : state!.templates.suggested_templates;
@@ -42,6 +43,7 @@ export function KitsPage() {
   }
 
   function startFromSuggestion(source?: EventTemplate) {
+    setCreateKey(crypto.randomUUID());
     setNewKit({
       name: source?.name || "",
       description: source?.description || "",
@@ -55,9 +57,12 @@ export function KitsPage() {
     event.preventDefault();
     setSaving(true);
     try {
-      await mutate("/api/kits/create", { ...newKit, items: newKit.items.map(({ item_id, amount }) => ({ item_id, amount })) }, { success: "Kit saved to the workspace." });
+      await mutate("/api/kits/create", { ...newKit, idempotency_key: createKey, items: newKit.items.map(({ item_id, amount }) => ({ item_id, amount })) }, { success: "Kit saved to the workspace." });
       setCreating(false);
       setNewKit({ name: "", description: "", notes: "", items: [{ id: crypto.randomUUID(), item_id: "", amount: 1 }] });
+      setCreateKey(crypto.randomUUID());
+    } catch {
+      // Keep the form and retry key; the workspace provider reports the API error.
     } finally {
       setSaving(false);
     }

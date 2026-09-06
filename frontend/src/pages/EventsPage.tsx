@@ -334,6 +334,7 @@ export function EventsPage() {
         <>
           <section className="calendar-section data-section">
             <div className="calendar-toolbar"><div><h2>{new Intl.DateTimeFormat("en", { month: "long", year: "numeric" }).format(month)}</h2><p>{activeEvents.length} active events</p></div><div><button className="icon-button" title="Previous month" aria-label="Previous month" onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() - 1, 1))}><ChevronLeft size={18} /></button><button className="button button-secondary button-compact" onClick={() => setMonth(new Date())}>Today</button><button className="icon-button" title="Next month" aria-label="Next month" onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth() + 1, 1))}><ChevronRight size={18} /></button></div></div>
+            <div className="calendar-scroll" role="region" aria-label="Event calendar" tabIndex={0}>
             <div className="calendar-grid calendar-weekdays">{weekDays.map((day) => <span key={day}>{day}</span>)}</div>
             <div className="calendar-grid">
               {cells.map((date) => {
@@ -343,6 +344,7 @@ export function EventsPage() {
                 const today = key === isoDate(new Date());
                 return <div className={`calendar-cell ${muted ? "muted" : ""} ${today ? "today" : ""}`} key={key}><span>{date.getDate()}</span>{dayEvents.slice(0, 2).map((event) => <button type="button" className={`calendar-event status-border-${event.status}`} key={event.id} onClick={() => setSearchParams({ event: event.id })}><strong>{event.start_time}</strong>{event.title}</button>)}{dayEvents.length > 2 ? <button type="button" className="calendar-more" onClick={() => setOverflowDate(key)} aria-label={`Show ${dayEvents.length - 2} more events on ${formatDateLong(key)}`}>+{dayEvents.length - 2} more</button> : null}</div>;
               })}
+            </div>
             </div>
           </section>
 
@@ -357,7 +359,7 @@ export function EventsPage() {
         </>
       )}
 
-      <Modal open={Boolean(selectedEvent) && !destructiveAction} title={editing ? "Edit event" : selectedEvent?.title || "Event"} description={selectedEvent ? `${formatDateLong(selectedEvent.start_date)} · ${selectedEvent.start_time} · ${selectedEvent.location || "Location TBD"}` : undefined} onClose={() => { setEditing(null); setSearchParams({}); }} size="lg">
+      <Modal open={Boolean(selectedEvent)} suspended={Boolean(destructiveAction)} title={editing ? "Edit event" : selectedEvent?.title || "Event"} description={selectedEvent ? `${formatDateLong(selectedEvent.start_date)} · ${selectedEvent.start_time} · ${selectedEvent.location || "Location TBD"}` : undefined} onClose={() => { setEditing(null); setSearchParams({}); }} size="lg">
         {selectedEvent && editing ? (
           <form className="event-edit-form" onSubmit={saveEdit}>
             <p className="event-edit-intro">Update the brief or schedule. Salamandra will rebuild the inventory plan from current workspace stock when you save.</p>

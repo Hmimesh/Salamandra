@@ -1,5 +1,5 @@
 import { AlertTriangle, CheckCircle2, Info, X } from "lucide-react";
-import { type ReactNode, useEffect, useRef } from "react";
+import { type ReactNode, useEffect, useId, useRef } from "react";
 import { titleCase } from "../lib/format";
 import type { EventRecord, UserAccount } from "../types";
 
@@ -72,6 +72,7 @@ export function Modal({
   children,
   onClose,
   size = "md",
+  suspended = false,
 }: {
   open: boolean;
   title: string;
@@ -79,8 +80,11 @@ export function Modal({
   children: ReactNode;
   onClose: () => void;
   size?: "sm" | "md" | "lg";
+  suspended?: boolean;
 }) {
   const panelRef = useRef<HTMLElement>(null);
+  const titleId = useId();
+  const descriptionId = useId();
   const closeHandler = useRef(onClose);
   closeHandler.current = onClose;
 
@@ -124,11 +128,11 @@ export function Modal({
     <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
       if (event.currentTarget === event.target) onClose();
     }}>
-      <section ref={panelRef} className={`modal-panel modal-${size}`} role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby={description ? "modal-description" : undefined}>
+      <section ref={panelRef} className={`modal-panel modal-${size}`} role="dialog" aria-modal="true" aria-hidden={suspended || undefined} aria-labelledby={titleId} aria-describedby={description ? descriptionId : undefined}>
         <header className="modal-head">
           <div>
-            <h2 id="modal-title">{title}</h2>
-            {description ? <p id="modal-description">{description}</p> : null}
+            <h2 id={titleId}>{title}</h2>
+            {description ? <p id={descriptionId}>{description}</p> : null}
           </div>
           <button className="icon-button" type="button" onClick={onClose} aria-label="Close dialog" title="Close">
             <X size={19} />

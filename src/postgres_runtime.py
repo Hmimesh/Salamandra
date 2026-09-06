@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import secrets
 from copy import deepcopy
@@ -20,6 +21,7 @@ from database import (
     ItemClassRecordModel,
     MembershipModel,
     OrganizationModel,
+    OperationRequestModel,
     SavedKitModel,
     SessionModel,
     StockMovementModel,
@@ -38,7 +40,7 @@ from Inventory import Inventory
 from inventory_workspace import PERSONAL_SCOPE, SHARED_SCOPE
 from Item_node import ItemNode, Requirement, normalize_item_id
 from item_classes import ConfiguredItemClass, ItemClassCatalog
-from kits import SavedKit, validate_kit_payload
+from kits import SavedKit, normalize_kit_name, validate_kit_payload
 from security import Permission, ResourceNotFound, StateConflict, require_permission
 
 
@@ -371,6 +373,7 @@ class PostgresInventoryWorkspace:
         reason_code: str = "stock_received",
         reason: str = "Inventory received.",
         source: str = "inventory_ui",
+        _trusted_preset: bool = False,
     ) -> ItemNode:
         owner = self._owner(scope, user_id)
         item_id = normalize_item_id(item.id)
@@ -389,6 +392,7 @@ class PostgresInventoryWorkspace:
             reason_code,
             reason,
             source,
+            _trusted_preset=_trusted_preset,
         )
         return self._item(row)
 
@@ -413,6 +417,8 @@ class PostgresInventoryWorkspace:
             reason_code="preset_received",
             reason=f"Stock added from preset {preset.id}.",
             source="inventory_preset",
+            # Only the server catalog supplies this definition, never request metadata.
+            _trusted_preset=True,
         )
 
     def update_item(
@@ -806,6 +812,8 @@ class PostgresIntegrationStore:
 
 
 class PostgresKitStore:
+    OPERATION = "kit.create"
+
     def __init__(self, factory: sessionmaker[Session]):
         self.factory = factory
 
@@ -834,55 +842,165 @@ class PostgresKitStore:
         organization_id: str,
         actor_user_id: str,
         request_id: str,
+        idempotency_key: str = "",
     ) -> SavedKit:
         kit = validate_kit_payload(data, organization_id)
-        with self.factory.begin() as session:
-            membership = session.scalar(
-                select(MembershipModel).where(
-                    MembershipModel.organization_id == organization_id,
-                    MembershipModel.user_id == actor_user_id,
-                    MembershipModel.status == "active",
-                )
-            )
-            if membership is None:
-                raise ResourceNotFound("Organization membership was not found.")
-            require_permission(membership.role, Permission.KITS_MANAGE)
-            visible_ids = set(
-                session.scalars(
-                    select(InventoryHoldingModel.legacy_item_id).where(
-                        InventoryHoldingModel.organization_id == organization_id,
-                        InventoryHoldingModel.active.is_(True),
-                        or_(
-                            InventoryHoldingModel.scope == SHARED_SCOPE,
-                            and_(
-                                InventoryHoldingModel.scope == PERSONAL_SCOPE,
-                                InventoryHoldingModel.owner_user_id == actor_user_id,
-                            ),
-                        ),
+        idempotency_key = str(idempotency_key or request_id).strip()
+        if not idempotency_key or len(idempotency_key) > 160:
+            raise ValueError("Kit creation idempotency key is invalid.")
+        fingerprint_payload = {
+            "name": normalize_kit_name(kit.name),
+            "description": kit.description,
+            "notes": kit.notes,
+            "items": [item.to_dict() for item in kit.items],
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        try:
+            with self.factory.begin() as session:
+                membership = session.scalar(
+                    select(MembershipModel).where(
+                        MembershipModel.organization_id == organization_id,
+                        MembershipModel.user_id == actor_user_id,
+                        MembershipModel.status == "active",
                     )
                 )
-            )
-            if not {item.item_id for item in kit.items}.issubset(visible_ids):
-                raise ValueError("Choose only inventory available to this workspace account.")
-            row = SavedKitModel(
-                id=kit.id,
-                organization_id=organization_id,
-                name=kit.name,
-                data=kit.to_dict(),
-            )
-            session.add(row)
-            session.add(
-                AuditEventModel(
-                    organization_id=organization_id,
-                    actor_membership_id=membership.id,
-                    action="kit.created",
-                    resource_type="kit",
-                    resource_id=kit.id,
-                    request_id=request_id,
-                    changes={"name": kit.name, "item_count": len(kit.items)},
+                if membership is None:
+                    raise ResourceNotFound("Organization membership was not found.")
+                require_permission(membership.role, Permission.KITS_MANAGE)
+                organization = session.scalar(
+                    select(OrganizationModel)
+                    .where(OrganizationModel.id == organization_id)
+                    .with_for_update()
                 )
+                if organization is None:
+                    raise ResourceNotFound("Organization was not found.")
+
+                existing_request = self._request(
+                    session, organization_id, idempotency_key, lock=True
+                )
+                if existing_request is not None:
+                    return self._existing_result(
+                        session, existing_request, fingerprint
+                    )
+
+                existing_names = session.scalars(
+                    select(SavedKitModel.name).where(
+                        SavedKitModel.organization_id == organization_id
+                    )
+                )
+                if any(
+                    normalize_kit_name(name) == normalize_kit_name(kit.name)
+                    for name in existing_names
+                ):
+                    raise StateConflict(
+                        "A kit with this name already exists in the workspace."
+                    )
+
+                visible_ids = set(
+                    session.scalars(
+                        select(InventoryHoldingModel.legacy_item_id).where(
+                            InventoryHoldingModel.organization_id == organization_id,
+                            InventoryHoldingModel.active.is_(True),
+                            or_(
+                                InventoryHoldingModel.scope == SHARED_SCOPE,
+                                and_(
+                                    InventoryHoldingModel.scope == PERSONAL_SCOPE,
+                                    InventoryHoldingModel.owner_user_id == actor_user_id,
+                                ),
+                            ),
+                        )
+                    )
+                )
+                if not {item.item_id for item in kit.items}.issubset(visible_ids):
+                    raise ValueError(
+                        "Choose only inventory available to this workspace account."
+                    )
+
+                operation = OperationRequestModel(
+                    organization_id=organization_id,
+                    operation=self.OPERATION,
+                    idempotency_key=idempotency_key,
+                    request_fingerprint=fingerprint,
+                )
+                row = SavedKitModel(
+                    id=kit.id,
+                    organization_id=organization_id,
+                    name=kit.name,
+                    data=kit.to_dict(),
+                )
+                session.add_all([operation, row])
+                session.flush()
+                operation.status = "completed"
+                operation.resource_id = kit.id
+                operation.response = {"kit_id": kit.id}
+                operation.completed_at = utc_now()
+                session.add(
+                    AuditEventModel(
+                        organization_id=organization_id,
+                        actor_membership_id=membership.id,
+                        action="kit.created",
+                        resource_type="kit",
+                        resource_id=kit.id,
+                        request_id=request_id,
+                        changes={
+                            "name": kit.name,
+                            "item_count": len(kit.items),
+                            "idempotency_key": idempotency_key,
+                        },
+                    )
+                )
+                return kit
+        except IntegrityError:
+            with self.factory() as session:
+                existing_request = self._request(
+                    session, organization_id, idempotency_key, lock=False
+                )
+                if existing_request is None:
+                    raise
+                return self._existing_result(session, existing_request, fingerprint)
+
+    def _request(
+        self,
+        session: Session,
+        organization_id: str,
+        idempotency_key: str,
+        *,
+        lock: bool,
+    ) -> OperationRequestModel | None:
+        statement = select(OperationRequestModel).where(
+            OperationRequestModel.organization_id == organization_id,
+            OperationRequestModel.operation == self.OPERATION,
+            OperationRequestModel.idempotency_key == idempotency_key,
+        )
+        if lock:
+            statement = statement.with_for_update()
+        return session.scalar(statement)
+
+    @staticmethod
+    def _existing_result(
+        session: Session,
+        request: OperationRequestModel,
+        fingerprint: str,
+    ) -> SavedKit:
+        if request.request_fingerprint != fingerprint:
+            raise StateConflict(
+                "This idempotency key was already used for another kit."
             )
-        return kit
+        if request.status != "completed" or not request.resource_id:
+            raise StateConflict("This kit creation is still being processed.")
+        row = session.scalar(
+            select(SavedKitModel).where(
+                SavedKitModel.organization_id == request.organization_id,
+                SavedKitModel.id == request.resource_id,
+            )
+        )
+        if row is None:
+            raise StateConflict("The completed kit is unavailable.")
+        return SavedKit.from_dict(dict(row.data or {}))
 
 
 class PostgresRuntime:

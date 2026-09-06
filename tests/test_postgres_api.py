@@ -42,6 +42,7 @@ from database import (
     MembershipModel,
     OperationRequestModel,
     OrganizationModel,
+    SavedKitModel,
     SessionModel,
     StockMovementModel,
     UserModel,
@@ -125,6 +126,7 @@ def _serve_postgres(
     DatabaseHandler.memory = runtime.memory
     DatabaseHandler.item_classes = runtime.item_classes
     DatabaseHandler.integrations = runtime.integrations
+    DatabaseHandler.kits = runtime.kits
     DatabaseHandler.templates = TemplateCatalog(
         kits=[
             Kit(
@@ -344,6 +346,16 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200)
+        return headers["set-cookie"].split(";", 1)[0]
+
+    def _sign_in_credentials(self, port: int, email: str, password: str) -> str:
+        status, payload, headers = _request(
+            port,
+            "POST",
+            "/api/auth/signin",
+            {"email": email, "password": password},
+        )
+        self.assertEqual(status, 200, payload)
         return headers["set-cookie"].split(";", 1)[0]
 
     def test_workspace_registration_creates_an_empty_authoritative_workspace(self):
@@ -1114,6 +1126,7 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         self.assertEqual(new_audits[0]["changes"]["changed_fields"], ["info"])
         _request(port, "POST", "/api/auth/signout", {}, cookie)
 
+    @isolated_database_inserts
     def test_definition_update_tenant_and_permission_boundaries(self):
         port = self.ports[0]
         owner_cookie = self._sign_in(port)
@@ -1178,6 +1191,9 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             scope="personal",
         )
         personal_body.pop("original_id")
+        # This setup creates basic stock; advanced-field rejection is tested separately.
+        for field in ("class_id", "capabilities", "connectors", "attributes", "quality_score", "preference_score"):
+            personal_body.pop(field, None)
         personal_body["idempotency_key"] = "add-technician-definition-item"
         add_status, _, _ = _request(
             port,
@@ -1500,6 +1516,536 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             )
         self.assertEqual((rollback_requests, rollback_events), (0, 0))
         _request(first_port, "POST", "/api/auth/signout", {}, cookie)
+
+    @isolated_database_inserts
+    def test_inventory_dependency_validation_is_authoritative_and_atomic(self):
+        port = self.ports[0]
+        cookie = self._sign_in(port)
+        suffix = uuid4().hex
+        target_id = f"dependency target {suffix}"
+        target_body = self._definition_body(target_id)
+        target_body.pop("original_id")
+        target_body["idempotency_key"] = f"dependency-target-{suffix}"
+        status, payload, _ = _request(
+            port, "POST", "/api/inventory/items", target_body, cookie
+        )
+        self.assertEqual(status, 200, payload)
+
+        foreign_org_id = f"dependency-foreign-org-{suffix}"
+        foreign_target_id = f"foreign dependency target {suffix}"
+        inactive_target_id = f"inactive dependency target {suffix}"
+        with self.factory.begin() as session:
+            session.add(OrganizationModel(id=foreign_org_id, name="Dependency Foreign Org"))
+            session.flush()
+            session.add_all(
+                [
+                    InventoryHoldingModel(
+                        id=f"foreign-dependency-holding-{suffix}",
+                        organization_id=foreign_org_id,
+                        legacy_item_id=foreign_target_id,
+                        scope="shared",
+                        available_quantity=1,
+                        active=True,
+                        data={"requirements": []},
+                    ),
+                    InventoryHoldingModel(
+                        id=f"inactive-dependency-holding-{suffix}",
+                        organization_id="runtime-org",
+                        legacy_item_id=inactive_target_id,
+                        scope="shared",
+                        available_quantity=0,
+                        active=False,
+                        data={"requirements": []},
+                    ),
+                ]
+            )
+
+        def mutation_counts() -> tuple[int, int, int, int, int]:
+            with self.factory() as session:
+                return tuple(
+                    session.scalar(select(func.count()).select_from(model))
+                    for model in (
+                        InventoryHoldingModel,
+                        InventoryAdjustmentModel,
+                        StockMovementModel,
+                        AuditEventModel,
+                        OperationRequestModel,
+                    )
+                )
+
+        invalid_requirements = (
+            ("self", lambda item_id: [{"item_id": item_id, "amount": 1}]),
+            ("missing", lambda _: [{"item_id": f"missing target {suffix}", "amount": 1}]),
+            ("foreign", lambda _: [{"item_id": foreign_target_id, "amount": 1}]),
+            ("inactive", lambda _: [{"item_id": inactive_target_id, "amount": 1}]),
+            (
+                "duplicate",
+                lambda _: [
+                    {"item_id": target_id, "amount": 1},
+                    {"item_id": target_id.upper(), "amount": 2},
+                ],
+            ),
+            ("zero", lambda _: [{"item_id": target_id, "amount": 0}]),
+            ("negative", lambda _: [{"item_id": target_id, "amount": -1}]),
+            ("boolean", lambda _: [{"item_id": target_id, "amount": True}]),
+            ("fractional", lambda _: [{"item_id": target_id, "amount": 1.5}]),
+            ("malformed", lambda _: [{"item_id": target_id, "amount": "1.5"}]),
+        )
+        for label, requirements in invalid_requirements:
+            with self.subTest(label=label):
+                item_id = f"invalid dependency {label} {suffix}"
+                body = self._definition_body(item_id)
+                body.pop("original_id")
+                body["requirements"] = requirements(item_id)
+                body["idempotency_key"] = f"invalid-dependency-{label}-{suffix}"
+                before = mutation_counts()
+                status, _, _ = _request(
+                    port, "POST", "/api/inventory/items", body, cookie
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(mutation_counts(), before)
+
+        valid_id = f"valid dependency source {suffix}"
+        valid_body = self._definition_body(valid_id)
+        valid_body.pop("original_id")
+        valid_body["requirements"] = [{"item_id": target_id, "amount": 2}]
+        valid_body["idempotency_key"] = f"valid-dependency-{suffix}"
+        status, payload, _ = _request(
+            port, "POST", "/api/inventory/items", valid_body, cookie
+        )
+        self.assertEqual(status, 200, payload)
+        with self.factory() as session:
+            holding = session.scalar(
+                select(InventoryHoldingModel).where(
+                    InventoryHoldingModel.organization_id == "runtime-org",
+                    InventoryHoldingModel.legacy_item_id == valid_id,
+                )
+            )
+            self.assertEqual(
+                dict(holding.data or {})["requirements"],
+                [{"item_id": target_id, "amount": 2}],
+            )
+        _request(port, "POST", "/api/auth/signout", {}, cookie)
+
+    @isolated_database_inserts
+    def test_inventory_dependency_cycle_is_rejected_without_partial_mutation(self):
+        port = self.ports[0]
+        cookie = self._sign_in(port)
+        suffix = uuid4().hex
+        item_ids = [f"cycle {letter} {suffix}" for letter in "abc"]
+        for item_id in item_ids:
+            body = self._definition_body(item_id)
+            body.pop("original_id")
+            body["idempotency_key"] = f"create-{item_id.replace(' ', '-')}"
+            status, payload, _ = _request(
+                port, "POST", "/api/inventory/items", body, cookie
+            )
+            self.assertEqual(status, 200, payload)
+
+        for source_id, target_id in zip(item_ids[:2], item_ids[1:]):
+            body = self._definition_body(
+                source_id,
+                original_id=source_id,
+                idempotency_key=f"link-{source_id.replace(' ', '-')}",
+            )
+            body["requirements"] = [{"item_id": target_id, "amount": 1}]
+            status, payload, _ = _request(
+                port, "POST", "/api/inventory/items/update", body, cookie
+            )
+            self.assertEqual(status, 200, payload)
+
+        with self.factory() as session:
+            before_holding = session.scalar(
+                select(InventoryHoldingModel).where(
+                    InventoryHoldingModel.organization_id == "runtime-org",
+                    InventoryHoldingModel.legacy_item_id == item_ids[2],
+                )
+            )
+            before = (
+                deepcopy(before_holding.data),
+                before_holding.version,
+                session.scalar(select(func.count()).select_from(AuditEventModel)),
+                session.scalar(select(func.count()).select_from(OperationRequestModel)),
+            )
+
+        cycle_body = self._definition_body(
+            item_ids[2],
+            original_id=item_ids[2],
+            idempotency_key=f"cycle-close-{suffix}",
+        )
+        cycle_body["requirements"] = [{"item_id": item_ids[0], "amount": 1}]
+        status, _, _ = _request(
+            port, "POST", "/api/inventory/items/update", cycle_body, cookie
+        )
+        self.assertEqual(status, 400)
+        with self.factory() as session:
+            after_holding = session.scalar(
+                select(InventoryHoldingModel).where(
+                    InventoryHoldingModel.organization_id == "runtime-org",
+                    InventoryHoldingModel.legacy_item_id == item_ids[2],
+                )
+            )
+            after = (
+                deepcopy(after_holding.data),
+                after_holding.version,
+                session.scalar(select(func.count()).select_from(AuditEventModel)),
+                session.scalar(select(func.count()).select_from(OperationRequestModel)),
+            )
+        self.assertEqual(after, before)
+        _request(port, "POST", "/api/auth/signout", {}, cookie)
+
+    @isolated_database_inserts
+    def test_inventory_dependencies_respect_personal_source_visibility(self):
+        port = self.ports[0]
+        cookie = self._sign_in(port)
+        suffix = uuid4().hex
+        own_target, other_target = f"own target {suffix}", f"other target {suffix}"
+        with self.factory.begin() as session:
+            for item_id, owner in ((own_target, "runtime-owner"), (other_target, "runtime-other")):
+                session.add(InventoryHoldingModel(
+                    organization_id="runtime-org", owner_user_id=owner,
+                    legacy_item_id=item_id, scope="personal", available_quantity=2,
+                    data={"type": "cable", "requirements": []},
+                ))
+        for scope, target, expected in (
+            ("shared", own_target, 400),
+            ("shared", other_target, 400),
+            ("personal", other_target, 400),
+            ("personal", own_target, 200),
+        ):
+            with self.subTest(scope=scope, target=target):
+                before = self._database_state_snapshot()
+                status, payload, _ = _request(
+                    port, "POST", "/api/inventory/items",
+                    {"id": f"visibility source {uuid4().hex}", "scope": scope, "amount": 1,
+                     "requirements": [{"item_id": target, "amount": 1}]},
+                    cookie,
+                )
+                self.assertEqual(status, expected, payload)
+                if expected == 400:
+                    self.assertEqual(self._database_state_snapshot(), before)
+        _request(port, "POST", "/api/auth/signout", {}, cookie)
+
+    @isolated_database_inserts
+    def test_advanced_inventory_metadata_requires_definition_permission(self):
+        port = self.ports[0]
+        suffix = uuid4().hex
+        users = (
+            ("producer", f"producer-{suffix}", f"producer-{suffix}@example.test"),
+            ("admin", f"admin-{suffix}", f"admin-{suffix}@example.test"),
+        )
+        with self.factory.begin() as session:
+            for role, user_id, email in users:
+                session.add(
+                    UserModel(
+                        id=user_id,
+                        email=email,
+                        name=f"Runtime {role.title()}",
+                        password_hash=AccountStore.hash_password(f"{role}-password"),
+                    )
+                )
+                session.flush()
+                session.add(
+                    MembershipModel(
+                        id=f"{role}-membership-{suffix}",
+                        organization_id="runtime-org",
+                        user_id=user_id,
+                        role=role,
+                    )
+                )
+
+        producer_cookie = self._sign_in_credentials(
+            port, users[0][2], "producer-password"
+        )
+        basic_id = f"producer basic {suffix}"
+        status, payload, _ = _request(
+            port,
+            "POST",
+            "/api/inventory/items",
+            {
+                "id": basic_id,
+                "type": "other",
+                "amount": 1,
+                "scope": "personal",
+                "info": "User-facing note",
+                "weight_kg": 1,
+                "requirements": [],
+            },
+            producer_cookie,
+        )
+        self.assertEqual(status, 200, payload)
+
+        advanced_values = {
+            "quality_score": 99,
+            "preference_score": 99,
+            "class_id": "main-pa",
+            "capabilities": ["pa.main"],
+            "connectors": ["xlr"],
+            "attributes": {"forged": True},
+        }
+        for field, value in advanced_values.items():
+            with self.subTest(role="producer", field=field):
+                status, _, _ = _request(
+                    port,
+                    "POST",
+                    "/api/inventory/items",
+                    {
+                        "id": f"producer forged {field} {suffix}",
+                        "type": "other",
+                        "amount": 1,
+                        "scope": "personal",
+                        field: value,
+                    },
+                    producer_cookie,
+                )
+                self.assertEqual(status, 403)
+        shared_status, _, _ = _request(
+            port,
+            "POST",
+            "/api/inventory/items",
+            {"id": f"producer shared {suffix}", "amount": 1, "scope": "shared"},
+            producer_cookie,
+        )
+        self.assertEqual(shared_status, 403)
+
+        # Selecting a server-owned preset is not permission to submit raw definitions.
+        preset_status, preset_payload, _ = _request(
+            port, "POST", "/api/inventory/presets",
+            {"preset_id": "xlr-10m", "scope": "personal", "amount": 2},
+            producer_cookie,
+        )
+        self.assertEqual(preset_status, 200, preset_payload)
+        forged_preset_status, _, _ = _request(
+            port, "POST", "/api/inventory/presets",
+            {"preset_id": "xlr-10m", "scope": "personal", "quality_score": 99},
+            producer_cookie,
+        )
+        self.assertEqual(forged_preset_status, 403)
+
+        technician_cookie = self._sign_in_other(port)
+        status, _, _ = _request(
+            port,
+            "POST",
+            "/api/inventory/items",
+            {
+                "id": f"technician forged {suffix}",
+                "amount": 1,
+                "scope": "personal",
+                "capabilities": ["forged.capability"],
+            },
+            technician_cookie,
+        )
+        self.assertEqual(status, 403)
+
+        owner_cookie = self._sign_in(port)
+        admin_cookie = self._sign_in_credentials(port, users[1][2], "admin-password")
+        for role, role_cookie in (("owner", owner_cookie), ("admin", admin_cookie)):
+            status, payload, _ = _request(
+                port,
+                "POST",
+                "/api/inventory/items",
+                {
+                    "id": f"{role} advanced {suffix}",
+                    "type": "pa",
+                    "amount": 1,
+                    "scope": "shared",
+                    "class_id": "main-pa",
+                    "capabilities": ["pa.main"],
+                    "connectors": ["xlr"],
+                    "quality_score": 90,
+                    "preference_score": 80,
+                    "attributes": {"coverage": "medium"},
+                },
+                role_cookie,
+            )
+            self.assertEqual(status, 200, payload)
+
+        with self.factory() as session:
+            forged_count = session.scalar(
+                select(func.count()).select_from(InventoryHoldingModel).where(
+                    InventoryHoldingModel.organization_id == "runtime-org",
+                    InventoryHoldingModel.legacy_item_id.like("%forged%"),
+                )
+            )
+        self.assertEqual(forged_count, 0)
+        for session_cookie in (
+            producer_cookie,
+            technician_cookie,
+            owner_cookie,
+            admin_cookie,
+        ):
+            _request(port, "POST", "/api/auth/signout", {}, session_cookie)
+
+    @race_required
+    @isolated_database_inserts
+    def test_saved_kit_creation_is_idempotent_unique_and_tenant_scoped(self):
+        first_port, second_port = self.ports
+        cookie = self._sign_in(first_port)
+        suffix = uuid4().hex
+        item_id = f"saved kit item {suffix}"
+        status, payload, _ = _request(
+            first_port,
+            "POST",
+            "/api/inventory/items",
+            {
+                "id": item_id,
+                "type": "other",
+                "amount": 4,
+                "scope": "shared",
+                "idempotency_key": f"saved-kit-stock-{suffix}",
+            },
+            cookie,
+        )
+        self.assertEqual(status, 200, payload)
+
+        name = f"Retry Safe Kit {suffix}"
+        body = {
+            "name": name,
+            "description": "One deliberate saved kit.",
+            "notes": "Test retry safety.",
+            "items": [{"item_id": item_id, "amount": 1}],
+            "idempotency_key": f"saved-kit-key-{suffix}",
+        }
+        first = _request(first_port, "POST", "/api/kits/create", body, cookie)
+        retry = _request(second_port, "POST", "/api/kits/create", body, cookie)
+        self.assertEqual((first[0], retry[0]), (201, 201))
+        self.assertEqual(first[1]["kit"]["id"], retry[1]["kit"]["id"])
+
+        conflict_status, _, _ = _request(
+            first_port,
+            "POST",
+            "/api/kits/create",
+            {**body, "description": "Different payload."},
+            cookie,
+        )
+        self.assertEqual(conflict_status, 409)
+        duplicate_name_status, _, _ = _request(
+            first_port,
+            "POST",
+            "/api/kits/create",
+            {
+                **body,
+                "name": f"  {name.upper()}  ",
+                "idempotency_key": f"duplicate-kit-name-{suffix}",
+            },
+            cookie,
+        )
+        self.assertEqual(duplicate_name_status, 409)
+
+        race_body = {
+            **body,
+            "name": f"Concurrent Kit {suffix}",
+            "idempotency_key": f"concurrent-kit-key-{suffix}",
+        }
+        barrier = threading.Barrier(3)
+        race_results: list[tuple[int, dict]] = []
+        race_lock = threading.Lock()
+
+        def create_kit(port: int) -> None:
+            barrier.wait(timeout=10)
+            status_code, response, _ = _request(
+                port, "POST", "/api/kits/create", race_body, cookie
+            )
+            with race_lock:
+                race_results.append((status_code, response))
+
+        threads = [
+            threading.Thread(target=create_kit, args=(first_port,)),
+            threading.Thread(target=create_kit, args=(second_port,)),
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=10)
+        for thread in threads:
+            thread.join(timeout=15)
+        self.assertEqual([thread.is_alive() for thread in threads], [False, False])
+        self.assertEqual(sorted(status for status, _ in race_results), [201, 201])
+        self.assertEqual(
+            len({response["kit"]["id"] for _, response in race_results}), 1
+        )
+
+        foreign_org_id = f"kit-foreign-org-{suffix}"
+        foreign_user_id = f"kit-foreign-user-{suffix}"
+        foreign_email = f"kit-foreign-{suffix}@example.test"
+        with self.factory.begin() as session:
+            session.add(OrganizationModel(id=foreign_org_id, name="Kit Foreign Org"))
+            session.add(
+                UserModel(
+                    id=foreign_user_id,
+                    email=foreign_email,
+                    name="Kit Foreign Owner",
+                    password_hash=AccountStore.hash_password("foreign-kit-password"),
+                )
+            )
+            session.flush()
+            session.add_all(
+                [
+                    MembershipModel(
+                        id=f"kit-foreign-membership-{suffix}",
+                        organization_id=foreign_org_id,
+                        user_id=foreign_user_id,
+                        role="owner",
+                    ),
+                    InventoryHoldingModel(
+                        id=f"kit-foreign-holding-{suffix}",
+                        organization_id=foreign_org_id,
+                        legacy_item_id=item_id,
+                        scope="shared",
+                        available_quantity=1,
+                        active=True,
+                        data={"requirements": []},
+                    ),
+                ]
+            )
+        foreign_cookie = self._sign_in_credentials(
+            first_port, foreign_email, "foreign-kit-password"
+        )
+        tenant_status, tenant_payload, _ = _request(
+            first_port,
+            "POST",
+            "/api/kits/create",
+            {
+                **body,
+                "idempotency_key": body["idempotency_key"],
+            },
+            foreign_cookie,
+        )
+        self.assertEqual(tenant_status, 201, tenant_payload)
+        self.assertNotEqual(tenant_payload["kit"]["id"], first[1]["kit"]["id"])
+
+        with self.factory() as session:
+            org_kit_count = session.scalar(
+                select(func.count()).select_from(SavedKitModel).where(
+                    SavedKitModel.organization_id == "runtime-org",
+                    func.lower(SavedKitModel.name).in_(
+                        [name.lower(), f"concurrent kit {suffix}".lower()]
+                    ),
+                )
+            )
+            operation_count = session.scalar(
+                select(func.count()).select_from(OperationRequestModel).where(
+                    OperationRequestModel.organization_id == "runtime-org",
+                    OperationRequestModel.operation == "kit.create",
+                    OperationRequestModel.idempotency_key.in_(
+                        [body["idempotency_key"], race_body["idempotency_key"]]
+                    ),
+                )
+            )
+            audit_count = session.scalar(
+                select(func.count()).select_from(AuditEventModel).where(
+                    AuditEventModel.organization_id == "runtime-org",
+                    AuditEventModel.action == "kit.created",
+                    AuditEventModel.resource_id.in_(
+                        [
+                            first[1]["kit"]["id"],
+                            race_results[0][1]["kit"]["id"],
+                        ]
+                    ),
+                )
+            )
+        self.assertEqual((org_kit_count, operation_count, audit_count), (2, 2, 2))
+        _request(first_port, "POST", "/api/auth/signout", {}, cookie)
+        _request(first_port, "POST", "/api/auth/signout", {}, foreign_cookie)
 
     def test_direct_inventory_use_and_return_are_disabled_in_production(self):
         first_port = self.ports[0]

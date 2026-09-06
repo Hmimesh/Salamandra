@@ -62,3 +62,16 @@ jobs:
         run: pnpm run check
       - name: Vite production build
         run: pnpm run build
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Reproducible browser QA
+        run: pnpm qa:browser
+      - name: Upload browser QA evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-evidence
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7

@@ -25,6 +25,11 @@ from event_operations import EventOperations
 from event_planner import EventPlanner
 from event_templates import TemplateCatalog
 from inventory_workspace import PERSONAL_SCOPE, SHARED_SCOPE, InventoryWorkspace
+from inventory_dependencies import (
+    DependencyNode,
+    normalize_dependency_requirements,
+    validate_dependency_updates,
+)
 from integrations import IntegrationStore
 from Item_node import ItemNode, Requirement
 from item_classes import ConfiguredItemClass, DependencyRule, ItemClassCatalog
@@ -56,6 +61,16 @@ ITEM_CLASSES_PATH = DOCS_DIR / "item_classes.json"
 INTEGRATIONS_PATH = DOCS_DIR / "integrations.json"
 KITS_PATH = DOCS_DIR / "kits.json"
 MAX_JSON_BODY_BYTES = 1_000_000
+ADVANCED_INVENTORY_FIELDS = frozenset(
+    {
+        "attributes",
+        "capabilities",
+        "class_id",
+        "connectors",
+        "preference_score",
+        "quality_score",
+    }
+)
 LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(logging.NullHandler())
 
@@ -212,7 +227,9 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
             if parsed_url.path == "/api/inventory/items":
                 scope = self.authorized_inventory_scope(body, user)
+                self.validate_inventory_metadata_access(body, user)
                 item = self.create_item_from_body(body)
+                self.validate_local_item_dependencies(item, scope, user)
                 operation_key = self.operation_request_id(body)
                 stored_item = self.workspace.add_item(
                     item,
@@ -233,9 +250,16 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 require_permission(user.role, Permission.INVENTORY_DEFINITION_MANAGE)
                 scope = self.authorized_inventory_scope(body, user)
                 operation_key = self.operation_request_id(body)
+                updated_item = self.create_item_from_body(body)
+                self.validate_local_item_dependencies(
+                    updated_item,
+                    scope,
+                    user,
+                    replaced_item_id=str(body.get("original_id", body.get("id", ""))),
+                )
                 updated_item = self.workspace.update_item(
                     body.get("original_id", body.get("id", "")),
-                    self.create_item_from_body(body),
+                    updated_item,
                     scope=scope,
                     user_id=user.id,
                     organization_id=user.organization_id,
@@ -294,6 +318,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 return
 
             if parsed_url.path == "/api/inventory/presets":
+                self.validate_inventory_metadata_access(body, user)
                 scope = self.authorized_inventory_scope(body, user)
                 preset = self.catalog.get(body.get("preset_id", ""))
                 if preset is None:
@@ -409,15 +434,18 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
             if parsed_url.path == "/api/kits/create":
                 require_permission(user.role, Permission.KITS_MANAGE)
+                operation_key = self.operation_request_id(body)
                 if self.database_runtime is not None:
                     kit = self.kits.create(
                         body,
                         user.organization_id,
                         user.id,
                         self.correlation_id(),
+                        operation_key,
                     )
                 else:
-                    kit = self.kits.create(body, user.organization_id)
+                    with self.operation_lock:
+                        kit = self.kits.create(body, user.organization_id)
                 self.send_json(
                     {"kit": kit.to_dict(), "state": self.state_payload(user)},
                     HTTPStatus.CREATED,
@@ -1035,14 +1063,9 @@ class SalamandraServer(BaseHTTPRequestHandler):
         )
 
     def create_item_from_body(self, body: dict) -> ItemNode:
-        requirements = [
-            Requirement(
-                item_id=requirement.get("item_id", ""),
-                amount=int(requirement.get("amount", 1)),
-            )
-            for requirement in body.get("requirements", [])
-            if requirement.get("item_id")
-        ]
+        requirements = list(
+            normalize_dependency_requirements(body.get("requirements", []))
+        )
 
         return ItemNode(
             id=body.get("id", ""),
@@ -1060,6 +1083,55 @@ class SalamandraServer(BaseHTTPRequestHandler):
             quality_score=int(body.get("quality_score", 0)),
             preference_score=int(body.get("preference_score", 0)),
             weight_kg=float(body.get("weight_kg", 0)),
+        )
+
+    @staticmethod
+    def validate_inventory_metadata_access(body: dict, user: UserAccount) -> None:
+        forbidden = ADVANCED_INVENTORY_FIELDS.intersection(body)
+        if forbidden:
+            require_permission(user.role, Permission.INVENTORY_DEFINITION_MANAGE)
+
+    def validate_local_item_dependencies(
+        self,
+        item: ItemNode,
+        scope: str,
+        user: UserAccount,
+        *,
+        replaced_item_id: str | None = None,
+    ) -> None:
+        if self.database_runtime is not None:
+            return
+        nodes: list[DependencyNode] = []
+        for candidate_scope, owner_user_id in (
+            (SHARED_SCOPE, None),
+            (PERSONAL_SCOPE, user.id),
+        ):
+            if scope == SHARED_SCOPE and candidate_scope == PERSONAL_SCOPE:
+                continue
+            inventory = self.workspace.inventory_for(
+                candidate_scope,
+                owner_user_id,
+                user.organization_id,
+            )
+            nodes.extend(
+                DependencyNode(
+                    scope=candidate_scope,
+                    owner_user_id=owner_user_id,
+                    item_id=candidate.id,
+                    requirements=tuple(candidate.req),
+                )
+                for candidate in inventory.list_items()
+            )
+        owner_user_id = user.id if scope == PERSONAL_SCOPE else None
+        removed = []
+        if replaced_item_id:
+            normalized_replaced_id = str(replaced_item_id).strip().lower()
+            if normalized_replaced_id and normalized_replaced_id != item.id:
+                removed.append((scope, owner_user_id, normalized_replaced_id))
+        validate_dependency_updates(
+            nodes,
+            {(scope, owner_user_id, item.id): tuple(item.req)},
+            removed_keys=removed,
         )
 
     def create_item_class_from_body(

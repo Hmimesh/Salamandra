@@ -29,6 +29,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from event_operations import EVENT_TRANSITIONS
+from Item_node import Requirement
+from inventory_dependencies import (
+    DependencyNode,
+    NodeKey,
+    normalize_dependency_requirements,
+    validate_dependency_updates,
+)
 from security import Permission, ResourceNotFound, StateConflict, require_permission
 
 
@@ -1486,6 +1493,16 @@ class TransactionalInventoryOperations:
             "version",
         }
     )
+    ADVANCED_DEFINITION_FIELDS = frozenset(
+        {
+            "attributes",
+            "capabilities",
+            "class_id",
+            "connectors",
+            "preference_score",
+            "quality_score",
+        }
+    )
 
     def __init__(self, factory: sessionmaker[Session]):
         self.factory = factory
@@ -1569,6 +1586,15 @@ class TransactionalInventoryOperations:
                         raise StateConflict(
                             "Another inventory item already uses that identity."
                         )
+                self._validate_dependency_metadata(
+                    session,
+                    organization_id,
+                    scope,
+                    owner_user_id,
+                    new_item_id,
+                    normalized_metadata,
+                    replaced_item_id=holding.legacy_item_id,
+                )
 
                 before, after, changed_fields = self._definition_changes(
                     holding,
@@ -1637,6 +1663,8 @@ class TransactionalInventoryOperations:
         reason_code: str,
         reason: str,
         source: str,
+        *,
+        _trusted_preset: bool = False,
     ) -> tuple[InventoryHoldingModel, bool]:
         if operation not in {"inventory.add", "inventory.remove"}:
             raise ValueError("Inventory adjustment operation is invalid.")
@@ -1706,6 +1734,19 @@ class TransactionalInventoryOperations:
                     session.add(holding)
                     session.flush()
                     definition_action = "inventory.definition_created"
+                    if self._advanced_metadata_fields(normalized_metadata) and not _trusted_preset:
+                        require_permission(
+                            membership.role,
+                            Permission.INVENTORY_DEFINITION_MANAGE,
+                        )
+                    self._validate_dependency_metadata(
+                        session,
+                        organization_id,
+                        scope,
+                        owner_user_id,
+                        item_id,
+                        normalized_metadata,
+                    )
                 elif operation == "inventory.add":
                     merged_metadata = {
                         **self._normalize_definition_metadata(
@@ -1725,6 +1766,14 @@ class TransactionalInventoryOperations:
                         require_permission(
                             membership.role,
                             Permission.INVENTORY_DEFINITION_MANAGE,
+                        )
+                        self._validate_dependency_metadata(
+                            session,
+                            organization_id,
+                            scope,
+                            owner_user_id,
+                            holding.legacy_item_id,
+                            merged_metadata,
                         )
                     self._ensure_definition_change_allowed(holding, changed_fields)
                     if changed_fields:
@@ -1868,6 +1917,17 @@ class TransactionalInventoryOperations:
                 )
                 session.add(request)
                 session.flush()
+                dependency_updates = {
+                    (scope, owner_user_id, str(item["item_id"])): tuple(
+                        Requirement.from_dict(requirement)
+                        for requirement in item["metadata"].get("requirements", [])
+                    )
+                    for item in normalized
+                }
+                validate_dependency_updates(
+                    self._dependency_nodes(session, organization_id, scope, owner_user_id),
+                    dependency_updates,
+                )
                 batch_id = new_id()
                 for item in normalized:
                     item_id = str(item["item_id"])
@@ -2044,11 +2104,94 @@ class TransactionalInventoryOperations:
             raise ValueError(
                 "Stock quantities, ownership, scope, and holding state require a separate command."
             )
-        return {
+        normalized = {
             key: value
             for key, value in metadata.items()
             if key not in cls.SEPARATE_COMMAND_FIELDS
         }
+        normalized["requirements"] = [
+            requirement.to_dict()
+            for requirement in normalize_dependency_requirements(
+                normalized.get("requirements", [])
+            )
+        ]
+        return normalized
+
+    @classmethod
+    def _advanced_metadata_fields(cls, metadata: dict[str, Any]) -> frozenset[str]:
+        fields: set[str] = set()
+        for field in cls.ADVANCED_DEFINITION_FIELDS:
+            value = metadata.get(field)
+            if field in {"quality_score", "preference_score"}:
+                if value not in {None, 0}:
+                    fields.add(field)
+            elif value not in (None, "", (), [], {}):
+                fields.add(field)
+        return frozenset(fields)
+
+    @staticmethod
+    def _dependency_nodes(
+        session: Session,
+        organization_id: str,
+        scope: str,
+        owner_user_id: str | None,
+    ) -> list[DependencyNode]:
+        visibility = InventoryHoldingModel.scope == "shared"
+        if scope == "personal":
+            visibility = or_(
+                visibility,
+                and_(
+                    InventoryHoldingModel.scope == "personal",
+                    InventoryHoldingModel.owner_user_id == owner_user_id,
+                ),
+            )
+        rows = session.scalars(
+            select(InventoryHoldingModel).where(
+                InventoryHoldingModel.organization_id == organization_id,
+                InventoryHoldingModel.active.is_(True),
+                visibility,
+            )
+        )
+        return [
+            DependencyNode(
+                scope=row.scope,
+                owner_user_id=row.owner_user_id,
+                item_id=row.legacy_item_id,
+                requirements=normalize_dependency_requirements(
+                    dict(row.data or {}).get("requirements", [])
+                ),
+            )
+            for row in rows
+        ]
+
+    @classmethod
+    def _validate_dependency_metadata(
+        cls,
+        session: Session,
+        organization_id: str,
+        scope: str,
+        owner_user_id: str | None,
+        item_id: str,
+        metadata: dict[str, Any],
+        *,
+        replaced_item_id: str | None = None,
+    ) -> None:
+        key: NodeKey = (scope, owner_user_id, item_id)
+        removed = (
+            [(scope, owner_user_id, replaced_item_id)]
+            if replaced_item_id and replaced_item_id != item_id
+            else []
+        )
+        validate_dependency_updates(
+            cls._dependency_nodes(session, organization_id, scope, owner_user_id),
+            {
+                key: tuple(
+                    Requirement.from_dict(requirement)
+                    for requirement in metadata.get("requirements", [])
+                )
+            },
+            removed_keys=removed,
+        )
 
     @classmethod
     def _definition_changes(
