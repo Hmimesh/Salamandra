@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
 
 from inventory_dependencies import (
     DependencyNode,
+    DependencyTargetInUse,
     normalize_dependency_requirements,
     validate_dependency_updates,
 )
@@ -19,6 +20,26 @@ from Item_node import Requirement
 
 
 class TestInventoryDependencies(unittest.TestCase):
+    def test_complete_graph_checks_untouched_components(self):
+        nodes = [DependencyNode("personal", "another-owner", "source", (Requirement("missing"),))]
+        with self.assertRaisesRegex(ValueError, "active inventory item"):
+            validate_dependency_updates(nodes, {("shared", None, "unrelated"): ()})
+        validate_dependency_updates(
+            [DependencyNode("shared", None, "broken", (Requirement("broken"),))],
+            {("shared", None, "broken"): ()},
+        )
+
+    def test_lifecycle_does_not_silently_retarget_personal_edges(self):
+        nodes = [
+            DependencyNode("shared", None, "target", ()),
+            DependencyNode("personal", "owner", "target", ()),
+            DependencyNode("personal", "owner", "source", (Requirement("target"),)),
+        ]
+        with self.assertRaises(DependencyTargetInUse):
+            validate_dependency_updates(nodes, {}, removed_keys=[("personal", "owner", "target")])
+        # The shared namesake is not the target of this owner's personal edge.
+        validate_dependency_updates(nodes, {}, removed_keys=[("shared", None, "target")])
+
     def test_normalization_rejects_invalid_quantities_and_duplicates(self):
         for value in (0, -1, True, 1.5, "1.5", "no"):
             with self.subTest(value=value):

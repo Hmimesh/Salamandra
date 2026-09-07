@@ -242,6 +242,90 @@ test("operational text scales in both themes and at 200 percent zoom", async ({ 
   await page.screenshot({ path: testInfo.outputPath("manual-largest.png"), fullPage: true });
 });
 
+test("compact text retains the operator floor without losing dense layout", async ({ page }, testInfo) => {
+  await signIn(page);
+  const assertFloor = async (selector: string) => {
+    const elements = page.locator(selector).filter({ visible: true });
+    await expect(elements.first()).toBeVisible();
+    expect(await elements.count()).toBeGreaterThan(0);
+    for (const element of await elements.all()) {
+      if (await element.isVisible()) {
+        expect(await element.evaluate((el) => parseFloat(getComputedStyle(el).fontSize)), selector).toBeGreaterThanOrEqual(14);
+      }
+    }
+  };
+  const assertControls = async () => {
+    await expectNoViewportOverflow(page);
+    const dialog = page.getByRole("dialog").last();
+    const surface = await dialog.isVisible() ? dialog : page.getByRole("main");
+    const controls = surface.locator('input:not([type="hidden"]), select, button');
+    for (const control of await controls.all()) {
+      if (!(await control.isVisible())) continue;
+      await control.scrollIntoViewIfNeeded();
+      const bounds = await control.boundingBox();
+      expect(bounds).not.toBeNull();
+      expect(bounds!.x).toBeGreaterThanOrEqual(0);
+      expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(page.viewportSize()!.width + 1);
+      expect(bounds!.y).toBeGreaterThanOrEqual(0);
+      expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(page.viewportSize()!.height + 1);
+      expect(await control.evaluate((el) => el.scrollWidth <= el.clientWidth + 1),
+        await control.evaluate((el) => el.outerHTML)).toBeTruthy();
+    }
+  };
+  await page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption("compact");
+  await expect(page.locator("html")).toHaveAttribute("data-font-scale", "compact");
+  const comfortableGap = await page.locator(".settings-grid").evaluate((el) => parseFloat(getComputedStyle(el).gap));
+  await activate(page.getByRole("button", { name: "Compact", exact: true }));
+  await expect(page.locator("html")).toHaveAttribute("data-density", "compact");
+  const compactGap = await page.locator(".settings-grid").evaluate((el) => parseFloat(getComputedStyle(el).gap));
+  expect(compactGap).toBeLessThanOrEqual(comfortableGap - 4);
+  await page.goto("/inventory");
+  await activate(page.getByRole("button", { name: "Add item", exact: true }));
+  await activate(page.getByRole("button", { name: "Create a custom item" }));
+  await assertFloor(".dependency-row label");
+  await assertControls();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toBeHidden();
+  await page.goto("/kits");
+  await activate(page.getByRole("button", { name: "Create kit", exact: true }));
+  await assertFloor(".kit-builder-line label");
+  await assertControls();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toBeHidden();
+  await page.goto("/events/new");
+  await activate(page.getByRole("button", { name: "Build manually" }));
+  await assertFloor(".manual-requirement-row > label");
+  await assertControls();
+  const date = new Date().toISOString().slice(0, 10);
+  const response = await page.request.post("/api/events/save", {
+    headers: { Origin: "http://127.0.0.1:4173" },
+    data: {
+      description: `Small meeting on ${date} at 19:00 with no lighting.`,
+      overrides: { title: `Compact ${testInfo.project.name}`, start_date: date },
+      idempotency_key: `compact-${testInfo.project.name}`,
+    },
+  });
+  expect(response.status()).toBe(201);
+  await page.goto("/events");
+  await assertFloor(".calendar-event");
+  await expectNoViewportOverflow(page);
+  await activate(page.locator(".calendar-event").first());
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await assertFloor(".status-tag");
+  await page.keyboard.press("Escape");
+  await page.goto("/settings");
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "compact.csv", mimeType: "text/csv",
+    buffer: Buffer.from("id,count,type\nCompact preview stand,2,stand\n"),
+  });
+  await expect(page.getByRole("dialog", { name: "Review inventory import" })).toBeVisible();
+  await assertFloor(".csv-mapping-grid label, .csv-preview-table th, .csv-preview-table td");
+  await assertControls();
+  await page.screenshot({ path: testInfo.outputPath("compact-preview.png"), fullPage: true });
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toBeHidden();
+});
+
 test("CSV mapping and appearance controls are keyboard reachable", async ({ page }, testInfo) => {
   const errors = watchErrors(page);
   await signIn(page);

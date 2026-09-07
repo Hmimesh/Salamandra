@@ -31,6 +31,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 from event_operations import EVENT_TRANSITIONS
 from Item_node import Requirement
 from inventory_dependencies import (
+    DependencyTargetInUse,
     DependencyNode,
     NodeKey,
     normalize_dependency_requirements,
@@ -1767,6 +1768,7 @@ class TransactionalInventoryOperations:
                             membership.role,
                             Permission.INVENTORY_DEFINITION_MANAGE,
                         )
+                    if changed_fields or not holding.active:
                         self._validate_dependency_metadata(
                             session,
                             organization_id,
@@ -1796,6 +1798,11 @@ class TransactionalInventoryOperations:
                     if amount > holding.available_quantity:
                         raise StateConflict(
                             f"Cannot remove {amount}; only {holding.available_quantity} available."
+                        )
+                    if self._total(holding) == amount:
+                        self._validate_dependency_graph(
+                            session, organization_id, {},
+                            removed_keys=[(scope, owner_user_id, item_id)],
                         )
                     holding.available_quantity -= amount
                     if self._total(holding) == 0:
@@ -1925,7 +1932,7 @@ class TransactionalInventoryOperations:
                     for item in normalized
                 }
                 validate_dependency_updates(
-                    self._dependency_nodes(session, organization_id, scope, owner_user_id),
+                    self._dependency_nodes(session, organization_id),
                     dependency_updates,
                 )
                 batch_id = new_id()
@@ -2133,23 +2140,11 @@ class TransactionalInventoryOperations:
     def _dependency_nodes(
         session: Session,
         organization_id: str,
-        scope: str,
-        owner_user_id: str | None,
     ) -> list[DependencyNode]:
-        visibility = InventoryHoldingModel.scope == "shared"
-        if scope == "personal":
-            visibility = or_(
-                visibility,
-                and_(
-                    InventoryHoldingModel.scope == "personal",
-                    InventoryHoldingModel.owner_user_id == owner_user_id,
-                ),
-            )
         rows = session.scalars(
             select(InventoryHoldingModel).where(
                 InventoryHoldingModel.organization_id == organization_id,
                 InventoryHoldingModel.active.is_(True),
-                visibility,
             )
         )
         return [
@@ -2163,6 +2158,22 @@ class TransactionalInventoryOperations:
             )
             for row in rows
         ]
+
+    @classmethod
+    def _validate_dependency_graph(
+        cls, session: Session, organization_id: str,
+        updates: dict[NodeKey, tuple[Requirement, ...]],
+        *, removed_keys: tuple[NodeKey, ...] | list[NodeKey] = (),
+    ) -> None:
+        # Callers hold the organization lock until their entire command commits.
+        # Include every owner's personal definitions; resolution still enforces scope.
+        try:
+            validate_dependency_updates(
+                cls._dependency_nodes(session, organization_id), updates,
+                removed_keys=removed_keys,
+            )
+        except DependencyTargetInUse as error:
+            raise StateConflict(str(error)) from error
 
     @classmethod
     def _validate_dependency_metadata(
@@ -2182,8 +2193,8 @@ class TransactionalInventoryOperations:
             if replaced_item_id and replaced_item_id != item_id
             else []
         )
-        validate_dependency_updates(
-            cls._dependency_nodes(session, organization_id, scope, owner_user_id),
+        cls._validate_dependency_graph(
+            session, organization_id,
             {
                 key: tuple(
                     Requirement.from_dict(requirement)

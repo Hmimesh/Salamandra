@@ -1,11 +1,7 @@
 import { defineConfig } from "@playwright/test";
-import path from "node:path";
 
 
 const baseURL = "http://127.0.0.1:4173";
-const python = process.platform === "win32"
-  ? path.join(process.cwd(), ".venv", "Scripts", "python.exe")
-  : "python";
 
 export default defineConfig({
   testDir: "tests/e2e",
@@ -18,12 +14,7 @@ export default defineConfig({
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
   },
-  webServer: {
-    command: `"${python}" tests/e2e_server.py --port 4173`,
-    url: `${baseURL}/health`,
-    reuseExistingServer: false,
-    timeout: 30_000,
-  },
+  globalSetup: "./tests/e2e_setup.ts",
   projects: [
     { name: "mobile-360", use: { viewport: { width: 360, height: 800 } } },
     { name: "tablet-768", use: { viewport: { width: 768, height: 1024 } } },

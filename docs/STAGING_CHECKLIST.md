@@ -43,18 +43,54 @@ pnpm qa:browser
 The command builds the production frontend before starting the disposable test
 server. Automated coverage includes 360px mobile, 768px tablet, 1280px desktop,
 and 1440px wide layouts. A fifth project emulates a 1280x900 browser at 200% zoom
-using 640x450 CSS pixels and device scale factor 2. Every project runs all eight
-scenarios (40 tests, no intentional skips): navigation links, focus trapping and
+using 640x450 CSS pixels and device scale factor 2. Every project runs all nine
+scenarios (45 tests, no intentional skips): navigation links, focus trapping and
 restoration, Escape handling, manual planning and crew assignment, kit creation,
 preset and custom inventory, dependency selection, account popovers, calendar
 overflow, cancellation/delete confirmations, CSV mapping and import, and appearance.
 Every test checks console/page errors; key states check document overflow.
 
-Default/large/largest text and light/dark themes are exercised at every viewport.
+Compact/default/large/largest text is exercised at every viewport, with light/dark
+coverage. Compact text retains a computed >=14px floor for calendar events, manual
+planner labels, dependency rows, kit labels, CSV mapping/preview, and operational
+facts/status. Decorative text is unchanged. Compact density still reduces spacing:
+the suite compares settings-grid gaps at the same text size and checks an
+at-least-4px reduction, dialog Escape behavior, control bounds, and viewport overflow.
 Zoom emulation tests reflow and pixel scaling; native browser chrome zoom and
 non-Chromium browsers still require the manual staging check. Screenshots and
 failure traces are written under ignored `test-results/`; CI uploads these along
 with its Playwright report. No pixel-perfect screenshot baseline is required.
+
+Playwright global setup owns the Python fixture directly (no shell). The parent
+stdin pipe is its lifetime: normal teardown and runner exit close it, and the
+fixture shuts down its HTTP server, joins its worker, closes its socket, and removes
+its temporary data. Teardown waits up to 10 seconds for child exit and verifies that
+port 4173 is closed; timeout or abnormal exit fails QA. It refuses an occupied port.
+This also runs after test failures, preserving a nonzero test result. The Python
+suite independently tests pipe-EOF shutdown and port release. No taskkill is used.
+
+The separate `Windows browser QA lifecycle` CI job runs the same command with an
+8-minute step timeout and a 15-minute job timeout, then independently checks that
+neither a Python fixture process nor a port-4173 listener remains. The existing
+Linux/PostgreSQL production-core job is unchanged in strictness.
+
+### Dependency Target Lifecycle Acceptance
+
+PostgreSQL commands reject rename or removal-to-zero/archive with HTTP 409 when
+any active same-organization definition resolves a dependency to that target.
+This includes other users' personal definitions depending on shared stock. Personal
+edges still resolve only within their owner's inventory or shared inventory, never
+another user's personal stock. References are not silently rewritten or redirected
+to a fallback item. Unreferenced definitions may be renamed or archived normally.
+
+The existing organization row lock covers complete post-operation graph validation
+and the full command transaction. Creation, definition updates, reactivation, and
+CSV reconciliation validate all active organization definitions, not just updated
+roots. Archive/removal and rename reject incoming references before mutation.
+Failure rolls back holdings, metadata, adjustments, operation requests, and audits.
+Two independent HTTP processes race target removal/rename against a dependency
+update: exactly one succeeds and the committed graph remains valid. No migration
+or event/allocation architecture change is involved.
 
 The test server uses disposable local compatibility stores and fake accounts,
 not the production database. PostgreSQL authorization, transactions, and races

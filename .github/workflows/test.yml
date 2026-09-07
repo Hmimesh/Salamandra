@@ -8,6 +8,49 @@ permissions:
   contents: read
 
 jobs:
+  windows-browser-qa:
+    name: Windows browser QA lifecycle
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install fixture Python dependencies
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install chromium
+      - name: Browser QA must exit successfully
+        timeout-minutes: 8
+        run: pnpm qa:browser
+      - name: Verify fixture process and port were released
+        if: always()
+        run: |
+          if (Get-NetTCPConnection -LocalPort 4173 -State Listen -ErrorAction SilentlyContinue) {
+            throw "Browser QA left port 4173 listening"
+          }
+          $fixtures = Get-CimInstance Win32_Process | Where-Object { $_.Name -match '^python' -and $_.CommandLine -match 'tests[/\\]e2e_server.py' }
+          if ($fixtures) { throw "Browser QA left a fixture process running" }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-playwright-evidence
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
   production-core-acceptance:
     name: PostgreSQL production core
     runs-on: ubuntu-latest

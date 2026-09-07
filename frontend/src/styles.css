@@ -588,6 +588,17 @@ html[data-theme="dark"] .field-label, html[data-theme="dark"] .form-stack label,
 html[data-theme="dark"] :is(.crew-picker label, .add-inventory-choices > button) { color: var(--ink); background: var(--surface); }
 
 html[data-font-scale="compact"] { font-size: 15px; }
+/* Operational labels retain a 14px floor while spacing follows text preferences. */
+:is(.calendar-event, .calendar-more, .calendar-weekdays span, .calendar-cell > span,
+    .calendar-overflow-list small, .manual-requirement-row > label, .dependency-row label,
+    .kit-builder-line label, .csv-mapping-grid label, .csv-preview-table table,
+    .status-tag, .event-facts small, .event-facts strong, .draft-fields label,
+    .draft-fields input, .run-of-show > span, .run-of-show > div > div,
+    .plan-summary span, .plan-lines strong, .plan-lines small, .detail-gear-list strong,
+    .detail-gear-list small, .plan-line em, .line-ready, .line-missing,
+    .crew-picker legend, .crew-picker > p, .crew-picker strong, .crew-picker small) {
+  font-size: max(14px, 0.875rem);
+}
 html[data-font-scale="comfortable"] { font-size: 16px; }
 html[data-font-scale="large"] { font-size: 18px; }
 html[data-font-scale="largest"] { font-size: 20px; }
@@ -602,11 +613,11 @@ html[data-density="comfortable"] :is(.operations-table td, .event-list-row, .tea
 .kit-builder { display: grid; gap: 1rem; }
 .kit-builder-lines { display: grid; gap: 0.5rem; border-top: 1px solid var(--line); }
 .kit-builder-line { display: grid; grid-template-columns: minmax(12rem, 1fr) 6rem 2.25rem; align-items: end; gap: 0.5rem; }
-.kit-builder-line label, .csv-mapping-grid label { display: grid; gap: 0.375rem; color: var(--muted); font-size: 0.875rem; font-weight: 700; }
+.kit-builder-line label, .csv-mapping-grid label { display: grid; gap: 0.375rem; color: var(--muted); font-size: max(14px, 0.875rem); font-weight: 700; }
 .csv-import-review { display: grid; gap: 1rem; }
 .csv-mapping-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.625rem; }
 .csv-preview-table { max-width: 100%; overflow: auto; border: 1px solid var(--line); border-radius: 0.3125rem; }
-.csv-preview-table table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+.csv-preview-table table { width: 100%; border-collapse: collapse; font-size: max(14px, 0.875rem); }
 .csv-preview-table th, .csv-preview-table td { min-width: 7rem; padding: 0.5rem; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
 .csv-preview-table th { background: var(--soft); }
 

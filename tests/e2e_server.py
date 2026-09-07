@@ -94,14 +94,23 @@ def handler_for(data_dir: Path, port: int):
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=4173)
+    parser.add_argument("--parent-stdin", action="store_true")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="salamandra-playwright-") as directory:
         server = ThreadingHTTPServer(
             ("127.0.0.1", args.port), handler_for(Path(directory), args.port)
         )
+        worker = threading.Thread(target=server.serve_forever)
+        worker.start()
         try:
-            server.serve_forever()
+            if args.parent_stdin:
+                # EOF also arrives if the runner crashes; never expose a shutdown API.
+                sys.stdin.buffer.read()
+            else:
+                worker.join()
         finally:
+            server.shutdown()
+            worker.join(timeout=10)
             server.server_close()
 
 

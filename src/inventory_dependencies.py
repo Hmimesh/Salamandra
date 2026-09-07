@@ -9,6 +9,10 @@ from Item_node import Requirement, normalize_item_id
 NodeKey = tuple[str, str | None, str]
 
 
+class DependencyTargetInUse(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class DependencyNode:
     scope: str
@@ -69,10 +73,6 @@ def validate_dependency_updates(
     removed_keys: Iterable[NodeKey] = (),
 ) -> None:
     graph = {node.key: node for node in nodes if node.active}
-    for key in removed_keys:
-        graph.pop(key, None)
-    for key, requirements in updates.items():
-        graph[key] = DependencyNode(*key, requirements=requirements)
 
     def resolve(source: DependencyNode, target_id: str) -> NodeKey | None:
         if target_id == source.item_id:
@@ -84,6 +84,24 @@ def validate_dependency_updates(
         shared_key = ("shared", None, target_id)
         return shared_key if shared_key in graph else None
 
+    removed = set(removed_keys)
+    referrers = {
+        node.key for node in graph.values()
+        if node.key not in removed and any(
+            resolve(node, requirement.item_id) in removed
+            for requirement in node.requirements
+        )
+    } if removed else set()
+    if referrers:
+        raise DependencyTargetInUse(
+            f"Cannot rename or archive this item because {len(referrers)} "
+            "active inventory definitions depend on it."
+        )
+    for key in removed:
+        graph.pop(key, None)
+    for key, requirements in updates.items():
+        graph[key] = DependencyNode(*key, requirements=requirements)
+
     visiting: set[NodeKey] = set()
     visited: set[NodeKey] = set()
 
@@ -94,7 +112,7 @@ def validate_dependency_updates(
             return
         node = graph[key]
         visiting.add(key)
-        for requirement in node.requirements:
+        for requirement in normalize_dependency_requirements(node.requirements):
             target_key = resolve(node, requirement.item_id)
             if target_key is None:
                 raise ValueError(
@@ -104,5 +122,5 @@ def validate_dependency_updates(
         visiting.remove(key)
         visited.add(key)
 
-    for key in updates:
+    for key in graph:
         visit(key)

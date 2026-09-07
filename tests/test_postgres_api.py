@@ -1517,6 +1517,116 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         self.assertEqual((rollback_requests, rollback_events), (0, 0))
         _request(first_port, "POST", "/api/auth/signout", {}, cookie)
 
+    def _dependency_item(self, cookie, item_id, requirements=(), scope="shared"):
+        body = self._definition_body(item_id, scope=scope)
+        body.pop("original_id")
+        body.update(requirements=list(requirements), idempotency_key=uuid4().hex)
+        status, payload, _ = _request(
+            self.ports[0], "POST", "/api/inventory/items", body, cookie
+        )
+        self.assertEqual(status, 200, payload)
+
+    def _target_mutation(self, item_id, action):
+        if action == "rename":
+            return "/api/inventory/items/update", self._definition_body(
+                f"{item_id}-renamed", original_id=item_id, idempotency_key=uuid4().hex
+            )
+        return "/api/inventory/remove", {
+            "item_id": item_id, "amount": 1, "scope": "shared",
+            "idempotency_key": uuid4().hex,
+        }
+
+    @isolated_database_inserts
+    def test_dependency_target_lifecycle_rejects_references_without_side_effects(self):
+        cookie = self._sign_in(self.ports[0])
+        for scope in ("shared", "personal", "other-personal"):
+            target, source = f"target-{uuid4().hex}", f"source-{uuid4().hex}"
+            self._dependency_item(cookie, target)
+            self._dependency_item(cookie, source, [{"item_id": target, "amount": 1}],
+                                  "personal" if scope == "other-personal" else scope)
+            if scope == "other-personal":
+                with self.factory.begin() as session:
+                    holding = session.scalar(select(InventoryHoldingModel).where(
+                        InventoryHoldingModel.organization_id == "runtime-org",
+                        InventoryHoldingModel.legacy_item_id == source,
+                    ))
+                    holding.owner_user_id = "runtime-other"
+            for action in ("remove", "rename"):
+                with self.subTest(scope=scope, action=action):
+                    before = self._database_state_snapshot()
+                    route, body = self._target_mutation(target, action)
+                    status, payload, _ = _request(self.ports[0], "POST", route, body, cookie)
+                    self.assertEqual(status, 409, payload)
+                    self.assertEqual(self._database_state_snapshot(), before)
+
+    @isolated_database_inserts
+    def test_unreferenced_dependency_target_lifecycle_remains_available(self):
+        cookie = self._sign_in(self.ports[0])
+        target = f"unreferenced-{uuid4().hex}"
+        self._dependency_item(cookie, target)
+        for item_id, action in ((target, "rename"), (f"{target}-renamed", "remove")):
+            route, body = self._target_mutation(item_id, action)
+            status, payload, _ = _request(self.ports[0], "POST", route, body, cookie)
+            self.assertEqual(status, 200, payload)
+        with self.factory() as session:
+            holding = session.scalar(select(InventoryHoldingModel).where(
+                InventoryHoldingModel.organization_id == "runtime-org",
+                InventoryHoldingModel.legacy_item_id == f"{target}-renamed",
+            ))
+            self.assertFalse(holding.active)
+            self.assertEqual(holding.available_quantity, 0)
+
+    def _race_dependency_target_lifecycle(self, action):
+        cookie = self._sign_in(self.ports[0])
+        # Independent HTTP processes contend on the same PostgreSQL organization lock.
+        for scope in ("shared", "personal"):
+            target, source = f"target-{uuid4().hex}", f"source-{uuid4().hex}"
+            self._dependency_item(cookie, target)
+            self._dependency_item(cookie, source, scope=scope)
+            update = self._definition_body(source, scope=scope, idempotency_key=uuid4().hex)
+            update["requirements"] = [{"item_id": target, "amount": 1}]
+            route, mutation = self._target_mutation(target, action)
+            barrier = threading.Barrier(3)
+            results = {}
+
+            def send(label, port, path, body):
+                barrier.wait(timeout=10)
+                results[label] = _request(port, "POST", path, body, cookie)[0]
+
+            threads = [
+                threading.Thread(target=send, args=("target", self.ports[0], route, mutation)),
+                threading.Thread(target=send, args=("dependency", self.ports[1], "/api/inventory/items/update", update)),
+            ]
+            for thread in threads:
+                thread.start()
+            barrier.wait(timeout=10)
+            for thread in threads:
+                thread.join(timeout=15)
+                self.assertFalse(thread.is_alive())
+            self.assertIn(results, (
+                {"target": 409, "dependency": 200},
+                {"target": 200, "dependency": 400},
+            ))
+            from database import TransactionalInventoryOperations
+            from inventory_dependencies import validate_dependency_updates
+            with self.factory() as session:
+                nodes = TransactionalInventoryOperations._dependency_nodes(session, "runtime-org")
+                validate_dependency_updates(nodes, {})
+                failed_key = mutation["idempotency_key"] if results["target"] == 409 else update["idempotency_key"]
+                self.assertIsNone(session.scalar(select(OperationRequestModel).where(
+                    OperationRequestModel.idempotency_key == failed_key,
+                )))
+
+    @race_required
+    @isolated_database_inserts
+    def test_dependency_target_removal_race(self):
+        self._race_dependency_target_lifecycle("remove")
+
+    @race_required
+    @isolated_database_inserts
+    def test_dependency_target_rename_race(self):
+        self._race_dependency_target_lifecycle("rename")
+
     @isolated_database_inserts
     def test_inventory_dependency_validation_is_authoritative_and_atomic(self):
         port = self.ports[0]
