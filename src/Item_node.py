@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from catalog_terms import LEGACY_CODES
+
 
 class ItemType(Enum):
     MIXER = "mixer"
@@ -94,11 +96,19 @@ class ItemNode:
     attributes: dict[str, Any] = field(default_factory=dict)
     preference_score: int = 0
     weight_kg: float = 0
+    display_name: str = ""
+    canonical_type: str = ""
+    category_label: str = ""
 
     def __post_init__(self):
         if self.id:
             self.id = normalize_item_id(self.id)
         self.type = parse_item_type(self.type)
+        for value in (self.display_name, self.category_label):
+            if not isinstance(value, str) or len(value) > 4096 or "\x00" in value:
+                raise ValueError("Inventory display text is invalid.")
+        if not self.canonical_type and self.type:
+            self.canonical_type = LEGACY_CODES.get(self.type.value, self.type.value)
         self.req = [self._parse_requirement(requirement) for requirement in self.req]
         self.class_id = normalize_item_id(self.class_id) if self.class_id else ""
         self.capabilities = tuple(
@@ -177,6 +187,9 @@ class ItemNode:
             "attributes": self.attributes,
             "preference_score": self.preference_score,
             "weight_kg": self.weight_kg,
+            "display_name": self.display_name,
+            "canonical_type": self.canonical_type,
+            "category_label": self.category_label,
         }
 
     @classmethod
@@ -197,6 +210,9 @@ class ItemNode:
             attributes=dict(data.get("attributes", {})),
             preference_score=int(data.get("preference_score", 0)),
             weight_kg=float(data.get("weight_kg", 0)),
+            display_name=data.get("display_name", ""),
+            canonical_type=data.get("canonical_type", ""),
+            category_label=data.get("category_label", ""),
             req=[
                 Requirement.from_dict(requirement)
                 for requirement in data.get("requirements", data.get("req", []))

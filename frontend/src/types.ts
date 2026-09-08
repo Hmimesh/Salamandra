@@ -6,6 +6,9 @@ export interface Requirement {
 }
 
 export interface InventoryItem {
+  display_name?: string;
+  canonical_type?: string;
+  category_label?: string;
   id: string;
   type: string;
   count: number;

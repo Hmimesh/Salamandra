@@ -64,6 +64,28 @@ class OrganizationModel(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class CatalogTermModel(Base):
+    __tablename__ = "catalog_terms"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), ForeignKey("organizations.id", ondelete="CASCADE"))
+    kind: Mapped[str] = mapped_column(String(16))
+    label: Mapped[str] = mapped_column(String(200))
+    normalized_label: Mapped[str] = mapped_column(String(256))
+    canonical_code: Mapped[str] = mapped_column(String(80))
+    language: Mapped[str] = mapped_column(String(32), default="")
+    confirmed_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("organization_id", "normalized_label", name="uq_catalog_terms_org_label"),
+        CheckConstraint("kind IN ('category', 'alias')", name="ck_catalog_terms_kind"),
+        ForeignKeyConstraint(["confirmed_by", "organization_id"],
+                             ["memberships.id", "memberships.organization_id"],
+                             ondelete="RESTRICT", name="fk_catalog_terms_actor_org"),
+    )
+
+
 class UserModel(Base):
     __tablename__ = "users"
 
@@ -2116,6 +2138,11 @@ class TransactionalInventoryOperations:
             for key, value in metadata.items()
             if key not in cls.SEPARATE_COMMAND_FIELDS
         }
+        # Read-time defaults keep legacy definitions equivalent without rewriting stock.
+        from catalog_terms import LEGACY_CODES
+        normalized.setdefault("display_name", "")
+        normalized.setdefault("category_label", "")
+        normalized.setdefault("canonical_type", LEGACY_CODES.get(normalized.get("type"), normalized.get("type") or ""))
         normalized["requirements"] = [
             requirement.to_dict()
             for requirement in normalize_dependency_requirements(

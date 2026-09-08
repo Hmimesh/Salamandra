@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+from catalog_terms import CANONICAL_TYPES, LEGACY_CODES, index_workspace_terms, resolve_category
 import email.utils
 import hashlib
 import io
@@ -163,6 +164,12 @@ class SalamandraServer(BaseHTTPRequestHandler):
             self.export_inventory_csv(user)
             return
 
+        if parsed_url.path == "/api/catalog":
+            user = self.require_user()
+            require_permission(user.role, Permission.INVENTORY_READ)
+            self.send_json({"canonical_types": list(CANONICAL_TYPES), "terms": self.catalog_terms(user)})
+            return
+
         if parsed_url.path == "/api/presets":
             user = self.require_user()
             require_permission(user.role, Permission.INVENTORY_READ)
@@ -301,6 +308,26 @@ class SalamandraServer(BaseHTTPRequestHandler):
                     },
                     status=HTTPStatus.CREATED,
                 )
+                return
+
+            if parsed_url.path == "/api/catalog/resolve":
+                require_permission(user.role, Permission.INVENTORY_READ)
+                labels = body.get("labels")
+                if not isinstance(labels, list) or len(labels) > 100:
+                    raise ValueError("Provide at most 100 category labels.")
+                terms = index_workspace_terms(self.catalog_terms(user))
+                self.send_json({"mappings": [resolve_category(label, terms) for label in labels]})
+                return
+
+            if parsed_url.path in {"/api/catalog/aliases", "/api/catalog/categories"}:
+                require_permission(user.role, Permission.CATALOG_MANAGE)
+                if self.database_runtime is None:
+                    raise StateConflict("Workspace category mappings require PostgreSQL.")
+                kind = "alias" if parsed_url.path.endswith("aliases") else "category"
+                result = self.database_runtime.canonical_catalog.create(
+                    user.organization_id, user.id, kind, body, self.request_id()
+                )
+                self.send_json({"term": result}, status=HTTPStatus.CREATED)
                 return
 
             if parsed_url.path == "/api/item-classes/remove":
@@ -1067,9 +1094,21 @@ class SalamandraServer(BaseHTTPRequestHandler):
             normalize_dependency_requirements(body.get("requirements", []))
         )
 
+        user = self.require_user()
+        category = self.resolve_inventory_category(body.get("canonical_type") or body.get("type") or "other", user)
+        input_type = body.get("type") or ""
+        if not isinstance(input_type, str):
+            raise ValueError("Inventory type must be text.")
+        default_label = (
+            "" if input_type in CANONICAL_TYPES or input_type in LEGACY_CODES
+            or input_type.startswith("custom_") else input_type
+        )
         return ItemNode(
             id=body.get("id", ""),
-            type=body.get("type") or None,
+            type=category["legacy_type"],
+            canonical_type=category["canonical_type"],
+            display_name=body.get("display_name", ""),
+            category_label=body.get("category_label", default_label),
             count=self.required_amount(body),
             req=requirements,
             info=body.get("info", ""),
@@ -1084,6 +1123,17 @@ class SalamandraServer(BaseHTTPRequestHandler):
             preference_score=int(body.get("preference_score", 0)),
             weight_kg=float(body.get("weight_kg", 0)),
         )
+
+    def catalog_terms(self, user: UserAccount) -> list[dict]:
+        if self.database_runtime is None:
+            return []
+        return self.database_runtime.canonical_catalog.list_terms(user.organization_id, user.id)
+
+    def resolve_inventory_category(self, value, user: UserAccount, terms=None) -> dict:
+        result = resolve_category(value, self.catalog_terms(user) if terms is None else terms)
+        if result["canonical_type"] is None:
+            raise ValueError("Category needs review. Choose a canonical category or confirm a workspace alias.")
+        return result
 
     @staticmethod
     def validate_inventory_metadata_access(body: dict, user: UserAccount) -> None:
@@ -1771,7 +1821,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
         fieldnames = [
             "id", "type", "count", "in_use_count", "class_id", "manufacturer",
             "model", "condition", "quality_score", "preference_score", "weight_kg",
-            "capabilities", "connectors", "info",
+            "capabilities", "connectors", "info", "display_name", "canonical_type", "category_label",
         ]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
@@ -1781,6 +1831,9 @@ class SalamandraServer(BaseHTTPRequestHandler):
         ).list_items():
             row = {
                     "id": item.id,
+                    "display_name": item.display_name or item.id,
+                    "canonical_type": item.canonical_type,
+                    "category_label": item.category_label,
                     "type": item.type.value if item.type else "other",
                     "count": item.count,
                     "in_use_count": item.in_use_count,
@@ -1847,6 +1900,9 @@ class SalamandraServer(BaseHTTPRequestHandler):
             "capabilities": source("capabilities", "capability"),
             "connectors": source("connectors", "connector"),
             "weight_kg": source("weight_kg", "weight"),
+            "display_name": source("display_name"),
+            "canonical_type": source("canonical_type"),
+            "category_label": source("category_label"),
         }
         if columns["name"] is None:
             raise ValueError("Map a CSV column to Item name before importing.")
@@ -1858,6 +1914,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
             for item in inventory.list_items()
         }
         seen_ids: set[str] = set()
+        terms = index_workspace_terms(self.catalog_terms(user))
         for row_number, row in enumerate(reader, start=2):
             if row_number > 10_001:
                 raise ValueError("Inventory CSV cannot contain more than 10,000 rows.")
@@ -1879,9 +1936,16 @@ class SalamandraServer(BaseHTTPRequestHandler):
             if count < 0:
                 raise ValueError(f"Count cannot be negative for {item_name}.")
             existing = inventory.get_item(item_id)
+            raw_category = row.get(columns["type"] or "", "") or (existing.type.value if existing and existing.type else "other")
+            category = self.resolve_inventory_category(
+                row.get(columns["canonical_type"] or "", "") or raw_category, user, terms
+            )
             item = ItemNode(
                 id=item_id,
-                type=row.get(columns["type"] or "", "") or (existing.type if existing else "other"),
+                type=category["legacy_type"],
+                canonical_type=category["canonical_type"],
+                display_name=str(row.get(columns["display_name"] or "", "") or item_name),
+                category_label=str(row.get(columns["category_label"] or "", "") or raw_category),
                 count=count,
                 info=str(row.get(columns["info"] or "", "")),
                 class_id=str(row.get(columns["class_id"] or "", "")),

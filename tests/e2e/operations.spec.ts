@@ -242,6 +242,43 @@ test("operational text scales in both themes and at 200 percent zoom", async ({ 
   await page.screenshot({ path: testInfo.outputPath("manual-largest.png"), fullPage: true });
 });
 
+test("multilingual inventory display and RTL briefs preserve original text", async ({ page }, testInfo) => {
+  await signIn(page);
+  await page.goto("/inventory");
+  await activate(page.getByRole("button", { name: "Add item", exact: true }));
+  await activate(page.getByRole("button", { name: "Create a custom item" }));
+  const dialog = page.getByRole("dialog", { name: "Add custom item" });
+  const name = `רמקול — ميكروفون — CAFÉ 🎤 ${testInfo.project.name}`;
+  await dialog.getByLabel("Item name").fill(name);
+  await expect(dialog.getByLabel("Item name")).toHaveAttribute("dir", "auto");
+  await expect(dialog.getByLabel("Item name")).toHaveCSS("direction", "rtl");
+  await dialog.getByLabel("Category").selectOption("speaker");
+  await activate(dialog.getByRole("button", { name: "Add equipment" }));
+  await page.getByPlaceholder("Search inventory").fill(`cafe\u0301 🎤 ${testInfo.project.name}`);
+  await expect(page.locator(".inventory-table tbody tr")).toHaveCount(1);
+  await expect(page.getByText(name, { exact: true })).toBeVisible();
+  await expect(page.getByText(name, { exact: true })).toHaveCSS("direction", "rtl");
+  await activate(page.locator(".inventory-table tbody tr").getByRole("button", { name: /^Edit / }));
+  const edit = page.getByRole("dialog", { name: "Edit equipment" });
+  await expect(edit.getByLabel("Item name")).toHaveValue(name);
+  await edit.getByLabel("Item name").fill(`${name} — geändert`);
+  const response = page.waitForResponse((value) => value.url().endsWith("/api/inventory/items/update"));
+  await activate(edit.getByRole("button", { name: "Save changes" }));
+  const saved = await (await response).json();
+  expect(saved.item.id).toBe(name.toLowerCase());
+  expect(saved.item.display_name).toBe(`${name} — geändert`);
+  expect(saved.item.canonical_type).toBe("speaker");
+  await expectNoViewportOverflow(page);
+  await page.goto("/events/new");
+  const brief = page.getByLabel("Event brief", { exact: true });
+  const description = "מופע בבית קפה — عرض موسيقي — Café 🎤";
+  await brief.fill(description);
+  await expect(brief).toHaveValue(description);
+  await expect(brief).toHaveCSS("direction", "rtl");
+  await expectNoViewportOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("multilingual-brief.png"), fullPage: true });
+});
+
 test("compact text retains the operator floor without losing dense layout", async ({ page }, testInfo) => {
   await signIn(page);
   const assertFloor = async (selector: string) => {
@@ -330,6 +367,12 @@ test("CSV mapping and appearance controls are keyboard reachable", async ({ page
   const errors = watchErrors(page);
   await signIn(page);
   await page.goto("/settings");
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "invalid-encoding.csv", mimeType: "text/csv",
+    buffer: Buffer.from([0x63, 0x61, 0x66, 0xe9]),
+  });
+  await expect(page.getByText("CSV must be UTF-8 encoded. Export as CSV UTF-8 and try again.")).toBeVisible();
+  await expect(page.getByRole("dialog")).toBeHidden();
   await activate(page.getByRole("button", { name: "dark" }));
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption("largest");

@@ -1421,6 +1421,7 @@ class TestAlembicMigration(unittest.TestCase):
                 engine.dispose()
 
         expected_tables = {
+            "catalog_terms",
             "alembic_version",
             "organizations",
             "users",

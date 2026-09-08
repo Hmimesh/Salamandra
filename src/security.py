@@ -13,6 +13,7 @@ class Permission(StrEnum):
     INVENTORY_EXPORT = "inventory.export"
     INVENTORY_IMPORT = "inventory.import"
     ITEM_CLASSES_MANAGE = "item_classes.manage"
+    CATALOG_MANAGE = "catalog.manage"
     EVENTS_PLAN = "events.plan"
     EVENTS_CREATE = "events.create"
     EVENTS_UPDATE = "events.update"

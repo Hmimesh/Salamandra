@@ -72,7 +72,7 @@ def _request(
     cookie: str = "",
 ) -> tuple[int, dict, dict[str, str]]:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
-    payload = json.dumps(body).encode("utf-8") if body is not None else None
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     headers = {"Content-Type": "application/json"} if payload is not None else {}
     if cookie:
         headers["Cookie"] = cookie
@@ -1049,8 +1049,10 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         self.assertEqual(free_requests, 1)
         self.assertEqual(
             set(free_audits[0].changes["changed_fields"]),
-            {"item_id", "type", "class_id", "info"},
+            {"item_id", "type", "canonical_type", "class_id", "info"},
         )
+        self.assertEqual(free_audits[0].changes["before"]["canonical_type"], "microphone")
+        self.assertEqual(free_audits[0].changes["after"]["canonical_type"], "speaker")
         self.assertEqual(
             free_audits[0].changes["before"]["item_id"],
             free_item_id,
@@ -1516,6 +1518,133 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             )
         self.assertEqual((rollback_requests, rollback_events), (0, 0))
         _request(first_port, "POST", "/api/auth/signout", {}, cookie)
+
+    @isolated_database_inserts
+    def test_multilingual_http_inventory_event_csv_round_trip(self):
+        import csv
+        import io
+        port = self.ports[0]
+        status, payload, headers = _request(port, "POST", "/api/auth/register", {
+            "name": "Multilingual Owner", "email": f"unicode-{uuid4().hex}@example.test",
+            "password": "Unicode-test-password-123", "organization_name": "Unicode Workspace",
+            "accept_terms": True,
+        })
+        self.assertEqual(status, 201, payload)
+        cookie = headers["set-cookie"].split(";", 1)[0]
+        with self.factory() as session:
+            self.assertEqual(session.scalar(text("SHOW server_encoding")), "UTF8")
+        names = ["רמקול ראשי במה", "ميكروفون رئيسي", "Câble für Bühne", "במה Stage A 🎤"]
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["name", "count", "type", "info"])
+        for name, category in zip(names, ["רמקולים", "ميكروفونات", "כבלים", "furniture"]):
+            writer.writerow([name, 2, category, f"Note {name}"])
+        status, payload, _ = _request(port, "POST", "/api/inventory/import.csv", {
+            "csv": output.getvalue(), "scope": "shared", "idempotency_key": uuid4().hex,
+        }, cookie)
+        self.assertEqual(status, 200, payload)
+        state = _request(port, "GET", "/api/state", cookie=cookie)[1]
+        items = {item["display_name"]: item for item in state["inventory"]["items"] if item.get("display_name") in names}
+        self.assertEqual(set(items), set(names))
+        self.assertEqual(items[names[0]]["canonical_type"], "speaker")
+        self.assertEqual(items[names[1]]["canonical_type"], "microphone")
+        self.assertEqual(items[names[2]]["category_label"], "כבלים")
+        connection = http.client.HTTPConnection("127.0.0.1", port)
+        connection.request("GET", "/api/inventory/export.csv", headers={"Cookie": cookie})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertIn("charset=utf-8", response.getheader("Content-Type"))
+        exported = list(csv.DictReader(io.StringIO(response.read().decode("utf-8-sig"))))
+        connection.close()
+        for name in names:
+            row = next(row for row in exported if row["display_name"] == name)
+            self.assertEqual(row["info"], f"Note {name}")
+        # Re-import preserves stable IDs rather than slugging display labels again.
+        export_text = io.StringIO()
+        export_writer = csv.DictWriter(export_text, fieldnames=exported[0].keys())
+        export_writer.writeheader()
+        export_writer.writerows(exported)
+        status, payload, _ = _request(port, "POST", "/api/inventory/import.csv", {
+            "csv": export_text.getvalue(), "scope": "shared", "idempotency_key": uuid4().hex,
+        }, cookie)
+        self.assertEqual(status, 200, payload)
+        brief = "מופע קטן — عرض موسيقي — Café 🎤"
+        status, payload, _ = _request(port, "POST", "/api/events/save", {
+            "description": brief, "overrides": {"title": brief, "start_date": "2027-01-08"},
+            "idempotency_key": uuid4().hex,
+        }, cookie)
+        self.assertEqual(status, 201, payload)
+        with self.factory() as session:
+            event = session.get(EventModel, payload["event"]["id"])
+            self.assertEqual(event.data["description"], brief)
+
+    @race_required
+    @isolated_database_inserts
+    def test_workspace_catalog_alias_scope_permissions_and_idempotent_race(self):
+        from database import CatalogTermModel
+        port, second_port = self.ports
+        cookie = self._sign_in(port)
+        technician = self._sign_in_other(port)
+        alias = {"label": "רמקולים", "canonical_type": "powered_speaker", "idempotency_key": uuid4().hex}
+        before = self._database_state_snapshot()
+        self.assertEqual(_request(port, "POST", "/api/catalog/aliases", alias, technician)[0], 403)
+        self.assertEqual(self._database_state_snapshot(), before)
+        barrier = threading.Barrier(3)
+        results = []
+        def create(target_port):
+            barrier.wait(timeout=10)
+            results.append(_request(target_port, "POST", "/api/catalog/aliases", alias, cookie))
+        threads = [threading.Thread(target=create, args=(value,)) for value in self.ports]
+        for thread in threads:
+            thread.start()
+        barrier.wait(timeout=10)
+        for thread in threads:
+            thread.join(timeout=15)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual([result[0] for result in results], [201, 201])
+        self.assertEqual(results[0][1], results[1][1])
+        with self.factory() as session:
+            self.assertEqual(session.scalar(select(func.count()).select_from(CatalogTermModel)), 1)
+        self.assertEqual(_request(port, "POST", "/api/catalog/aliases", {**alias, "canonical_type": "cable"}, cookie)[0], 409)
+        resolved = _request(port, "POST", "/api/catalog/resolve", {"labels": ["רמקולים"], "organization_id": "forged-org"}, cookie)[1]
+        self.assertEqual(resolved["mappings"][0]["canonical_type"], "powered_speaker")
+        status, payload, _ = _request(port, "POST", "/api/inventory/items", {
+            "id": "alias-labeled-item", "type": "רמקולים", "amount": 1, "scope": "shared",
+        }, cookie)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["item"]["category_label"], "רמקולים")
+        self.assertEqual(payload["item"]["canonical_type"], "powered_speaker")
+        before = self._database_state_snapshot()
+        status, _, _ = _request(port, "POST", "/api/inventory/items", {
+            "id": "invalid-type-item", "type": {"invalid": True},
+            "canonical_type": "speaker", "amount": 1, "scope": "shared",
+        }, cookie)
+        self.assertEqual(status, 400)
+        self.assertEqual(self._database_state_snapshot(), before)
+        # A distinct owner/workspace receives only built-ins, never this workspace's alias.
+        registration = {"name": "Org B", "email": f"catalog-{uuid4().hex}@example.test",
+                        "password": "Catalog-test-password-123", "organization_name": "Catalog B", "accept_terms": True}
+        status, payload, headers = _request(port, "POST", "/api/auth/register", registration)
+        self.assertEqual(status, 201, payload)
+        other_cookie = headers["set-cookie"].split(";", 1)[0]
+        resolved = _request(second_port, "POST", "/api/catalog/resolve", {"labels": ["רמקולים"], "organization_id": "runtime-org"}, other_cookie)[1]
+        self.assertEqual(resolved["mappings"][0]["canonical_type"], "speaker")
+        status, payload, _ = _request(port, "POST", "/api/catalog/categories", {
+            "label": "אירוח خاص", "idempotency_key": uuid4().hex,
+        }, cookie)
+        self.assertEqual(status, 201, payload)
+        custom_code = payload["term"]["canonical_code"]
+        before = self._database_state_snapshot()
+        self.assertEqual(_request(port, "POST", "/api/catalog/aliases", {
+            "label": "private category", "canonical_type": custom_code, "idempotency_key": uuid4().hex,
+        }, other_cookie)[0], 400)
+        self.assertEqual(self._database_state_snapshot(), before)
+        status, payload, _ = _request(port, "POST", "/api/inventory/items", {
+            "id": "custom-catalog-item", "display_name": "אירוח خاص", "canonical_type": custom_code,
+            "amount": 1, "scope": "shared",
+        }, cookie)
+        self.assertEqual(status, 200, payload)
+        self.assertEqual(payload["item"]["canonical_type"], custom_code)
 
     def _dependency_item(self, cookie, item_id, requirements=(), scope="shared"):
         body = self._definition_body(item_id, scope=scope)
