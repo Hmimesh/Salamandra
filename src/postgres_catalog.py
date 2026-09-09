@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from contextlib import nullcontext
 
 from sqlalchemy import select, func
 
@@ -41,7 +42,7 @@ class PostgresCatalog:
                 CatalogTermModel.organization_id == organization_id
             ).order_by(CatalogTermModel.normalized_label))]
 
-    def create(self, organization_id, actor_id, kind, body, request_id):
+    def create(self, organization_id, actor_id, kind, body, request_id, *, session=None):
         if kind not in {"alias", "category"}:
             raise ValueError("Invalid catalog term kind.")
         label, language, key = body.get("label"), body.get("language", ""), body.get("idempotency_key")
@@ -61,11 +62,13 @@ class PostgresCatalog:
             [kind, label, language, code], ensure_ascii=False
         ).encode("utf-8")).hexdigest()
         operation = f"catalog.{kind}.create"
-        with self.factory.begin() as session:
+        # An import supplies its transaction; standalone catalog commands own theirs.
+        owns_transaction = session is None
+        with self.factory.begin() if owns_transaction else nullcontext(session) as session:
             member = self._authorize(session, organization_id, actor_id, Permission.CATALOG_MANAGE)
             session.scalar(select(OrganizationModel).where(
                 OrganizationModel.id == organization_id
-            ).with_for_update())
+            ).with_for_update(key_share=not owns_transaction))
             prior = session.scalar(select(OperationRequestModel).where(
                 OperationRequestModel.organization_id == organization_id,
                 OperationRequestModel.operation == operation,

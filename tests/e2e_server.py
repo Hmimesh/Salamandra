@@ -14,21 +14,25 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from accounts import AccountStore
-from event_memory import EventMemory
 from event_templates import TemplateCatalog
-from integrations import IntegrationStore
-from inventory_workspace import InventoryWorkspace
 from Item_node import ItemNode
-from item_classes import ItemClassCatalog
-from kits import KitStore
 from presets import PresetCatalog
 from server import SalamandraServer
 from web_config import WebConfig
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
+from database import Base
+from postgres_runtime import PostgresRuntime
 
 
 def handler_for(data_dir: Path, port: int):
-    accounts = AccountStore(data_dir / "users.json")
+    engine = create_engine(f"sqlite+pysqlite:///{(data_dir / 'browser.db').as_posix()}", connect_args={"check_same_thread": False})
+    @event.listens_for(engine, "connect")
+    def foreign_keys(connection, _):
+        connection.execute("PRAGMA foreign_keys=ON")
+    Base.metadata.create_all(engine)
+    runtime = PostgresRuntime(sessionmaker(bind=engine, expire_on_commit=False))
+    accounts = runtime.accounts
     accounts.create_user(
         name="Playwright Owner",
         email="owner@playwright.test",
@@ -40,6 +44,12 @@ def handler_for(data_dir: Path, port: int):
     owner = accounts.authenticate("owner@playwright.test", "playwright-password")
     if owner is None:
         raise RuntimeError("Could not create the Playwright account fixture.")
+    for viewport in ("mobile-360", "tablet-768", "desktop-1280", "wide-1440", "desktop-200-percent"):
+        accounts.create_user(
+            name="Import Owner", email=f"owner@phase-b-{viewport}.test",
+            password="playwright-password", role="owner",
+            organization_id=f"import-{viewport}", organization_name=f"Import {viewport}",
+        )
     accounts.create_user(
         name="Playwright Technician", email="tech@playwright.test",
         password="playwright-password", role="technician",
@@ -47,7 +57,7 @@ def handler_for(data_dir: Path, port: int):
         organization_name="Playwright Operations",
     )
 
-    workspace = InventoryWorkspace(data_dir / "inventories.json")
+    workspace = runtime.workspace
     workspace.add_item(
         ItemNode(id="xlr cable", type="cable", count=12, info="Balanced signal cable"),
         amount=12,
@@ -70,16 +80,16 @@ def handler_for(data_dir: Path, port: int):
     PlaywrightHandler.workspace = workspace
     PlaywrightHandler.catalog = PresetCatalog()
     PlaywrightHandler.templates = TemplateCatalog()
-    PlaywrightHandler.memory = EventMemory(data_dir / "events.json")
-    PlaywrightHandler.item_classes = ItemClassCatalog(data_dir / "item_classes.json")
-    PlaywrightHandler.integrations = IntegrationStore(data_dir / "integrations.json")
-    PlaywrightHandler.kits = KitStore(data_dir / "kits.json")
+    PlaywrightHandler.memory = runtime.memory
+    PlaywrightHandler.item_classes = runtime.item_classes
+    PlaywrightHandler.integrations = runtime.integrations
+    PlaywrightHandler.kits = runtime.kits
     PlaywrightHandler.sessions = {}
     PlaywrightHandler.login_attempts = {}
     PlaywrightHandler.registration_attempts = {}
     PlaywrightHandler.event_create_requests = {}
     PlaywrightHandler.operation_lock = threading.RLock()
-    PlaywrightHandler.database_runtime = None
+    PlaywrightHandler.database_runtime = runtime
     PlaywrightHandler.readiness_probe = None
     origin = f"http://127.0.0.1:{port}"
     PlaywrightHandler.web_config = replace(
@@ -112,6 +122,7 @@ def main() -> None:
             server.shutdown()
             worker.join(timeout=10)
             server.server_close()
+            server.RequestHandlerClass.database_runtime.factory.kw["bind"].dispose()
 
 
 if __name__ == "__main__":

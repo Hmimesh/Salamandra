@@ -1,0 +1,1 @@
+function e(e){return e.normalize(`NFKC`).toLowerCase().replaceAll(`ß`,`ss`).replace(/[\p{P}\p{Z}\s]+/gu,` `).trim()}export{e as t};

@@ -1,0 +1,33 @@
+.import-wizard { display: grid; gap: 1rem; min-width: 0; }
+.import-steps { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: .5rem; }
+.import-steps li { border-bottom: 2px solid var(--line); padding: .5rem 0; font-size: .875rem; overflow-wrap: anywhere; }
+.import-steps li[aria-current] { border-color: var(--teal); font-weight: 700; }
+.import-steps span { display: block; color: var(--muted); }
+.import-table { max-width: 100%; overflow: auto; border: 1px solid var(--line); border-radius: 4px; }
+.import-table table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+.import-raw-table table { table-layout: auto; }
+.import-raw-table td, .import-raw-table th { min-width: 8rem; }
+.import-table td, .import-table th { padding: .75rem; text-align: start; vertical-align: top; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.import-table small, .import-review-row small { display: block; color: var(--muted); }
+.import-review-list { display: grid; gap: 0; }
+.import-review-row { display: grid; gap: .65rem; padding: 1rem 0; border-bottom: 1px solid var(--line); min-width: 0; overflow-wrap: anywhere; }
+.import-review-row label { display: grid; gap: .4rem; min-width: 0; }
+.import-review-row select, .import-review-row input { width: 100%; min-width: 0; max-width: 100%; }
+.import-review-row .import-checkbox { display: flex; align-items: center; gap: .5rem; }
+.import-checkbox input { width: 1.1rem; height: 1.1rem; flex: 0 0 1.1rem; }
+.import-error { color: var(--red); overflow-wrap: anywhere; }
+.import-totals { display: grid; grid-template-columns: repeat(auto-fit,minmax(min(100%, 9rem),1fr)); gap: 1rem; padding: 1rem 0; border-block: 1px solid var(--line); }
+.import-totals dt { color: var(--muted); font-size: .875rem; }
+.import-totals dd { margin: .4rem 0 0; font-size: 1.5rem; font-weight: 700; }
+.import-toolbar, .import-pagination { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; }
+.import-pagination { justify-content: center; margin-block: .75rem; }
+.cleanup-section { padding-block: 1.25rem; border-top: 1px solid var(--line); }
+.cleanup-section h2 { font-size: 1.25rem; }
+.cleanup-section > label { display: grid; gap: .4rem; max-width: 28rem; margin-bottom: 1rem; }
+.cleanup-section > label input { width: 100%; }
+@media (max-width: 600px) {
+  .import-steps { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .import-table td, .import-table th { padding: .4rem; }
+  .import-wizard .modal-actions { display: flex; flex-wrap: wrap; }
+  .import-wizard .modal-actions button { flex: 1 1 auto; }
+}

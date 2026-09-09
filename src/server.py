@@ -170,6 +170,14 @@ class SalamandraServer(BaseHTTPRequestHandler):
             self.send_json({"canonical_types": list(CANONICAL_TYPES), "terms": self.catalog_terms(user)})
             return
 
+        if parsed_url.path == "/api/inventory/cleanup":
+            user = self.require_user()
+            require_permission(user.role, Permission.CATALOG_MANAGE)
+            if self.database_runtime is None:
+                raise StateConflict("Inventory cleanup requires PostgreSQL.")
+            self.send_json(self.database_runtime.reconciliation.cleanup(user.organization_id, user.id))
+            return
+
         if parsed_url.path == "/api/presets":
             user = self.require_user()
             require_permission(user.role, Permission.INVENTORY_READ)
@@ -839,6 +847,20 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 self.send_json(
                     {"imported": imported, "state": self.state_payload(user)}
                 )
+                return
+
+            if parsed_url.path in {"/api/inventory/import.review", "/api/inventory/import.commit", "/api/inventory/cleanup/decision"}:
+                require_permission(user.role, Permission.CATALOG_MANAGE if parsed_url.path.endswith("/decision") else Permission.INVENTORY_IMPORT)
+                if self.database_runtime is None:
+                    raise StateConflict("Reviewed inventory imports require PostgreSQL.")
+                service = self.database_runtime.reconciliation
+                if parsed_url.path.endswith(".review"):
+                    result = service.preview(user.organization_id, user.id, body)
+                elif parsed_url.path.endswith(".commit"):
+                    result = service.commit(user.organization_id, user.id, body, self.request_id())
+                else:
+                    result = service.decide(user.organization_id, user.id, body, self.request_id())
+                self.send_json(result)
                 return
 
             if parsed_url.path == "/api/inventory/import.preview":
@@ -1821,7 +1843,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
         fieldnames = [
             "id", "type", "count", "in_use_count", "class_id", "manufacturer",
             "model", "condition", "quality_score", "preference_score", "weight_kg",
-            "capabilities", "connectors", "info", "display_name", "canonical_type", "category_label",
+            "capabilities", "connectors", "info", "display_name", "canonical_type", "category_label", "location",
         ]
         writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
@@ -1834,6 +1856,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
                     "display_name": item.display_name or item.id,
                     "canonical_type": item.canonical_type,
                     "category_label": item.category_label,
+                    "location": item.attributes.get("location", ""),
                     "type": item.type.value if item.type else "other",
                     "count": item.count,
                     "in_use_count": item.in_use_count,

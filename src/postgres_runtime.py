@@ -1007,6 +1007,8 @@ class PostgresRuntime:
     def __init__(self, factory: sessionmaker[Session]):
         from postgres_catalog import PostgresCatalog
         self.canonical_catalog = PostgresCatalog(factory)
+        from postgres_reconciliation import PostgresReconciliation
+        self.reconciliation = PostgresReconciliation(factory)
         self.factory = factory
         self.accounts = PostgresAccountStore(factory)
         self.workspace = PostgresInventoryWorkspace(factory)

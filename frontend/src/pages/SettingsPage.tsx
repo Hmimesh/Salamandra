@@ -15,7 +15,8 @@ import {
 } from "lucide-react";
 import { type ChangeEvent, type FormEvent, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { Modal, PageHeader } from "../components/ui";
+import { PageHeader } from "../components/ui";
+import { InventoryImportWizard, type ImportReview } from "../components/InventoryImportWizard";
 import { useWorkspace } from "../context/WorkspaceContext";
 
 function connectionLabel(status: string): string {
@@ -31,8 +32,7 @@ export function SettingsPage() {
   const user = state!.auth.user!;
   const preferences = user.preferences;
   const integrations = state!.integrations;
-  const [csvImport, setCsvImport] = useState<{ csv: string; headers: string[]; rows: Record<string, string>[]; mapping: Record<string, string> } | null>(null);
-  const [importing, setImporting] = useState(false);
+  const [csvImport, setCsvImport] = useState<{ csv: string; review: ImportReview } | null>(null);
 
   async function saveProfile(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -88,6 +88,7 @@ export function SettingsPage() {
   async function importInventory(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
+    if (file.size > 2_000_000) { notify("CSV file must be no larger than 2 MB."); event.target.value = ""; return; }
     let csv: string;
     try {
       csv = new TextDecoder("utf-8", { fatal: true }).decode(await file.arrayBuffer());
@@ -97,24 +98,14 @@ export function SettingsPage() {
       return;
     }
     try {
-      const preview = await mutate<{ headers: string[]; rows: Record<string, string>[]; suggested_mapping: Record<string, string> }>("/api/inventory/import.preview", { csv });
-      setCsvImport({ csv, headers: preview.headers, rows: preview.rows, mapping: preview.suggested_mapping });
+      const review = await mutate<ImportReview>("/api/inventory/import.review", { csv });
+      setCsvImport({ csv, review });
     } catch {
       // The workspace provider reports the API message.
     }
     event.target.value = "";
   }
 
-  async function confirmImport() {
-    if (!csvImport || importing) return;
-    setImporting(true);
-    try {
-      await mutate<{ imported: number }>("/api/inventory/import.csv", { csv: csvImport.csv, scope: "shared", column_mapping: csvImport.mapping, idempotency_key: crypto.randomUUID() }, { success: "Shared inventory imported from CSV." });
-      setCsvImport(null);
-    } finally {
-      setImporting(false);
-    }
-  }
 
   return (
     <div className="page settings-page">
@@ -132,9 +123,7 @@ export function SettingsPage() {
 
         <section className="settings-section data-company-section"><header><span><Database size={20} /></span><div><h2>Data & company</h2><p>Support, policy, and staging data use.</p></div></header><button className="settings-nav-row" onClick={() => navigate("/contact")}><span><strong>Contact support</strong><small>Account and product assistance</small></span><ChevronRight size={18} /></button><button className="settings-nav-row" onClick={() => navigate("/terms")}><span><strong>Terms of use</strong><small>Service and operational responsibilities</small></span><ChevronRight size={18} /></button><button className="settings-nav-row" onClick={() => navigate("/privacy")}><span><strong>Privacy</strong><small>Data handling and connected services</small></span><ChevronRight size={18} /></button></section>
       </div>
-      <Modal open={Boolean(csvImport)} title="Review inventory import" description="Match your columns, inspect the first rows, then import. Salamandra creates item references automatically." onClose={() => setCsvImport(null)} size="lg">
-        {csvImport ? <div className="csv-import-review"><div className="csv-mapping-grid">{[["name", "Item name"], ["count", "Quantity"], ["type", "Category"], ["info", "Description"], ["manufacturer", "Manufacturer"], ["model", "Model"], ["condition", "Condition"]].map(([field, label]) => <label key={field}>{label}{field === "name" ? " *" : ""}<select value={csvImport.mapping[field] || ""} onChange={(event) => setCsvImport({ ...csvImport, mapping: { ...csvImport.mapping, [field]: event.target.value } })} required={field === "name"}><option value="">Not mapped</option>{csvImport.headers.map((header) => <option key={header} value={header}>{header}</option>)}</select></label>)}</div><div className="csv-preview-table" tabIndex={0}><table><thead><tr>{csvImport.headers.map((header) => <th key={header}>{header}</th>)}</tr></thead><tbody>{csvImport.rows.map((row, index) => <tr key={index}>{csvImport.headers.map((header) => <td key={header} dir="auto">{row[header]}</td>)}</tr>)}</tbody></table></div><p className="settings-note">Duplicate item names are rejected before any inventory change. Existing matching items are updated; unrelated inventory remains untouched.</p><div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => setCsvImport(null)}>Cancel</button><button className="button button-primary" type="button" disabled={!csvImport.mapping.name || importing} onClick={() => void confirmImport()}>{importing ? "Importing..." : "Import inventory"}</button></div></div> : null}
-      </Modal>
+      {csvImport ? <InventoryImportWizard csv={csvImport.csv} initial={csvImport.review} onClose={() => setCsvImport(null)} /> : null}
     </div>
   );
 }

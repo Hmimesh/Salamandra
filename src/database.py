@@ -86,6 +86,19 @@ class CatalogTermModel(Base):
     )
 
 
+class CatalogDecisionModel(Base):
+    __tablename__ = "catalog_decisions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), ForeignKey("organizations.id", ondelete="CASCADE"))
+    pair_key: Mapped[str] = mapped_column(String(64))
+    action: Mapped[str] = mapped_column(String(16))
+    data: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
+    __table_args__ = (
+        UniqueConstraint("organization_id", "pair_key", name="uq_catalog_decisions_org_pair"),
+        CheckConstraint("action IN ('separate', 'same')", name="ck_catalog_decisions_action"),
+    )
+
+
 class UserModel(Base):
     __tablename__ = "users"
 
@@ -2299,11 +2312,11 @@ class TransactionalInventoryOperations:
         return membership
 
     @staticmethod
-    def _lock_organization(session: Session, organization_id: str) -> None:
+    def _lock_organization(session: Session, organization_id: str, *, no_key_update: bool = False) -> None:
         organization = session.scalar(
             select(OrganizationModel)
             .where(OrganizationModel.id == organization_id)
-            .with_for_update()
+            .with_for_update(key_share=no_key_update)
         )
         if organization is None:
             raise ResourceNotFound("Organization was not found.")

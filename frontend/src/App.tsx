@@ -10,6 +10,7 @@ const ContactPage = lazy(() => import("./pages/ContactPage").then((module) => ({
 const DashboardPage = lazy(() => import("./pages/DashboardPage").then((module) => ({ default: module.DashboardPage })));
 const EventsPage = lazy(() => import("./pages/EventsPage").then((module) => ({ default: module.EventsPage })));
 const InventoryPage = lazy(() => import("./pages/InventoryPage").then((module) => ({ default: module.InventoryPage })));
+const InventoryCleanupPage = lazy(() => import("./pages/InventoryCleanupPage").then((module) => ({ default: module.InventoryCleanupPage })));
 const KitsPage = lazy(() => import("./pages/KitsPage").then((module) => ({ default: module.KitsPage })));
 const LandingPage = lazy(() => import("./pages/LandingPage").then((module) => ({ default: module.LandingPage })));
 const PrivacyPage = lazy(() => import("./pages/PrivacyPage").then((module) => ({ default: module.PrivacyPage })));
@@ -38,6 +39,7 @@ export function App() {
               <Route path="/dashboard" element={<Navigate to="/" replace />} />
               <Route path="/events/*" element={<EventsPage />} />
               <Route path="/inventory" element={<InventoryPage />} />
+              <Route path="/inventory/cleanup" element={<InventoryCleanupPage />} />
               <Route path="/kits" element={<KitsPage />} />
               <Route path="/returns" element={<ReturnsPage />} />
               <Route path="/team" element={<TeamPage />} />

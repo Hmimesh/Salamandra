@@ -45,6 +45,7 @@ from database import (
     SavedKitModel,
     SessionModel,
     StockMovementModel,
+    TransactionalEventOperations,
     UserModel,
 )
 from readiness import DatabaseReadiness
@@ -1518,6 +1519,181 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             )
         self.assertEqual((rollback_requests, rollback_events), (0, 0))
         _request(first_port, "POST", "/api/auth/signout", {}, cookie)
+
+    def _reviewed_import_fixture(self):
+        from postgres_runtime import PostgresRuntime
+        port = self.ports[0]
+        # Import fixtures do not consume the shared registration rate-limit bucket.
+        org, email = "import-" + uuid4().hex, f"import-{uuid4().hex}@example.test"
+        PostgresRuntime(self.factory).accounts.create_user("Import owner", email, "Import-test-password-123", "owner", org, "Import test")
+        cookie = self._sign_in_credentials(port, email, "Import-test-password-123")
+        item = {"id": "sm58", "display_name": "SM58", "type": "microphone", "amount": 4, "scope": "shared", "idempotency_key": uuid4().hex}
+        self.assertEqual(_request(port, "POST", "/api/inventory/items", item, cookie)[0], 200)
+        body = {"csv": "שם,כמות,סוג\nSM58,2,מיקרופונים", "idempotency_key": uuid4().hex}
+        status, review, _ = _request(port, "POST", "/api/inventory/import.review", body, cookie)
+        self.assertEqual(status, 200, review)
+        candidate = review["rows"][0]["candidates"][0]
+        body["decisions"] = {"1": {"action": "add", "target": candidate["target"], "expected": candidate["expected"]}}
+        return org, cookie, body, item
+
+    @race_required
+    @isolated_database_inserts
+    def test_reviewed_import_two_process_replay_and_stock_addition_races(self):
+        org, cookie, body, item = self._reviewed_import_fixture()
+        def race(requests):
+            barrier, results = threading.Barrier(3), []
+            def send(port, route, payload):
+                barrier.wait(timeout=10)
+                results.append(_request(port, "POST", route, payload, cookie))
+            threads = [threading.Thread(target=send, args=(port, *request)) for port, request in zip(self.ports, requests)]
+            # Hold the real organization row until BOTH API processes are waiting on it.
+            with self.factory.begin() as session:
+                session.scalar(select(OrganizationModel).where(OrganizationModel.id == org).with_for_update())
+                for thread in threads:
+                    thread.start()
+                barrier.wait(timeout=10)
+                deadline, waiting = time.monotonic() + 5, 0
+                while time.monotonic() < deadline:
+                    with self.factory() as observer:
+                        waiting = observer.scalar(text("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'"))
+                    if waiting >= 2:
+                        break
+                    time.sleep(.02)
+                self.assertGreaterEqual(waiting, 2, "Both independent API commands must reach the database lock")
+            for thread in threads:
+                thread.join(timeout=15)
+                self.assertFalse(thread.is_alive())
+            self.assertEqual([result[0] for result in results], [200, 200], results)
+            return results
+        results = race([("/api/inventory/import.commit", body)] * 2)
+        self.assertEqual(results[0][1], results[1][1])
+        with self.factory() as session:
+            holding = session.scalar(select(InventoryHoldingModel).where(InventoryHoldingModel.organization_id == org))
+            self.assertEqual(holding.available_quantity, 6)
+            self.assertEqual(session.scalar(select(func.count()).select_from(InventoryAdjustmentModel).where(InventoryAdjustmentModel.organization_id == org)), 2)
+        body = {**body, "idempotency_key": uuid4().hex}
+        race([("/api/inventory/import.commit", body), ("/api/inventory/items", {**item, "amount": 3, "idempotency_key": uuid4().hex})])
+        with self.factory() as session:
+            holding = session.scalar(select(InventoryHoldingModel).where(InventoryHoldingModel.organization_id == org))
+            self.assertEqual(holding.available_quantity, 11)
+            self.assertEqual(session.scalar(select(func.sum(InventoryAdjustmentModel.delta)).where(InventoryAdjustmentModel.organization_id == org)), 11)
+
+    @race_required
+    @isolated_database_inserts
+    def test_reviewed_import_waits_for_event_holding_lock(self):
+        org, cookie, body, item = self._reviewed_import_fixture()
+        event_id = uuid4().hex
+        with self.factory.begin() as session:
+            member = session.scalar(select(MembershipModel).where(MembershipModel.organization_id == org))
+            member_id = member.id
+            session.add(EventModel(id=event_id, organization_id=org, owner_user_id=member.user_id,
+                                   title="Import reservation race", status="planning", data={
+                                       "plan_verified": True, "plan": {"lines": [
+                                           {"item_id": item["id"], "amount": 1, "missing": 0},
+                                       ]}, "conflicts": [], "history": [],
+                                   }))
+        results = []
+        worker = threading.Thread(target=lambda: results.append(_request(
+            self.ports[0], "POST", "/api/inventory/import.commit", body, cookie)))
+        try:
+            with self.factory.begin() as session:
+                TransactionalEventOperations(self.factory).transition_in_session(
+                    session, org, event_id, "confirmed", member_id, "import-holding-race")
+                session.flush()
+                worker.start()
+                deadline, waiting = time.monotonic() + 5, 0
+                while time.monotonic() < deadline:
+                    with self.factory() as observer:
+                        waiting = observer.scalar(text(
+                            "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                            "AND wait_event_type = 'Lock' AND query ILIKE '%inventory_holdings%'"))
+                    if waiting:
+                        break
+                    time.sleep(.02)
+                self.assertGreaterEqual(waiting, 1, "Import must wait for the event-owned holding lock")
+                self.assertEqual(results, [])
+        finally:
+            if worker.ident is not None:
+                worker.join(timeout=15)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results[0][0], 200, results)
+        with self.factory() as session:
+            holding = session.scalar(select(InventoryHoldingModel).where(InventoryHoldingModel.organization_id == org))
+            self.assertEqual((holding.available_quantity, holding.reserved_quantity), (5, 1))
+            self.assertEqual(session.scalar(select(func.sum(InventoryAdjustmentModel.delta)).where(
+                InventoryAdjustmentModel.organization_id == org)), 6)
+            self.assertEqual(session.scalar(select(func.count()).select_from(StockMovementModel).where(
+                StockMovementModel.organization_id == org)), 1)
+
+    @isolated_database_inserts
+    def test_reviewed_import_http_security_and_atomic_rollback(self):
+        org, cookie, body, item = self._reviewed_import_fixture()
+        other_org, other_cookie, foreign_body, _ = self._reviewed_import_fixture()
+        port = self.ports[0]
+        before = self._database_state_snapshot()
+        for method, route in (("GET", "/api/inventory/cleanup"),
+                              ("POST", "/api/inventory/import.review"),
+                              ("POST", "/api/inventory/import.commit"),
+                              ("POST", "/api/inventory/cleanup/decision")):
+            self.assertEqual(_request(port, method, route, body if method == "POST" else None)[0], 401)
+        self.assertEqual(self._database_state_snapshot(), before)
+        custom_status, custom, _ = _request(port, "POST", "/api/catalog/categories", {"label": "Private type", "idempotency_key": uuid4().hex}, other_cookie)
+        self.assertEqual(custom_status, 201)
+        cases = [
+            ({**body, "decisions": foreign_body["decisions"]}, 404),
+            ({**body, "decisions": {"1": {"action": "add", "target": "absent", "expected": "absent"}}}, 404),
+            ({**body, "category_choices": {"מיקרופונים": {"action": "map", "code": custom["term"]["canonical_code"]}}}, 400),
+            ({**body, "category_choices": {"מיקרופונים": {"action": "custom", "label": "Pending rollback"}}, "decisions": foreign_body["decisions"]}, 404),
+            ({**body, "scope": "personal"}, 400),
+            ({**body, "decisions": {"1": {"action": "add", "target": []}}}, 400),
+            ({**body, "csv": 'name,count\n"unclosed,2'}, 400),
+            ({**body, "csv": "name,count\n" + "A,1\n" * 10001}, 400),
+        ]
+        for forged, expected in cases:
+            with self.subTest(expected=expected, payload=str(forged)[:150]):
+                before = self._database_state_snapshot()
+                status, payload, _ = _request(port, "POST", "/api/inventory/import.commit", {**forged, "organization_id": other_org}, cookie)
+                self.assertEqual(status, expected, payload)
+                self.assertEqual(self._database_state_snapshot(), before)
+        status, payload, _ = _request(port, "POST", "/api/inventory/import.commit", body, cookie)
+        self.assertEqual(status, 200, payload)
+        before = self._database_state_snapshot()
+        self.assertEqual(_request(port, "POST", "/api/inventory/import.commit", {**body, "csv": body["csv"].replace(",2,", ",3,")}, cookie)[0], 409)
+        self.assertEqual(self._database_state_snapshot(), before)
+        with self.factory.begin() as session:
+            holding = session.scalar(select(InventoryHoldingModel).where(InventoryHoldingModel.organization_id == org))
+            holding.data = {**holding.data, "info": "Changed since review"}
+        before = self._database_state_snapshot()
+        self.assertEqual(_request(port, "POST", "/api/inventory/import.commit", {**body, "idempotency_key": uuid4().hex}, cookie)[0], 409)
+        self.assertEqual(self._database_state_snapshot(), before)
+        with self.factory.begin() as session:
+            session.scalar(select(InventoryHoldingModel).where(InventoryHoldingModel.organization_id == org)).active = False
+        before = self._database_state_snapshot()
+        self.assertEqual(_request(port, "POST", "/api/inventory/import.commit", {**body, "idempotency_key": uuid4().hex}, cookie)[0], 404)
+        self.assertEqual(self._database_state_snapshot(), before)
+
+    @isolated_database_inserts
+    def test_reviewed_import_rechecks_permissions_after_preview(self):
+        org, cookie, body, _ = self._reviewed_import_fixture()
+        port = self.ports[0]
+        custom_body = {"csv": "name,count,type\nNew,1,חדש", "idempotency_key": uuid4().hex,
+                       "category_choices": {"חדש": {"action": "custom", "label": "Custom type"}}}
+        self.assertEqual(_request(port, "POST", "/api/inventory/import.review", custom_body, cookie)[0], 200)
+        with self.factory.begin() as session:
+            member = session.scalar(select(MembershipModel).where(MembershipModel.organization_id == org))
+            member.role = "operator"
+        before = self._database_state_snapshot()
+        self.assertEqual(_request(port, "POST", "/api/inventory/import.commit", custom_body, cookie)[0], 403)
+        alias_body = {**custom_body, "category_choices": {"חדש": {"action": "map", "code": "speaker", "remember": True}}}
+        self.assertEqual(_request(port, "POST", "/api/inventory/import.commit", alias_body, cookie)[0], 403)
+        self.assertEqual(_request(port, "GET", "/api/inventory/cleanup", cookie=cookie)[0], 403)
+        self.assertEqual(self._database_state_snapshot(), before)
+        self.assertEqual(_request(port, "POST", "/api/inventory/import.commit", body, cookie)[0], 200)
+        with self.factory.begin() as session:
+            session.scalar(select(MembershipModel).where(MembershipModel.organization_id == org)).status = "disabled"
+        before = self._database_state_snapshot()
+        self.assertEqual(_request(port, "POST", "/api/inventory/import.commit", body, cookie)[0], 401)
+        self.assertEqual(self._database_state_snapshot(), before)
 
     @isolated_database_inserts
     def test_multilingual_http_inventory_event_csv_round_trip(self):

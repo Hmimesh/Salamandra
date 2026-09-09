@@ -43,8 +43,8 @@ pnpm qa:browser
 The command builds the production frontend before starting the disposable test
 server. Automated coverage includes 360px mobile, 768px tablet, 1280px desktop,
 and 1440px wide layouts. A fifth project emulates a 1280x900 browser at 200% zoom
-using 640x450 CSS pixels and device scale factor 2. Every project runs all ten
-scenarios (50 tests, no intentional skips): navigation links, focus trapping and
+using 640x450 CSS pixels and device scale factor 2. Every project runs all eleven
+scenarios (55 tests, no retries or intentional skips): navigation links, focus trapping and
 restoration, Escape handling, manual planning and crew assignment, kit creation,
 preset and custom inventory, dependency selection, account popovers, calendar
 overflow, cancellation/delete confirmations, CSV mapping and import, and appearance.

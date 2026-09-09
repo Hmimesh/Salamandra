@@ -23,8 +23,17 @@ async function signIn(page: Page, email = "owner@playwright.test") {
   await expect(page).toHaveURL(/\/$/);
   await expect(page.getByRole("main").getByRole("heading").first()).toBeVisible();
   await page.goto("/settings");
-  await activate(page.getByRole("button", { name: "light", exact: true }));
-  await page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption("comfortable");
+  // A database-backed fixture exposes overlap: finish each reset before sending the next.
+  await Promise.all([
+    page.waitForResponse(response => response.url().endsWith("/api/account/preferences") && response.status() === 200),
+    activate(page.getByRole("button", { name: "light", exact: true })),
+  ]);
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await Promise.all([
+    page.waitForResponse(response => response.url().endsWith("/api/account/preferences") && response.status() === 200),
+    page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption("comfortable"),
+  ]);
+  await expect(page.locator("html")).toHaveAttribute("data-font-scale", "comfortable");
   await activate(page.getByRole("button", { name: "Comfortable", exact: true }));
   await expect(page.locator("html")).toHaveAttribute("data-font-scale", "comfortable");
   await expect(page.locator("html")).toHaveAttribute("data-density", "comfortable");
@@ -363,6 +372,68 @@ test("compact text retains the operator floor without losing dense layout", asyn
   await expect(page.getByRole("dialog")).toBeHidden();
 });
 
+test("multilingual import wizard reconciles categories duplicates and cleanup", async ({ page }, testInfo) => {
+  const errors = watchErrors(page);
+  const suffix = testInfo.project.name;
+  await signIn(page, `owner@phase-b-${suffix}.test`);
+  const itemId = `review-ev-${suffix}`;
+  const seeded = await page.request.post("/api/inventory/items", { data: {
+    id: itemId, display_name: `EV ZLX-15P ${suffix}`, type: "pa", manufacturer: "Electro-Voice", model: "ZLX-15P", amount: 4, scope: "shared",
+  } });
+  expect(seeded.status()).toBe(200);
+  const custom = `אירוח ${suffix}`;
+  const csv = ["שם,כמות,סוג,יצרן,דגם,נוסף,הערות",
+    `Electro Voice ZLX 15P ${suffix},2,רמקולים,Electro-Voice,ZLX-15P,ignored,במה`,
+    `ميكروفون ${suffix},1,ميكروفونات,,,ignored,عرض موسيقي`,
+    `Câble ${suffix},3,cable,,,ignored,Café`,
+    `Custom ${suffix},1,${custom},,,ignored,خاص`,
+    `Bad quantity ${suffix},wrong,cable,,,ignored,fix later`,
+    `=Formula ${suffix},1,furniture,,,ignored,=1+1`,
+    `EV ZLX-12P ${suffix},1,speaker,Electro-Voice,ZLX-12P,ignored,different model`,
+  ].join("\n");
+  await page.goto("/settings");
+  await page.locator('input[type="file"]').setInputFiles({ name: "multilingual.csv", mimeType: "text/csv", buffer: Buffer.from(csv, "utf8") });
+  const dialog = page.getByRole("dialog", { name: "Review inventory import" });
+  await expect(dialog.getByLabel("Item name")).toHaveValue("שם");
+  await expect(dialog.getByLabel("Quantity")).toHaveValue("כמות");
+  await activate(dialog.getByRole("button", { name: "Continue", exact: true }));
+  await dialog.getByRole("combobox", { name: `Map ${custom}`, exact: true }).selectOption("custom");
+  await dialog.getByLabel("New category name").fill(custom);
+  await dialog.locator(".import-review-row").filter({ has: page.getByRole("combobox", { name: `Map ${custom}`, exact: true }) }).getByRole("checkbox").check();
+  await activate(dialog.getByRole("button", { name: "Continue", exact: true }));
+  await dialog.getByRole("combobox", { name: "Decision for row 1", exact: true }).selectOption({ label: `Add quantity to EV ZLX-15P ${suffix}` });
+  await dialog.getByRole("combobox", { name: "Decision for row 5", exact: true }).selectOption("skip");
+  await expect(dialog.getByRole("combobox", { name: "Decision for row 7", exact: true })).toHaveValue("new");
+  await activate(dialog.getByRole("button", { name: "Continue", exact: true }));
+  await expect(dialog.getByRole("heading", { name: "Confirm import", exact: true })).toBeFocused();
+  await expect(dialog.getByRole("button", { name: "Import inventory", exact: true })).toBeEnabled();
+  await expectNoViewportOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("import-final-preview.png"), fullPage: true });
+  await activate(dialog.getByRole("button", { name: "Back", exact: true }));
+  await expect(dialog.getByRole("combobox", { name: "Decision for row 1", exact: true })).not.toHaveValue("new");
+  await activate(dialog.getByRole("button", { name: "Continue", exact: true }));
+  await activate(dialog.getByRole("button", { name: "Import inventory", exact: true }));
+  await expect(dialog).toBeHidden();
+  const state = await (await page.request.get("/api/state")).json();
+  expect(state.inventory.items.find((item: { id: string }) => item.id === itemId).count).toBe(6);
+  const exported = await (await page.request.get("/api/inventory/export.csv")).text();
+  expect(exported).toContain(`ميكروفون ${suffix}`);
+  expect(exported).toContain(`Câble ${suffix}`);
+  expect(exported).toContain("'=1+1");
+  await page.goto("/inventory/cleanup");
+  await expect(page.getByRole("heading", { name: "Product details" })).toBeVisible();
+  await expectNoViewportOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("inventory-cleanup.png"), fullPage: true });
+  await page.getByLabel("Search product details").fill(`Câble ${suffix}`);
+  await activate(page.getByRole("link", { name: `Edit Câble ${suffix}` }));
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await expect(page.getByLabel("Item name", { exact: true })).toHaveValue(`Câble ${suffix}`);
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toBeHidden();
+  await expectNoViewportOverflow(page);
+  expect(errors).toEqual([]);
+});
+
 test("CSV mapping and appearance controls are keyboard reachable", async ({ page }, testInfo) => {
   const errors = watchErrors(page);
   await signIn(page);
@@ -391,6 +462,11 @@ test("CSV mapping and appearance controls are keyboard reachable", async ({ page
   await dialog.getByLabel("Category").selectOption("Kind");
   await expect(dialog.getByText(`QA CSV ${testInfo.project.name} stand`, { exact: true })).toBeVisible();
   await expectNoViewportOverflow(page);
+  await activate(dialog.getByRole("button", { name: "Continue", exact: true }));
+  await expect(dialog.getByRole("heading", { name: "Review categories", exact: true })).toBeVisible();
+  await activate(dialog.getByRole("button", { name: "Continue", exact: true }));
+  await expect(dialog.getByRole("heading", { name: "Review duplicates", exact: true })).toBeVisible();
+  await activate(dialog.getByRole("button", { name: "Continue", exact: true }));
   await activate(dialog.getByRole("button", { name: "Import inventory", exact: true }));
   await expect(dialog).toBeHidden();
   await page.goto("/inventory");
