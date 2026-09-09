@@ -12,6 +12,7 @@ class Permission(StrEnum):
     INVENTORY_DEFINITION_MANAGE = "inventory.definition.manage"
     INVENTORY_EXPORT = "inventory.export"
     INVENTORY_IMPORT = "inventory.import"
+    INVENTORY_CLEAR = "inventory.clear"
     ITEM_CLASSES_MANAGE = "item_classes.manage"
     CATALOG_MANAGE = "catalog.manage"
     EVENTS_PLAN = "events.plan"
@@ -32,7 +33,7 @@ ALL_PERMISSIONS = frozenset(Permission)
 
 ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
     "owner": ALL_PERMISSIONS,
-    "admin": ALL_PERMISSIONS,
+    "admin": ALL_PERMISSIONS - {Permission.INVENTORY_CLEAR},
     "producer": frozenset(
         {
             Permission.STATE_READ,

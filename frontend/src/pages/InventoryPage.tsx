@@ -17,12 +17,14 @@ import { useWorkspace } from "../context/WorkspaceContext";
 import { titleCase } from "../lib/format";
 import type { InventoryItem, InventoryScope, ItemClass } from "../types";
 import { normalizeSearch } from "../lib/catalog";
+import { ClearInventoryAction } from "../components/ClearInventoryAction";
 
-type ItemAction = "remove";
+type ItemAction = "remove" | "archive";
 
 const itemTypes = ["speaker", "powered_speaker", "monitor", "vehicle", "hospitality", "site", "mixer", "pa", "microphone", "lighting", "power", "rigging", "video", "di", "backline", "stand", "cable", "case", "accessory", "furniture", "decor", "catering", "tool", "transport", "display", "barrier", "other"];
 
 function actionCopy(action: ItemAction) {
+  if (action === "archive") return { title: "Archive empty item", button: "Archive item", icon: Trash2 };
   return { title: "Remove stock", button: "Remove from inventory", icon: Minus };
 }
 
@@ -38,7 +40,7 @@ function dependencyRules(value: FormDataEntryValue | null) {
 }
 
 export function InventoryPage() {
-  const { state, mutate } = useWorkspace();
+  const { state, mutate, busy } = useWorkspace();
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const [scope, setScope] = useState<InventoryScope>("combined");
@@ -51,7 +53,7 @@ export function InventoryPage() {
   const [classEditor, setClassEditor] = useState<ItemClass | "new" | null>(null);
   const [deleteClass, setDeleteClass] = useState<ItemClass | null>(null);
   const [editItem, setEditItem] = useState<InventoryItem | null>(null);
-  const [action, setAction] = useState<{ type: ItemAction; item: InventoryItem } | null>(null);
+  const [action, setAction] = useState<{ type: ItemAction; item: InventoryItem; key: string } | null>(null);
   const inventory = state!.inventories[scope];
   const canManageDefinitions = ["owner", "admin", "operator"].includes(state!.auth.user!.role);
   const itemClasses = state!.item_classes.classes;
@@ -162,11 +164,15 @@ export function InventoryPage() {
 
   async function runAction(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!action) return;
+    if (!action || busy) return;
     const form = new FormData(event.currentTarget);
     try {
-      await mutate("/api/inventory/remove", { item_id: action.item.id, amount: Number(form.get("amount") || 1), scope: actionScope(action.item) }, { success: `${titleCase(action.item.id)} updated.` });
+      await mutate(`/api/inventory/${action.type}`, { item_id: action.item.id, amount: Number(form.get("amount") || 1), scope: actionScope(action.item), idempotency_key: action.key, reason: String(form.get("reason") || "Empty definition archived") }, { refresh: true, success: `${action.item.display_name || titleCase(action.item.id)} updated.` });
       setAction(null);
+      requestAnimationFrame(() => {
+        // An archived row no longer has a trigger for the dialog to restore focus to.
+        if (document.activeElement === document.body) document.querySelector<HTMLButtonElement>(".inventory-toolbar button.active")?.focus();
+      });
     } catch {
       // The workspace provider reports the API message.
     }
@@ -211,7 +217,8 @@ export function InventoryPage() {
         {filtered.length ? <div className="table-scroll"><table className="operations-table inventory-table"><thead><tr><th>Gear</th><th>Class</th><th>Available</th><th>Out</th><th>Linked needs</th><th>Status</th><th>Actions</th></tr></thead><tbody>{filtered.map((item) => {
           const reserved = state!.events.active_reservations[item.id] || 0;
           const status = item.count === 0 ? "Out of stock" : reserved ? "Planned" : "Ready";
-          return <tr key={item.id}><td><div className="item-name"><span className={`category-icon type-${item.type}`}>{item.id.slice(0, 1).toUpperCase()}</span><span><strong dir="auto">{item.display_name || titleCase(item.id)}</strong><small dir="auto">{[item.manufacturer, item.model, item.info].filter(Boolean).join(" · ") || "No equipment note"}</small></span>{item.info ? <span className="info-tooltip" title={item.info}><Info size={15} /></span> : null}</div></td><td><strong>{item.class_id ? titleCase(item.class_id) : titleCase(item.type)}</strong><small>{item.weight_kg ? `${item.weight_kg} kg · ${titleCase(item.condition)}` : titleCase(item.condition)}</small></td><td><strong>{item.count}</strong>{reserved ? <small>{reserved} planned across events</small> : null}</td><td>{item.in_use_count}</td><td>{item.requirements.length ? item.requirements.map((need) => `${need.amount}x ${titleCase(need.item_id)}`).join(", ") : "By class"}</td><td><span className={`stock-status stock-${status.toLowerCase().replaceAll(" ", "-")}`}>{status}</span></td><td><div className="row-actions">{canManageDefinitions ? <button className="icon-button" title="Edit equipment" aria-label={`Edit ${item.id}`} onClick={() => setEditItem(item)}><Pencil size={16} /></button> : null}<button className="icon-button danger-icon" title="Remove stock" aria-label={`Remove ${item.id}`} disabled={item.count < 1} onClick={() => setAction({ type: "remove", item })}><Minus size={17} /></button></div></td></tr>;
+          const sourceItem = state!.inventories[actionScope(item)].items.find(candidate => candidate.id === item.id)!;
+          return <tr key={item.id}><td><div className="item-name"><span className={`category-icon type-${item.type}`}>{item.id.slice(0, 1).toUpperCase()}</span><span><strong dir="auto">{item.display_name || titleCase(item.id)}</strong><small dir="auto">{[item.manufacturer, item.model, item.info].filter(Boolean).join(" · ") || "No equipment note"}</small></span>{item.info ? <span className="info-tooltip" title={item.info}><Info size={15} /></span> : null}</div></td><td><strong>{item.class_id ? titleCase(item.class_id) : titleCase(item.type)}</strong><small>{item.weight_kg ? `${item.weight_kg} kg · ${titleCase(item.condition)}` : titleCase(item.condition)}</small></td><td><strong>{item.count}</strong>{reserved ? <small>{reserved} planned across events</small> : null}</td><td>{item.in_use_count}</td><td>{item.requirements.length ? item.requirements.map((need) => `${need.amount}x ${titleCase(need.item_id)}`).join(", ") : "By class"}</td><td><span className={`stock-status stock-${status.toLowerCase().replaceAll(" ", "-")}`}>{status}</span></td><td><div className="row-actions">{canManageDefinitions ? <button className="icon-button" title="Edit equipment" aria-label={`Edit ${item.id}`} onClick={() => setEditItem(item)}><Pencil size={16} /></button> : null}<button className="icon-button danger-icon" title={sourceItem.count ? "Remove stock" : "Archive empty item"} aria-label={`${sourceItem.count ? "Remove" : "Archive"} ${item.id}`} disabled={!canManageDefinitions && (actionScope(item) !== "personal" || !["producer", "technician", "freelancer"].includes(state!.auth.user!.role))} onClick={() => setAction({ type: sourceItem.count ? "remove" : "archive", item: sourceItem, key: crypto.randomUUID() })}>{sourceItem.count ? <Minus size={17} /> : <Trash2 size={17} />}</button></div></td></tr>;
         })}</tbody></table></div> : <EmptyState title={inventory.summary.unique_items ? "No matching items" : "Your inventory is empty"} message={inventory.summary.unique_items ? "Change the filters or add an item to this inventory." : "Add an item manually, start from the catalog, or import an inventory CSV."} action={<div className="empty-actions"><button className="button button-primary" onClick={() => setAddOpen(true)}>Add inventory</button><button className="button button-secondary" onClick={() => navigate("/settings")}>Import CSV</button></div>} />}
       </section>
 
@@ -241,8 +248,9 @@ export function InventoryPage() {
         <p className="confirm-copy">Existing inventory keeps its data, but automatic planning will no longer be able to resolve this class.</p><div className="modal-actions"><button className="button button-secondary" onClick={() => setDeleteClass(null)}>Cancel</button><button className="button button-danger" onClick={() => void removeItemClass()}>Remove class</button></div>
       </Modal>
 
-      <Modal open={Boolean(action)} title={actionDetails?.title || "Update gear"} description={action ? titleCase(action.item.id) : undefined} onClose={() => setAction(null)} size="sm">
-        {action && actionDetails && ActionIcon ? <form className="form-stack" onSubmit={runAction}><div className="action-summary"><ActionIcon size={22} /><span><strong>{actionDetails.button}</strong><small>{action.item.count} currently available</small></span></div><label>Quantity<input name="amount" type="number" min="1" max={action.item.count} defaultValue="1" required /></label><div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => setAction(null)}>Cancel</button><button className="button button-danger" type="submit">{actionDetails.button}</button></div></form> : null}
+      <ClearInventoryAction />
+      <Modal open={Boolean(action)} title={actionDetails?.title || "Update gear"} description={action ? `${action.item.display_name || titleCase(action.item.id)} · ${actionScope(action.item) === "shared" ? "Shared inventory" : "My inventory"}` : undefined} onClose={() => { if (!busy) setAction(null); }} size="sm">
+        {action && actionDetails && ActionIcon ? <form className="form-stack" onSubmit={runAction} onChange={() => setAction({ ...action, key: crypto.randomUUID() })}><div className="action-summary"><ActionIcon size={22} /><span><strong>{actionDetails.button}</strong><small>{action.item.count} currently available</small></span></div><p>History is preserved. Removing the last unit archives the definition when no active dependency prevents it.</p>{action.type === "remove" ? <><label>Quantity<input name="amount" type="number" min="1" max={action.item.count} defaultValue="1" required disabled={busy} /></label><label>Reason<input name="reason" required maxLength={500} disabled={busy} /></label></> : null}<div className="modal-actions"><button className="button button-secondary" type="button" disabled={busy} onClick={() => setAction(null)}>Cancel</button><button className="button button-danger" type="submit" disabled={busy}>{actionDetails.button}</button></div></form> : null}
       </Modal>
     </div>
   );

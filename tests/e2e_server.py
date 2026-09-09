@@ -21,7 +21,7 @@ from server import SalamandraServer
 from web_config import WebConfig
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
-from database import Base
+from database import Base, InventoryHoldingModel
 from postgres_runtime import PostgresRuntime
 
 
@@ -45,6 +45,20 @@ def handler_for(data_dir: Path, port: int):
     if owner is None:
         raise RuntimeError("Could not create the Playwright account fixture.")
     for viewport in ("mobile-360", "tablet-768", "desktop-1280", "wide-1440", "desktop-200-percent"):
+        accounts.create_user(
+            name="Clear Owner", email=f"owner@phase-b5-{viewport}.test",
+            password="playwright-password", role="owner",
+            organization_id=f"clear-{viewport}", organization_name=f"Clear {viewport}",
+        )
+        accounts.create_user(
+            name="Clear Admin", email=f"admin@phase-b5-{viewport}.test",
+            password="playwright-password", role="admin",
+            organization_id=f"clear-{viewport}", organization_name=f"Clear {viewport}",
+        )
+        with runtime.factory.begin() as session:
+            session.add(InventoryHoldingModel(organization_id=f"clear-{viewport}",
+                                              legacy_item_id="empty-case", scope="shared",
+                                              active=True, data={"id": "empty-case", "type": "other"}))
         accounts.create_user(
             name="Import Owner", email=f"owner@phase-b-{viewport}.test",
             password="playwright-password", role="owner",

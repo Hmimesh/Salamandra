@@ -1520,6 +1520,171 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         self.assertEqual((rollback_requests, rollback_events), (0, 0))
         _request(first_port, "POST", "/api/auth/signout", {}, cookie)
 
+    @race_required
+    @isolated_database_inserts
+    def test_clear_inventory_two_process_duplicate_is_one_ledger_command(self):
+        org, cookie, _, _ = self._reviewed_import_fixture()
+        status, preview, _ = _request(self.ports[0], "GET", "/api/inventory/clear.preview", cookie=cookie)
+        self.assertEqual(status, 200, preview)
+        body = {"confirmation": "CLEAR INVENTORY", "preview_token": preview["preview_token"], "idempotency_key": uuid4().hex}
+        barrier, results = threading.Barrier(3), []
+        def send(port):
+            barrier.wait(timeout=10)
+            results.append(_request(port, "POST", "/api/inventory/clear", body, cookie))
+        workers = [threading.Thread(target=send, args=(port,)) for port in self.ports]
+        try:
+            with self.factory.begin() as session:
+                session.scalar(select(OrganizationModel).where(OrganizationModel.id == org).with_for_update())
+                for worker in workers:
+                    worker.start()
+                barrier.wait(timeout=10)
+                deadline, waiting = time.monotonic() + 5, 0
+                while time.monotonic() < deadline:
+                    with self.factory() as observer:
+                        waiting = observer.scalar(text("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'"))
+                    if waiting >= 2:
+                        break
+                    time.sleep(.02)
+                self.assertGreaterEqual(waiting, 2, "Both processes must contend on the real organization lock")
+        finally:
+            for worker in workers:
+                if worker.ident is not None:
+                    worker.join(timeout=15)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual([row[0] for row in results], [200, 200], results)
+        self.assertEqual(results[0][1], results[1][1])
+        with self.factory() as session:
+            holding = session.scalar(select(InventoryHoldingModel).where(InventoryHoldingModel.organization_id == org))
+            self.assertEqual((holding.active, holding.available_quantity, holding.reserved_quantity, holding.packed_quantity, holding.dispatched_quantity), (False, 0, 0, 0, 0))
+            self.assertEqual(session.scalar(select(func.count()).select_from(InventoryAdjustmentModel).where(InventoryAdjustmentModel.organization_id == org, InventoryAdjustmentModel.operation == "inventory.clear")), 1)
+            self.assertEqual(session.scalar(select(func.sum(InventoryAdjustmentModel.delta)).where(InventoryAdjustmentModel.organization_id == org)), 0)
+            self.assertEqual(session.scalar(select(func.count()).select_from(OperationRequestModel).where(OperationRequestModel.organization_id == org, OperationRequestModel.operation == "inventory.clear")), 1)
+            self.assertEqual(session.scalar(select(func.count()).select_from(AuditEventModel).where(AuditEventModel.organization_id == org, AuditEventModel.action == "inventory.clear")), 1)
+        before = self._database_state_snapshot()
+        self.assertEqual(_request(self.ports[0], "POST", "/api/inventory/clear", {**body, "preview_token": "conflicting"}, cookie)[0], 409)
+        self.assertEqual(self._database_state_snapshot(), before)
+
+    @race_required
+    @isolated_database_inserts
+    def test_clear_inventory_waits_for_reservation_and_rejects_atomically(self):
+        org, cookie, _, item = self._reviewed_import_fixture()
+        preview = _request(self.ports[0], "GET", "/api/inventory/clear.preview", cookie=cookie)[1]
+        body = {"confirmation": "CLEAR INVENTORY", "preview_token": preview["preview_token"], "idempotency_key": uuid4().hex}
+        event_id = uuid4().hex
+        with self.factory.begin() as session:
+            member = session.scalar(select(MembershipModel).where(MembershipModel.organization_id == org))
+            member_id = member.id
+            session.add(EventModel(id=event_id, organization_id=org, owner_user_id=member.user_id, title="Clear reservation race", status="planning", data={
+                "plan_verified": True, "plan": {"lines": [{"item_id": item["id"], "amount": 1, "missing": 0}]}, "conflicts": [], "history": [],
+            }))
+        results = []
+        worker = threading.Thread(target=lambda: results.append(_request(self.ports[0], "POST", "/api/inventory/clear", body, cookie)))
+        try:
+            with self.factory.begin() as session:
+                TransactionalEventOperations(self.factory).transition_in_session(session, org, event_id, "confirmed", member_id, "clear-reservation-race")
+                session.flush()
+                worker.start()
+                deadline, waiting = time.monotonic() + 5, 0
+                while time.monotonic() < deadline:
+                    with self.factory() as observer:
+                        waiting = observer.scalar(text("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query ILIKE '%inventory_holdings%'"))
+                    if waiting:
+                        break
+                    time.sleep(.02)
+                self.assertGreaterEqual(waiting, 1)
+                self.assertEqual(results, [])
+        finally:
+            if worker.ident is not None:
+                worker.join(timeout=15)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results[0][0], 409, results)
+        with self.factory() as session:
+            holding = session.scalar(select(InventoryHoldingModel).where(InventoryHoldingModel.organization_id == org))
+            self.assertEqual((holding.active, holding.available_quantity, holding.reserved_quantity), (True, 3, 1))
+            self.assertEqual(session.scalar(select(func.count()).select_from(OperationRequestModel).where(OperationRequestModel.organization_id == org, OperationRequestModel.operation == "inventory.clear")), 0)
+        for status in ("confirmed", "packed", "out"):
+            if status != "confirmed":
+                result = _request(self.ports[0], "POST", "/api/events/status", {"event_id": event_id, "status": status}, cookie)
+                self.assertEqual(result[0], 200, result)
+            preview = _request(self.ports[0], "GET", "/api/inventory/clear.preview", cookie=cookie)[1]
+            self.assertTrue(preview["blocked"])
+            before = self._database_state_snapshot()
+            self.assertEqual(_request(self.ports[0], "POST", "/api/inventory/clear", {**body, "preview_token": preview["preview_token"]}, cookie)[0], 409)
+            self.assertEqual(self._database_state_snapshot(), before)
+
+        self.assertEqual(_request(self.ports[0], "POST", "/api/events/status", {"event_id": event_id, "status": "returned"}, cookie)[0], 200)
+        preview = _request(self.ports[0], "GET", "/api/inventory/clear.preview", cookie=cookie)[1]
+        before = self._database_state_snapshot()
+        self.assertEqual(_request(self.ports[0], "POST", "/api/inventory/clear", {**body, "preview_token": preview["preview_token"]}, cookie)[0], 200)
+        after = self._database_state_snapshot()
+        mutable = {model.__tablename__ for model in (InventoryHoldingModel, InventoryAdjustmentModel, AuditEventModel, OperationRequestModel)}
+        for table in before.keys() - mutable:
+            self.assertEqual(after[table], before[table], f"Clear changed preserved table {table}")
+        for model in (InventoryAdjustmentModel, AuditEventModel, OperationRequestModel):
+            old_rows, new_rows = json.loads(before[model.__tablename__]), json.loads(after[model.__tablename__])
+            self.assertTrue(all(row in new_rows for row in old_rows), f"Clear rewrote {model.__tablename__} history")
+
+    @isolated_database_inserts
+    def test_inventory_clear_http_authorization_dependencies_and_scope(self):
+        org, cookie, _, _ = self._reviewed_import_fixture()
+        other_org, other_cookie, _, _ = self._reviewed_import_fixture()
+        port = self.ports[0]
+        preview = _request(port, "GET", "/api/inventory/clear.preview", cookie=cookie)[1]
+        body = {"confirmation": "CLEAR INVENTORY", "preview_token": preview["preview_token"], "idempotency_key": uuid4().hex}
+        before = self._database_state_snapshot()
+        self.assertEqual(_request(port, "POST", "/api/inventory/clear", body)[0], 401)
+        self.assertEqual(_request(port, "GET", "/api/inventory/clear.preview")[0], 401)
+        self.assertEqual(_request(port, "POST", "/api/inventory/clear", {**body, "organization_id": org}, other_cookie)[0], 409)
+        self.assertEqual(self._database_state_snapshot(), before)
+        for role in ("admin", "producer", "technician"):
+            with self.factory.begin() as session:
+                session.scalar(select(MembershipModel).where(MembershipModel.organization_id == org)).role = role
+            before = self._database_state_snapshot()
+            self.assertEqual(_request(port, "POST", "/api/inventory/clear", {**body, "role": "owner"}, cookie)[0], 403)
+            self.assertEqual(_request(port, "GET", "/api/inventory/clear.preview", cookie=cookie)[0], 403)
+            self.assertEqual(self._database_state_snapshot(), before)
+        with self.factory.begin() as session:
+            session.scalar(select(MembershipModel).where(MembershipModel.organization_id == org)).role = "owner"
+        self._dependency_item(cookie, "dependent", [{"item_id": "sm58", "amount": 1}], "personal")
+        preview = _request(port, "GET", "/api/inventory/clear.preview", cookie=cookie)[1]
+        self.assertTrue(preview["blocked"])
+        before = self._database_state_snapshot()
+        self.assertEqual(_request(port, "POST", "/api/inventory/clear", {**body, "preview_token": preview["preview_token"]}, cookie)[0], 409)
+        self.assertEqual(self._database_state_snapshot(), before)
+        # Remove the personal dependent using its own ledger command; clear can then proceed.
+        self.assertEqual(_request(port, "POST", "/api/inventory/remove", {"item_id": "dependent", "amount": 1, "scope": "personal", "idempotency_key": uuid4().hex}, cookie)[0], 200)
+        self._dependency_item(cookie, "shared-dependent", [{"item_id": "sm58", "amount": 1}])
+        preview = _request(port, "GET", "/api/inventory/clear.preview", cookie=cookie)[1]
+        status, result, _ = _request(port, "POST", "/api/inventory/clear", {**body, "preview_token": preview["preview_token"]}, cookie)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["archived"], 2)
+        with self.factory() as session:
+            self.assertEqual(session.scalar(select(InventoryHoldingModel.available_quantity).where(InventoryHoldingModel.organization_id == other_org)), 4)
+
+    @isolated_database_inserts
+    def test_empty_inventory_archive_http_validates_identity_and_keeps_history(self):
+        org, cookie, _, _ = self._reviewed_import_fixture()
+        port = self.ports[0]
+        body = {"item_id": "sm58", "scope": "shared", "idempotency_key": uuid4().hex}
+        before = self._database_state_snapshot()
+        for item, expected in ((None, 400), ("bad\x00id", 400), ("UPPERCASE", 400), ("missing", 404)):
+            self.assertEqual(_request(port, "POST", "/api/inventory/archive", {**body, "item_id": item}, cookie)[0], expected)
+        self.assertEqual(_request(port, "POST", "/api/inventory/archive", body, cookie)[0], 409)
+        self.assertEqual(self._database_state_snapshot(), before)
+        # A legacy empty active definition is a valid archival target.
+        with self.factory.begin() as session:
+            holding = session.scalar(select(InventoryHoldingModel).where(InventoryHoldingModel.organization_id == org))
+            holding.available_quantity = 0
+        status, result, _ = _request(port, "POST", "/api/inventory/archive", body, cookie)
+        self.assertEqual(status, 200, result)
+        before = self._database_state_snapshot()
+        self.assertEqual(_request(port, "POST", "/api/inventory/archive", body, cookie)[1], result)
+        self.assertEqual(self._database_state_snapshot(), before)
+        with self.factory() as session:
+            holding = session.scalar(select(InventoryHoldingModel).where(InventoryHoldingModel.organization_id == org))
+            self.assertFalse(holding.active)
+            self.assertEqual(session.scalar(select(func.count()).select_from(InventoryAdjustmentModel).where(InventoryAdjustmentModel.organization_id == org)), 1)
+
     def _reviewed_import_fixture(self):
         from postgres_runtime import PostgresRuntime
         port = self.ports[0]

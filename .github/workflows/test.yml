@@ -33,7 +33,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec playwright install chromium
       - name: Browser QA must exit successfully
-        timeout-minutes: 8
+        timeout-minutes: 10
         run: pnpm qa:browser
       - name: Verify fixture process and port were released
         if: always()

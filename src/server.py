@@ -170,6 +170,14 @@ class SalamandraServer(BaseHTTPRequestHandler):
             self.send_json({"canonical_types": list(CANONICAL_TYPES), "terms": self.catalog_terms(user)})
             return
 
+        if parsed_url.path == "/api/inventory/clear.preview":
+            user = self.require_user()
+            require_permission(user.role, Permission.INVENTORY_CLEAR)
+            if self.database_runtime is None:
+                raise StateConflict("Inventory clearing requires PostgreSQL.")
+            self.send_json(self.database_runtime.removals.preview(user.organization_id, user.id))
+            return
+
         if parsed_url.path == "/api/inventory/cleanup":
             user = self.require_user()
             require_permission(user.role, Permission.CATALOG_MANAGE)
@@ -408,6 +416,20 @@ class SalamandraServer(BaseHTTPRequestHandler):
                     return
                 self.save_workspace()
                 self.send_json({"state": self.state_payload(user)})
+                return
+
+            if parsed_url.path in {"/api/inventory/clear", "/api/inventory/archive"}:
+                clear = parsed_url.path.endswith("/clear")
+                if clear:
+                    require_permission(user.role, Permission.INVENTORY_CLEAR)
+                else:
+                    self.authorized_inventory_scope(body, user)
+                if self.database_runtime is None:
+                    raise StateConflict("Inventory archival requires PostgreSQL.")
+                result = self.database_runtime.removals.execute(
+                    user.organization_id, user.id, body, self.request_id(), clear=clear,
+                )
+                self.send_json(result)
                 return
 
             if parsed_url.path == "/api/inventory/remove":

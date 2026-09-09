@@ -399,6 +399,87 @@ test("compact text retains the operator floor without losing dense layout", asyn
   await expect(page.getByRole("dialog")).toBeHidden();
 });
 
+test("owner inventory removal and typed clear preserve private stock and retry safely", async ({ page }, testInfo) => {
+  const suffix = testInfo.project.name;
+  await signIn(page, `owner@phase-b5-${suffix}.test`);
+  for (const [id, amount, scope] of [["chairs", 4, "shared"], ["table", 1, "shared"], ["private-case", 2, "personal"], ["chairs", 9, "personal"]] as const) {
+    expect((await page.request.post("/api/inventory/items", { data: { id, amount, scope, type: "other" } })).status()).toBe(200);
+  }
+  await page.goto("/inventory");
+  await activate(page.getByRole("button", { name: "Remove chairs", exact: true }));
+  const remove = page.getByRole("dialog", { name: "Remove stock", exact: true });
+  await expect(remove.getByLabel("Quantity")).toHaveAttribute("max", "4");
+  await expect(remove).toContainText("Shared inventory");
+  await remove.getByLabel("Quantity").fill("2");
+  await remove.getByLabel("Reason").fill("Retired test stock");
+  await activate(remove.getByRole("button", { name: "Remove from inventory", exact: true }));
+  await expect(remove).toBeHidden();
+  await expect(page.getByRole("button", { name: "Remove chairs", exact: true })).toBeFocused();
+  let state = await (await page.request.get("/api/state")).json();
+  expect(state.inventories.shared.items.find((item: { id: string }) => item.id === "chairs").count).toBe(2);
+  await activate(page.getByRole("button", { name: "Remove table", exact: true }));
+  await remove.getByLabel("Reason").fill("Retire last unit");
+  await activate(remove.getByRole("button", { name: "Remove from inventory", exact: true }));
+  await expect(remove).toBeHidden();
+  await expect(page.getByRole("button", { name: "Remove table", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "All inventory", exact: true })).toBeFocused();
+  await activate(page.getByRole("button", { name: "Archive empty-case", exact: true }));
+  const archive = page.getByRole("dialog", { name: "Archive empty item", exact: true });
+  await activate(archive.getByRole("button", { name: "Archive item", exact: true }));
+  await expect(archive).toBeHidden();
+  await expect(page.getByRole("button", { name: "Archive empty-case", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "All inventory", exact: true })).toBeFocused();
+  const trigger = page.getByRole("button", { name: "Clear active inventory", exact: true });
+  await activate(trigger);
+  const dialog = page.getByRole("dialog", { name: "Clear active inventory?", exact: true });
+  await expect(dialog.getByLabel("Type CLEAR INVENTORY")).toBeEnabled();
+  await expect(dialog.locator("dl")).toContainText("Definitions to archive1");
+  await expect(dialog.locator("dl")).toContainText("Available units to remove2");
+  await dialog.getByLabel("Type CLEAR INVENTORY").fill("wrong");
+  await expect(dialog.getByRole("button", { name: "Clear shared inventory", exact: true })).toBeDisabled();
+  await page.keyboard.press("Escape");
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
+  await page.goto("/settings");
+  await savePreference(page, () => activate(page.getByRole("button", { name: "dark", exact: true })));
+  await savePreference(page, () => page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption("large"));
+  await page.goto("/inventory");
+  await activate(trigger);
+  await dialog.getByLabel("Type CLEAR INVENTORY").fill("CLEAR INVENTORY");
+  const submit = dialog.getByRole("button", { name: "Clear shared inventory", exact: true });
+  await submit.focus();
+  await page.keyboard.press("Tab");
+  await expect(dialog.getByRole("button", { name: "Close dialog", exact: true })).toBeFocused();
+  await page.keyboard.press("Shift+Tab");
+  await expect(submit).toBeFocused();
+  await expectNoViewportOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("clear-inventory-confirmation.png"), fullPage: true });
+  const keys: string[] = [];
+  await page.route("**/api/inventory/clear", async route => {
+    keys.push(route.request().postDataJSON().idempotency_key);
+    const response = await route.fetch();
+    expect(response.status()).toBe(200);
+    if (keys.length === 1) await route.fulfill({ status: 200, contentType: "application/json", body: "unreadable-response" });
+    else await route.fulfill({ response });
+  });
+  await activate(submit);
+  await expect(dialog.getByRole("alert")).toBeVisible();
+  await activate(submit);
+  await expect(dialog).toBeHidden();
+  await expect(trigger).toBeFocused();
+  expect(keys).toHaveLength(2);
+  expect(keys[0]).toBe(keys[1]);
+  state = await (await page.request.get("/api/state")).json();
+  expect(state.inventories.shared.items).toHaveLength(0);
+  expect(state.inventories.personal.items.find((item: { id: string }) => item.id === "private-case").count).toBe(2);
+  expect(state.inventories.personal.items.find((item: { id: string }) => item.id === "chairs").count).toBe(9);
+  await expectNoViewportOverflow(page);
+  expect((await page.request.post("/api/auth/signout", { data: {} })).status()).toBe(200);
+  await signIn(page, `admin@phase-b5-${suffix}.test`);
+  await page.goto("/inventory");
+  await expect(trigger).toHaveCount(0);
+});
+
 test("multilingual import wizard reconciles categories duplicates and cleanup", async ({ page }, testInfo) => {
   const errors = watchErrors(page);
   const suffix = testInfo.project.name;
