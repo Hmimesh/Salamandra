@@ -1,5 +1,5 @@
 import { AlertTriangle, CheckCircle2, Info, X } from "lucide-react";
-import { type ReactNode, useEffect, useId, useRef } from "react";
+import { type ReactNode, useLayoutEffect, useId, useRef } from "react";
 import { titleCase } from "../lib/format";
 import type { EventRecord, UserAccount } from "../types";
 
@@ -88,7 +88,7 @@ export function Modal({
   const closeHandler = useRef(onClose);
   closeHandler.current = onClose;
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!open) return;
     const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const panel = panelRef.current;

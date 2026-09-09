@@ -1,9 +1,29 @@
 import { expect, test as base, type Page, type Locator } from "@playwright/test";
+import { execFileSync } from "node:child_process";
 
 const test = base.extend<{ errorGuard: void }>({
-  errorGuard: [async ({ page }, use) => {
+  errorGuard: [async ({ page }, use, testInfo) => {
     const errors = watchErrors(page);
+    let active = 0, peak = 0, sent = 0;
+    const failures: { path: string; error: string | null }[] = [];
+    page.on("request", () => { sent++; active++; peak = Math.max(peak, active); });
+    page.on("requestfinished", () => { active--; });
+    page.on("requestfailed", request => { active--; failures.push({ path: new URL(request.url()).pathname, error: request.failure()?.errorText || null }); });
     await use();
+    if (errors.length || testInfo.status !== testInfo.expectedStatus) {
+      console.log("QA network summary", JSON.stringify({ sent, peak, active, failures }));
+      await testInfo.attach("network-summary", { body: JSON.stringify({ sent, peak, active, failures }), contentType: "application/json" });
+      if (process.platform === "win32" && errors.some(error => error.includes("ERR_NO_BUFFER_SPACE"))) {
+        try {
+          const output = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+            "Get-NetTCPConnection | Group-Object State | Select-Object Name,Count; netsh int ipv4 show dynamicport tcp; Get-Process chrome,python -ErrorAction SilentlyContinue | Select-Object ProcessName,Handles,WorkingSet64"], { timeout: 10000, windowsHide: true });
+          console.log("QA Windows socket diagnostics", output.toString("utf8"));
+          await testInfo.attach("windows-socket-diagnostics", { body: output, contentType: "text/plain" });
+        } catch (error) {
+          await testInfo.attach("windows-socket-diagnostics", { body: String(error), contentType: "text/plain" });
+        }
+      }
+    }
     expect(errors).toEqual([]);
   }, { auto: true }],
 });
@@ -12,6 +32,13 @@ async function activate(control: Locator) {
   await control.focus();
   await expect(control).toBeFocused();
   await control.press("Enter");
+}
+
+async function savePreference(page: Page, action: () => Promise<unknown>) {
+  await Promise.all([
+    page.waitForResponse(response => response.url().endsWith("/api/account/preferences") && response.status() === 200),
+    action(),
+  ]);
 }
 
 
@@ -34,7 +61,7 @@ async function signIn(page: Page, email = "owner@playwright.test") {
     page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption("comfortable"),
   ]);
   await expect(page.locator("html")).toHaveAttribute("data-font-scale", "comfortable");
-  await activate(page.getByRole("button", { name: "Comfortable", exact: true }));
+  await savePreference(page, () => activate(page.getByRole("button", { name: "Comfortable", exact: true })));
   await expect(page.locator("html")).toHaveAttribute("data-font-scale", "comfortable");
   await expect(page.locator("html")).toHaveAttribute("data-density", "comfortable");
 }
@@ -224,9 +251,9 @@ test("operational text scales in both themes and at 200 percent zoom", async ({ 
   for (const theme of ["light", "dark"] as const) {
     for (const [scale, pixels] of [["comfortable", 14], ["large", 15.75], ["largest", 17.5]] as const) {
       await page.goto("/settings");
-      await activate(page.getByRole("button", { name: theme, exact: true }));
+      await savePreference(page, () => activate(page.getByRole("button", { name: theme, exact: true })));
       await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
-      await page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption(scale);
+      await savePreference(page, () => page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption(scale));
       await expect(page.locator("html")).toHaveAttribute("data-font-scale", scale);
       await page.goto("/events/new");
       await activate(page.getByRole("button", { name: "Build manually" }));
@@ -321,7 +348,7 @@ test("compact text retains the operator floor without losing dense layout", asyn
   await page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption("compact");
   await expect(page.locator("html")).toHaveAttribute("data-font-scale", "compact");
   const comfortableGap = await page.locator(".settings-grid").evaluate((el) => parseFloat(getComputedStyle(el).gap));
-  await activate(page.getByRole("button", { name: "Compact", exact: true }));
+  await savePreference(page, () => activate(page.getByRole("button", { name: "Compact", exact: true })));
   await expect(page.locator("html")).toHaveAttribute("data-density", "compact");
   const compactGap = await page.locator(".settings-grid").evaluate((el) => parseFloat(getComputedStyle(el).gap));
   expect(compactGap).toBeLessThanOrEqual(comfortableGap - 4);
@@ -392,6 +419,8 @@ test("multilingual import wizard reconciles categories duplicates and cleanup", 
     `EV ZLX-12P ${suffix},1,speaker,Electro-Voice,ZLX-12P,ignored,different model`,
   ].join("\n");
   await page.goto("/settings");
+  const importButton = page.getByRole("button", { name: "Import to shared inventory", exact: true });
+  await importButton.focus();
   await page.locator('input[type="file"]').setInputFiles({ name: "multilingual.csv", mimeType: "text/csv", buffer: Buffer.from(csv, "utf8") });
   const dialog = page.getByRole("dialog", { name: "Review inventory import" });
   await expect(dialog.getByLabel("Item name")).toHaveValue("שם");
@@ -412,8 +441,22 @@ test("multilingual import wizard reconciles categories duplicates and cleanup", 
   await activate(dialog.getByRole("button", { name: "Back", exact: true }));
   await expect(dialog.getByRole("combobox", { name: "Decision for row 1", exact: true })).not.toHaveValue("new");
   await activate(dialog.getByRole("button", { name: "Continue", exact: true }));
+  const importKeys: string[] = [];
+  await page.route("**/api/inventory/import.commit", async route => {
+    importKeys.push(route.request().postDataJSON().idempotency_key);
+    const response = await route.fetch();
+    expect(response.status()).toBe(200);
+    // The first command commits, but its response is unreadable by the browser.
+    if (importKeys.length === 1) await route.fulfill({ status: 200, contentType: "application/json", body: "unreadable-response" });
+    else await route.fulfill({ response });
+  });
+  await activate(dialog.getByRole("button", { name: "Import inventory", exact: true }));
+  await expect(dialog.getByRole("alert")).toBeVisible();
   await activate(dialog.getByRole("button", { name: "Import inventory", exact: true }));
   await expect(dialog).toBeHidden();
+  expect(importKeys).toHaveLength(2);
+  expect(importKeys[1]).toBe(importKeys[0]);
+  await expect(importButton).toBeFocused();
   const state = await (await page.request.get("/api/state")).json();
   expect(state.inventory.items.find((item: { id: string }) => item.id === itemId).count).toBe(6);
   const exported = await (await page.request.get("/api/inventory/export.csv")).text();
@@ -444,11 +487,11 @@ test("CSV mapping and appearance controls are keyboard reachable", async ({ page
   });
   await expect(page.getByText("CSV must be UTF-8 encoded. Export as CSV UTF-8 and try again.")).toBeVisible();
   await expect(page.getByRole("dialog")).toBeHidden();
-  await activate(page.getByRole("button", { name: "dark" }));
+  await savePreference(page, () => activate(page.getByRole("button", { name: "dark" })));
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-  await page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption("largest");
+  await savePreference(page, () => page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption("largest"));
   await expect(page.locator("html")).toHaveAttribute("data-font-scale", "largest");
-  await activate(page.getByRole("button", { name: "Compact", exact: true }));
+  await savePreference(page, () => activate(page.getByRole("button", { name: "Compact", exact: true })));
   await expect(page.locator("html")).toHaveAttribute("data-density", "compact");
   await page.locator('input[type="file"]').setInputFiles({
     name: "inventory.csv",

@@ -14,7 +14,7 @@ const fields = [["name", "Item name"], ["count", "Quantity"], ["type", "Category
 const steps = ["Map columns", "Review categories", "Review duplicates", "Confirm import"];
 
 export function InventoryImportWizard({ csv, initial, onClose }: { csv: string; initial: ImportReview; onClose: () => void }) {
-  const { mutate } = useWorkspace();
+  const { mutate, refresh, notify } = useWorkspace();
   const [review, setReview] = useState(initial);
   const [mapping, setMapping] = useState(initial.suggested_mapping);
   const [choices, setChoices] = useState<Record<string, CategoryChoice>>({});
@@ -25,13 +25,17 @@ export function InventoryImportWizard({ csv, initial, onClose }: { csv: string; 
   const [error, setError] = useState("");
   const key = useRef(crypto.randomUUID());
   const heading = useRef<HTMLHeadingElement>(null);
+  const previousStep = useRef(step);
   const body = { csv, scope: "shared", column_mapping: mapping, category_choices: choices, decisions };
   const categoryRows = review.categories.slice(page * 25, (page + 1) * 25);
   const rows = review.rows.slice(page * 25, (page + 1) * 25);
   const totalPages = Math.ceil((step === 1 ? review.categories.length : review.rows.length) / 25);
 
   function changed() { key.current = crypto.randomUUID(); setError(""); }
-  useLayoutEffect(() => { heading.current?.focus(); }, [step]);
+  useLayoutEffect(() => {
+    if (previousStep.current !== step) heading.current?.focus();
+    previousStep.current = step;
+  }, [step]);
   function go(next: number) { setStep(next); setPage(0); }
   async function next() {
     setBusy(true); setError("");
@@ -46,7 +50,12 @@ export function InventoryImportWizard({ csv, initial, onClose }: { csv: string; 
   async function commit() {
     setBusy(true); setError("");
     try {
-      await mutate("/api/inventory/import.commit", { ...body, idempotency_key: key.current }, { refresh: true, success: "Inventory import completed." });
+      const result = await mutate("/api/inventory/import.commit", { ...body, idempotency_key: key.current });
+      if (typeof result.batch_id !== "string" || !Number.isInteger(result.imported)) {
+        throw new Error("Import confirmation could not be read. Retry without changing your choices.");
+      }
+      await refresh();
+      notify("Inventory import completed.");
       onClose();
     } catch (e) { setError(e instanceof Error ? e.message : "Import failed. Your stock was not partially imported."); }
     finally { setBusy(false); }
@@ -99,7 +108,7 @@ export function InventoryImportWizard({ csv, initial, onClose }: { csv: string; 
         <div className="import-table" tabIndex={0} aria-label="Final import preview"><table><thead><tr><th>Item</th><th>Quantity</th><th>Decision</th></tr></thead><tbody>{rows.map(row => <tr key={row.row}><td dir="auto">{row.name}</td><td>{row.quantity}</td><td>{row.action === "new" ? "Create" : titleCase(row.action)}{row.error ? <small>{row.error}</small> : null}</td></tr>)}</tbody></table></div>
       </> : null}
       {totalPages > 1 ? <nav className="import-pagination" aria-label="Review pages"><button className="icon-button" title="Previous page" aria-label="Previous page" disabled={!page} onClick={() => setPage(page - 1)}><ChevronLeft size={18} /></button><span>{page + 1} / {totalPages}</span><button className="icon-button" title="Next page" aria-label="Next page" disabled={page + 1 >= totalPages} onClick={() => setPage(page + 1)}><ChevronRight size={18} /></button></nav> : null}
-      <div className="modal-actions"><button className="button button-secondary" disabled={busy} onClick={onClose}>Cancel</button>{step > 0 ? <button className="button button-secondary" disabled={busy} onClick={() => { changed(); go(step - 1); }}><ArrowLeft size={16} />Back</button> : null}
+      <div className="modal-actions"><button className="button button-secondary" disabled={busy} onClick={onClose}>Cancel</button>{step > 0 ? <button className="button button-secondary" disabled={busy} onClick={() => go(step - 1)}><ArrowLeft size={16} />Back</button> : null}
         {step < 3 ? <button className="button button-primary" disabled={busy || !mapping.name || !mapping.count} onClick={() => void next()}>Continue<ArrowRight size={16} /></button> : <button className="button button-primary" disabled={busy || review.counts.unresolved > 0 || !(review.counts.create + review.counts.add)} onClick={() => void commit()}><Check size={16} />{busy ? "Importing..." : "Import inventory"}</button>}
       </div>
     </div>

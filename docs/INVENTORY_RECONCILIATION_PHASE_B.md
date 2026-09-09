@@ -17,6 +17,7 @@ Settings > Import to shared inventory opens the file chooser, then:
 
 Back remains available before commit. Every modification invalidates the previous
 request key; an unchanged failed request retains its key for an identical retry.
+Back/forward navigation alone does not replace that key.
 Cancel before committing writes nothing, including draft category/alias choices.
 The server reconstructs the plan on commit; the client cannot declare trusted totals.
 
@@ -26,6 +27,9 @@ columns and 4,096 characters per cell. Quantities are positive whole numbers up 
 mapping/upload. Structural quoting errors reject the file before any mutation.
 Condition values are ready/service/retired; unrecognized values require correcting
 the file or ignoring that optional column. Encoding conversion is not implemented.
+The existing HTTP API additionally caps the entire JSON request at 1,000,000 bytes,
+including escaped CSV and review decisions. This can require smaller batches before
+the parser's 2 MB file limit is reached; Phase B does not raise that production limit.
 
 Header suggestions use normalized built-in English, Hebrew and Arabic vocabulary,
 with selected Spanish quantity/name labels. All mappings can be overridden. Header
@@ -161,7 +165,43 @@ Local verification on Windows, 2026-09-09:
 - Synthetic 10,000-row/model-duplicate review: 0.884 seconds locally; serialized review
   was 12.4 MB. This is an observed local measurement, not an SLA. Large review responses
   remain a limitation; server-side paging is deferred. Only 25 rows render at once.
-- ERR_NO_BUFFER_SPACE did not recur. Fixture child exit was zero and port 4173 closed.
+- ERR_NO_BUFFER_SPACE did not recur locally. Fixture child exit was zero and port 4173 closed.
+
+Initial independent CI at 6b0e1a5 passed all PostgreSQL tests; one Linux job passed
+55/55 browser tests. Another Linux job exposed delayed dialog focus. Two Windows
+jobs each passed 54/55: one exposed overlapping preference writes in the test itself,
+the other a Winsock ERR_NO_BUFFER_SPACE failure on a lazy page-module request.
+These failed runs are retained, not converted into passes by retry configuration.
+
+Follow-up browser corrections:
+
+- Dialog initial focus now runs during layout, before newly shown controls can be
+  focused by the operator. Wizard heading focus runs only on step changes, preserving
+  the external launch control for focus restoration. The import test asserts this.
+- An unreadable successful import response does not close the wizard or claim a
+  confirmed import. The operator can retry the identical key; a browser fault-injection
+  test commits the first command, corrupts its response, retries and checks stock once.
+- Every tested preference change awaits its HTTP response, even if the requested
+  value already matches the visible DOM. No production preference behavior changed.
+- The test-only listener backlog is 64 instead of Python 3.12's default five, to
+  accommodate browser asset bursts. This is capacity hardening, not proof of the
+  original Windows failure's cause. Production listener configuration is unchanged.
+- Failed browser tests retain request counts/peak concurrency and failed resource
+  paths. A Windows buffer-space failure additionally captures socket-state counts,
+  dynamic TCP range and browser/Python handle/memory metrics. No tokens are captured.
+- Retries remain zero. Windows resource exhaustion remains an environment risk until
+  subsequent zero-retry runs and diagnostics establish reproducibility.
+
+Follow-up local verification: 183 Python tests passed again in 83.943 seconds,
+35 PostgreSQL-required and 15 race-required with zero skips. Full Windows browser QA
+passed 55/55 in 6.7 minutes. After the receipt-validation correction, all five
+multilingual lost-response/retry scenarios passed in 34.5 seconds. Three repeated
+tablet sign-out/page-module probes passed in 23.5 seconds without ERR_NO_BUFFER_SPACE.
+TypeScript and Vite passed again. No browser retry setting was enabled.
+
+Chromium maps Windows WSAENOBUFS to ERR_NO_BUFFER_SPACE; that code alone does not
+prove port exhaustion. See [Chromium's error mapping](https://chromium.googlesource.com/chromium/src/net/+/master/base/net_errors_win.cc)
+and [Microsoft's diagnostic guidance](https://learn.microsoft.com/en-us/troubleshoot/windows-client/networking/tcp-ip-port-exhaustion-troubleshooting).
 
 The Phase B PostgreSQL HTTP regressions are:
 
@@ -185,5 +225,6 @@ tests/test_inventory_reconciliation.py, this report.
 Updated: src/database.py, src/postgres_catalog.py, src/postgres_runtime.py,
 src/server.py, frontend/src/App.tsx, frontend/src/main.tsx,
 frontend/src/pages/InventoryPage.tsx, frontend/src/pages/SettingsPage.tsx,
+frontend/src/components/ui.tsx,
 tests/test_database_phase2.py, tests/test_postgres_api.py, tests/e2e_server.py,
 tests/e2e/operations.spec.ts, playwright.config.ts, docs/STAGING_CHECKLIST.md, generated web/ bundles.

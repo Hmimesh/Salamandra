@@ -101,13 +101,18 @@ def handler_for(data_dir: Path, port: int):
     return PlaywrightHandler
 
 
+class BrowserFixtureServer(ThreadingHTTPServer):
+    # Asset imports arrive in bursts; Python 3.12's default listen backlog is five.
+    request_queue_size = 64
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=4173)
     parser.add_argument("--parent-stdin", action="store_true")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="salamandra-playwright-") as directory:
-        server = ThreadingHTTPServer(
+        server = BrowserFixtureServer(
             ("127.0.0.1", args.port), handler_for(Path(directory), args.port)
         )
         worker = threading.Thread(target=server.serve_forever)
