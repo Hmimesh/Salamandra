@@ -158,6 +158,18 @@ class SalamandraServer(BaseHTTPRequestHandler):
             self.send_json(self.state_payload(user))
             return
 
+        if parsed_url.path == "/api/events/learning":
+            user = self.require_user()
+            require_permission(user.role, Permission.EVENTS_FEEDBACK_READ)
+            if self.database_runtime is None:
+                raise StateConflict("Event learning requires PostgreSQL.")
+            event_id = parse_qs(parsed_url.query).get("event_id", [""])[0]
+            if event_id:
+                self.send_json({"learning": self.database_runtime.get_event_learning(self.required_identifier(event_id, "event_id"), user)})
+            else:
+                self.send_json({"examples": self.database_runtime.learning_examples(user)})
+            return
+
         if parsed_url.path == "/api/inventory/export.csv":
             user = self.require_user()
             require_permission(user.role, Permission.INVENTORY_EXPORT)
@@ -247,6 +259,29 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 return
 
             user = self.require_user()
+
+            if parsed_url.path == "/api/events/feedback":
+                if self.database_runtime is None:
+                    raise StateConflict("Event feedback requires PostgreSQL.")
+                event_id = self.required_identifier(body.get("event_id"), "event_id")
+                key = self.operation_request_id(body)
+                expected = body.get("event_version")
+                expected_version = int(expected) if expected is not None else None
+                payload = {name: body.get(name) for name in ("missing", "unnecessary", "failed", "additional_onsite", "plan_fit", "reuse_plan", "notes", "items", "feedback_version") if name in body}
+                result = self.database_runtime.save_event_feedback(event_id, payload, user, self.correlation_id(), key, expected_version)
+                self.send_json(result)
+                return
+
+            if parsed_url.path == "/api/events/learning/eligibility":
+                if self.database_runtime is None:
+                    raise StateConflict("Event learning requires PostgreSQL.")
+                event_id = self.required_identifier(body.get("event_id"), "event_id")
+                if not isinstance(body.get("eligible"), bool):
+                    raise ValueError("Eligibility must be true or false.")
+                expected = body.get("event_version")
+                result = self.database_runtime.set_event_learning_eligibility(event_id, body["eligible"], str(body.get("reason", "")), user, self.correlation_id(), int(expected) if expected is not None else None, self.operation_request_id(body))
+                self.send_json({"learning": result})
+                return
 
             if parsed_url.path == "/api/inventory/items":
                 scope = self.authorized_inventory_scope(body, user)

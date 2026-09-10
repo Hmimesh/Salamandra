@@ -1423,6 +1423,9 @@ class TestAlembicMigration(unittest.TestCase):
         expected_tables = {
             "catalog_decisions",
             "catalog_terms",
+            "event_learning_records",
+            "event_feedback",
+            "event_feedback_items",
             "alembic_version",
             "organizations",
             "users",

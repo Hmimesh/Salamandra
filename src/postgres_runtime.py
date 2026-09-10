@@ -34,6 +34,7 @@ from database import (
     new_id,
     utc_now,
 )
+from event_learning import EventLearningStore
 from event_memory import EventRecord
 from integrations import DEFAULT_INTEGRATIONS, IntegrationStore
 from Inventory import Inventory
@@ -1022,6 +1023,7 @@ class PostgresRuntime:
         self.operations = TransactionalEventOperations(factory)
         self.event_details = TransactionalEventDetails(factory)
         self.kit_operations = TransactionalKitOperations(factory)
+        self.learning = EventLearningStore(factory)
 
     def create_session(self, user: UserAccount, max_age: int = 43_200) -> str:
         token = secrets.token_urlsafe(32)
@@ -1247,3 +1249,23 @@ class PostgresRuntime:
         if event is None:
             raise ResourceNotFound("Kit checkout event was not found.")
         return event, created
+
+    def get_event_learning(self, event_id: str, user: UserAccount) -> dict[str, Any]:
+        require_permission(user.role, Permission.EVENTS_FEEDBACK_READ)
+        return self.learning.get(user.organization_id, event_id)
+
+    def learning_examples(self, user: UserAccount, limit: int = 100) -> list[dict[str, Any]]:
+        require_permission(user.role, Permission.EVENTS_FEEDBACK_READ)
+        return self.learning.examples(user.organization_id, limit)
+
+    def save_event_feedback(
+        self, event_id: str, payload: dict[str, Any], user: UserAccount,
+        request_id: str, idempotency_key: str, expected_version: int | None,
+    ) -> dict[str, Any]:
+        return self.learning.save_feedback(user.organization_id, user.id, event_id, payload, request_id, idempotency_key, expected_version)
+
+    def set_event_learning_eligibility(
+        self, event_id: str, eligible: bool, reason: str, user: UserAccount,
+        request_id: str, expected_version: int | None, idempotency_key: str,
+    ) -> dict[str, Any]:
+        return self.learning.set_eligibility(user.organization_id, user.id, event_id, eligible, reason, request_id, expected_version, idempotency_key)

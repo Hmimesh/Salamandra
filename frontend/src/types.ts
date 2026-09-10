@@ -266,6 +266,43 @@ export interface EventDraft {
   learned_items: Requirement[];
 }
 
+export interface EventFeedbackItem {
+  kind: "missing" | "unnecessary" | "failed" | "additional_onsite";
+  item_id: string | null;
+  label_snapshot: string;
+  quantity: number | null;
+  note: string;
+}
+
+export interface EventFeedback {
+  id: string;
+  version: number;
+  missing: "yes" | "no";
+  unnecessary: "yes" | "no";
+  failed: "yes" | "no";
+  additional_onsite: "yes" | "no";
+  plan_fit: "too_little" | "about_right" | "too_much";
+  reuse_plan: "yes" | "with_changes" | "no";
+  notes: string;
+  items: EventFeedbackItem[];
+}
+
+export interface EventLearning {
+  available: boolean;
+  id?: string;
+  event_id: string;
+  source_type?: string;
+  eligible?: boolean;
+  exclusion_reason?: string | null;
+  features?: Record<string, unknown>;
+  original_request?: Record<string, unknown>;
+  proposal?: Record<string, unknown>;
+  corrections?: Record<string, unknown>;
+  execution?: Record<string, unknown>;
+  feedback?: EventFeedback | null;
+  version?: number;
+}
+
 export interface WorkspaceState {
   auth: {
     authenticated: boolean;

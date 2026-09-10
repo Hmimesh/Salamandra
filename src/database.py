@@ -7,6 +7,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from sqlalchemy import (
+    Boolean,
     JSON,
     CheckConstraint,
     DateTime,
@@ -233,6 +234,99 @@ class EventModel(Base):
             name="fk_events_owner_same_org",
         ),
         Index("ix_events_org_window", "organization_id", "status", "starts_at", "ends_at"),
+    )
+
+
+class EventLearningRecordModel(Base):
+    __tablename__ = "event_learning_records"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False, default="real")
+    source_id: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    exclusion_reason: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    features: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
+    original_request: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
+    proposal: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
+    corrections: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
+    execution: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("id", "organization_id", name="uq_learning_records_id_org"),
+        ForeignKeyConstraint(
+            ["event_id", "organization_id"],
+            ["events.id", "events.organization_id"],
+            ondelete="CASCADE",
+            name="fk_learning_records_event_same_org",
+        ),
+        CheckConstraint("version > 0", name="ck_learning_records_version"),
+        Index("ix_learning_records_org_eligible", "organization_id", "eligible", "event_id"),
+    )
+
+
+class EventFeedbackModel(Base):
+    __tablename__ = "event_feedback"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    missing: Mapped[str] = mapped_column(String(8), nullable=False)
+    unnecessary: Mapped[str] = mapped_column(String(8), nullable=False)
+    failed: Mapped[str] = mapped_column(String(8), nullable=False)
+    additional_onsite: Mapped[str] = mapped_column(String(8), nullable=False)
+    plan_fit: Mapped[str] = mapped_column(String(24), nullable=False)
+    reuse_plan: Mapped[str] = mapped_column(String(24), nullable=False)
+    notes: Mapped[str] = mapped_column(String(2000), nullable=False, default="")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("id", "organization_id", name="uq_event_feedback_id_org"),
+        ForeignKeyConstraint(
+            ["event_id", "organization_id"],
+            ["events.id", "events.organization_id"],
+            ondelete="CASCADE",
+            name="fk_event_feedback_event_same_org",
+        ),
+        CheckConstraint("missing IN ('yes', 'no')", name="ck_event_feedback_missing"),
+        CheckConstraint("unnecessary IN ('yes', 'no')", name="ck_event_feedback_unnecessary"),
+        CheckConstraint("failed IN ('yes', 'no')", name="ck_event_feedback_failed"),
+        CheckConstraint("additional_onsite IN ('yes', 'no')", name="ck_event_feedback_additional"),
+        CheckConstraint("plan_fit IN ('too_little', 'about_right', 'too_much')", name="ck_event_feedback_plan_fit"),
+        CheckConstraint("reuse_plan IN ('yes', 'with_changes', 'no')", name="ck_event_feedback_reuse"),
+        CheckConstraint("version > 0", name="ck_event_feedback_version"),
+        Index("ix_event_feedback_org_event", "organization_id", "event_id"),
+    )
+
+
+class EventFeedbackItemModel(Base):
+    __tablename__ = "event_feedback_items"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    feedback_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    item_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    label_snapshot: Mapped[str] = mapped_column(String(300), nullable=False, default="")
+    quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    note: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["feedback_id", "organization_id"],
+            ["event_feedback.id", "event_feedback.organization_id"],
+            ondelete="CASCADE",
+            name="fk_event_feedback_items_feedback_same_org",
+        ),
+        CheckConstraint("kind IN ('missing', 'unnecessary', 'failed', 'additional_onsite')", name="ck_event_feedback_items_kind"),
+        CheckConstraint("quantity IS NULL OR quantity > 0", name="ck_event_feedback_items_quantity"),
+        Index("ix_event_feedback_items_org_feedback", "organization_id", "feedback_id"),
     )
 
 
@@ -687,6 +781,8 @@ class TransactionalEventCreation:
                 )
                 session.add(event)
                 session.flush()
+                from event_learning import EventLearningStore
+                EventLearningStore.create_in_session(session, event, request_payload)
 
                 operation.status = "completed"
                 operation.resource_id = event.id
@@ -994,6 +1090,8 @@ class TransactionalEventDetails:
             event.version += 1
             authoritative_data["version"] = event.version
             event.data = authoritative_data
+            from event_learning import EventLearningStore
+            EventLearningStore.capture_edit_in_session(session, event, previous_data)
 
             current = {
                 "title": event.title,
@@ -1139,6 +1237,8 @@ class TransactionalEventOperations:
                 lines=self._movement_lines(session, event),
             )
         )
+        from event_learning import EventLearningStore
+        EventLearningStore.sync_execution_in_session(session, event)
         session.add(
             AuditEventModel(
                 organization_id=organization_id,

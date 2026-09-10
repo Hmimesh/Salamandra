@@ -27,6 +27,9 @@ class Permission(StrEnum):
     INTEGRATIONS_MANAGE = "integrations.manage"
     MEMBERS_INVITE = "members.invite"
     SYNC_RUN = "sync.run"
+    EVENTS_FEEDBACK_READ = "events.feedback.read"
+    EVENTS_FEEDBACK_WRITE = "events.feedback.write"
+    EVENTS_LEARNING_MANAGE = "events.learning.manage"
 
 
 ALL_PERMISSIONS = frozenset(Permission)
@@ -46,6 +49,8 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
             Permission.KITS_MANAGE,
             Permission.OPERATIONS_PACK,
             Permission.SYNC_RUN,
+            Permission.EVENTS_FEEDBACK_READ,
+            Permission.EVENTS_FEEDBACK_WRITE,
         }
     ),
     "operator": frozenset(
@@ -66,6 +71,8 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
             Permission.OPERATIONS_DISPATCH,
             Permission.OPERATIONS_RETURN,
             Permission.SYNC_RUN,
+            Permission.EVENTS_FEEDBACK_READ,
+            Permission.EVENTS_FEEDBACK_WRITE,
         }
     ),
     "technician": frozenset(
@@ -75,6 +82,8 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
             Permission.INVENTORY_PERSONAL_WRITE,
             Permission.OPERATIONS_PACK,
             Permission.OPERATIONS_RETURN,
+            Permission.EVENTS_FEEDBACK_READ,
+            Permission.EVENTS_FEEDBACK_WRITE,
         }
     ),
     "freelancer": frozenset(
@@ -83,6 +92,8 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
             Permission.INVENTORY_READ,
             Permission.INVENTORY_PERSONAL_WRITE,
             Permission.OPERATIONS_PACK,
+            Permission.EVENTS_FEEDBACK_READ,
+            Permission.EVENTS_FEEDBACK_WRITE,
         }
     ),
     "client": frozenset({Permission.STATE_READ, Permission.INVENTORY_READ}),
