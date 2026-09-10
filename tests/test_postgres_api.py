@@ -3018,9 +3018,17 @@ class TestPostgresHttpRuntime(unittest.TestCase):
 
     @isolated_database_inserts
     def test_event_creation_ids_are_rejected_without_disclosure_or_mutation(self):
+        from postgres_runtime import PostgresRuntime
         port = self.ports[0]
-        cookie = self._sign_in(port)
         suffix = uuid4().hex
+        # The positive creation case can replan its workspace's other events.
+        # Own the workspace as well as the inserted rows; never replan sibling fixtures.
+        own_org_id = f"creation-org-{suffix}"
+        email, password = f"creation-{suffix}@example.test", "Creation-test-password-123"
+        owner = PostgresRuntime(self.factory).accounts.create_user(
+            "Creation owner", email, password, "owner", own_org_id, "Creation boundary test"
+        )
+        cookie = self._sign_in_credentials(port, email, password)
         foreign_org_id = f"foreign-org-{suffix}"
         foreign_user_id = f"foreign-user-{suffix}"
         foreign_membership_id = f"foreign-membership-{suffix}"
@@ -3068,7 +3076,7 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             )
             session.flush()
             session.add(event_row(foreign_event_id, foreign_org_id, foreign_user_id))
-            session.add(event_row(own_event_id, "runtime-org", "runtime-owner"))
+            session.add(event_row(own_event_id, own_org_id, owner.id))
 
         mutation_tables = (
             "events",
@@ -3138,7 +3146,7 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         with self.factory() as session:
             created = session.get(EventModel, created_id)
             self.assertIsNotNone(created)
-            self.assertEqual(created.organization_id, "runtime-org")
+            self.assertEqual(created.organization_id, own_org_id)
 
     @race_required
     def test_durable_transactional_runtime_and_cross_process_dispatch(self):
