@@ -9,9 +9,13 @@ permissions:
 
 jobs:
   windows-browser-qa:
-    name: Windows browser QA lifecycle
+    name: Windows browser QA (${{ matrix.viewport }})
     runs-on: windows-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        viewport: [mobile-360, tablet-768, desktop-1280, wide-1440, desktop-200-percent]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -34,7 +38,11 @@ jobs:
       - run: pnpm exec playwright install chromium
       - name: Browser QA must exit successfully
         timeout-minutes: 10
-        run: pnpm qa:browser
+        run: |
+          pnpm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm exec playwright test --project=${{ matrix.viewport }}
+          exit $LASTEXITCODE
       - name: Verify fixture process and port were released
         if: always()
         run: |
@@ -46,7 +54,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: windows-playwright-evidence
+          name: windows-playwright-evidence-${{ matrix.viewport }}
           path: |
             playwright-report/
             test-results/

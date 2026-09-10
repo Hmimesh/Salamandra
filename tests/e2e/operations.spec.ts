@@ -185,7 +185,10 @@ test("preset inventory and account popovers work with a keyboard", async ({ page
   await activate(page.getByRole("button", { name: "Add item", exact: true }));
   await activate(page.getByRole("button", { name: "Start from a preset" }));
   const catalog = page.getByRole("dialog", { name: "Item catalog" });
-  await activate(catalog.getByRole("button", { name: "Add XLR Cable 10m", exact: true }));
+  await Promise.all([
+    page.waitForResponse(response => response.url().endsWith("/api/inventory/presets") && response.status() === 200),
+    activate(catalog.getByRole("button", { name: "Add XLR Cable 10m", exact: true })),
+  ]);
   await activate(catalog.getByRole("button", { name: "Done", exact: true }));
   await page.getByPlaceholder("Search inventory").fill("XLR Cable 10m");
   await expect(page.locator(".inventory-table tbody tr")).toHaveCount(1);
@@ -198,7 +201,10 @@ test("preset inventory and account popovers work with a keyboard", async ({ page
   await activate(page.getByRole("button", { name: "Add item", exact: true }));
   await activate(page.getByRole("button", { name: "Start from a preset" }));
   await expect(catalog.getByText("Add proven presets to your inventory.")).toBeVisible();
-  await activate(catalog.getByRole("button", { name: "Add XLR Cable 10m", exact: true }));
+  await Promise.all([
+    page.waitForResponse(response => response.url().endsWith("/api/inventory/presets") && response.status() === 200),
+    activate(catalog.getByRole("button", { name: "Add XLR Cable 10m", exact: true })),
+  ]);
   await activate(catalog.getByRole("button", { name: "Done", exact: true }));
   await activate(page.getByRole("button", { name: "My inventory", exact: true }));
   await page.getByPlaceholder("Search inventory").fill("XLR Cable 10m");
