@@ -4,10 +4,20 @@ import argparse
 import sys
 import tempfile
 import threading
+import time
+from unittest.mock import patch
 from dataclasses import replace
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+STARTED = time.monotonic()
+
+
+def startup_stage(stage: str) -> None:
+    print(f"QA fixture {time.monotonic() - STARTED:.3f}s: {stage}", flush=True)
+
+
+startup_stage("loading application imports")
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -24,9 +34,11 @@ from sqlalchemy.orm import sessionmaker
 from database import Base, EventModel, InventoryHoldingModel
 from event_learning import EventLearningStore
 from postgres_runtime import PostgresRuntime
+from accounts import AccountStore
 
 
 def handler_for(data_dir: Path, port: int):
+    startup_stage("creating disposable schema")
     engine = create_engine(f"sqlite+pysqlite:///{(data_dir / 'browser.db').as_posix()}", connect_args={"check_same_thread": False})
     @event.listens_for(engine, "connect")
     def foreign_keys(connection, _):
@@ -34,7 +46,16 @@ def handler_for(data_dir: Path, port: int):
     Base.metadata.create_all(engine)
     runtime = PostgresRuntime(sessionmaker(bind=engine, expire_on_commit=False))
     accounts = runtime.accounts
-    accounts.create_user(
+    startup_stage("seeding accounts")
+    # Only fixture creation reuses a freshly generated hash. HTTP authentication
+    # still runs the real password verifier, and production hashing is unchanged.
+    fixture_hash = AccountStore.hash_password("playwright-password")
+
+    def create_user(**kwargs):
+        with patch.object(AccountStore, "hash_password", return_value=fixture_hash):
+            return accounts.create_user(**kwargs)
+
+    owner = create_user(
         name="Playwright Owner",
         email="owner@playwright.test",
         password="playwright-password",
@@ -42,16 +63,12 @@ def handler_for(data_dir: Path, port: int):
         organization_id="playwright-org",
         organization_name="Playwright Operations",
     )
-    owner = accounts.authenticate("owner@playwright.test", "playwright-password")
-    if owner is None:
-        raise RuntimeError("Could not create the Playwright account fixture.")
     for viewport in ("mobile-360", "tablet-768", "desktop-1280", "wide-1440", "desktop-200-percent"):
         history_org = f"history-{viewport}"
         history_email = f"owner@phase-d-{viewport}.test"
-        accounts.create_user(name="History Owner", email=history_email,
+        history_owner = create_user(name="History Owner", email=history_email,
             password="playwright-password", role="owner",
             organization_id=history_org, organization_name="History Workspace")
-        history_owner = accounts.authenticate(history_email, "playwright-password")
         with runtime.factory.begin() as session:
             for index, quantity in enumerate((12, 12, 14)):
                 record = EventModel(id=f"{history_org}-{index}", organization_id=history_org,
@@ -64,12 +81,12 @@ def handler_for(data_dir: Path, port: int):
                 session.flush()
                 learning = EventLearningStore.create_in_session(session, record, source_type="real")
                 learning.eligible, learning.exclusion_reason = True, None
-        accounts.create_user(
+        create_user(
             name="Clear Owner", email=f"owner@phase-b5-{viewport}.test",
             password="playwright-password", role="owner",
             organization_id=f"clear-{viewport}", organization_name=f"Clear {viewport}",
         )
-        accounts.create_user(
+        create_user(
             name="Clear Admin", email=f"admin@phase-b5-{viewport}.test",
             password="playwright-password", role="admin",
             organization_id=f"clear-{viewport}", organization_name=f"Clear {viewport}",
@@ -78,18 +95,19 @@ def handler_for(data_dir: Path, port: int):
             session.add(InventoryHoldingModel(organization_id=f"clear-{viewport}",
                                               legacy_item_id="empty-case", scope="shared",
                                               active=True, data={"id": "empty-case", "type": "other"}))
-        accounts.create_user(
+        create_user(
             name="Import Owner", email=f"owner@phase-b-{viewport}.test",
             password="playwright-password", role="owner",
             organization_id=f"import-{viewport}", organization_name=f"Import {viewport}",
         )
-    accounts.create_user(
+    create_user(
         name="Playwright Technician", email="tech@playwright.test",
         password="playwright-password", role="technician",
         organization_id=owner.organization_id,
         organization_name="Playwright Operations",
     )
 
+    startup_stage("seeding inventory")
     workspace = runtime.workspace
     workspace.add_item(
         ItemNode(id="xlr cable", type="cable", count=12, info="Balanced signal cable"),
@@ -131,6 +149,7 @@ def handler_for(data_dir: Path, port: int):
         allowed_origins=frozenset({origin}),
         registration_mode="disabled",
     )
+    startup_stage("handler ready")
     return PlaywrightHandler
 
 
@@ -150,6 +169,7 @@ def main() -> None:
         )
         worker = threading.Thread(target=server.serve_forever)
         worker.start()
+        startup_stage(f"listening on 127.0.0.1:{args.port}")
         try:
             if args.parent_stdin:
                 # EOF also arrives if the runner crashes; never expose a shutdown API.

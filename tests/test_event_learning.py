@@ -11,7 +11,7 @@ if str(SRC) not in sys.path:
 if str(ROOT / "tests") not in sys.path:
     sys.path.insert(0, str(ROOT / "tests"))
 
-from database import EventModel, MembershipModel, OrganizationModel, UserModel
+from database import EventModel, MembershipModel, OrganizationModel, UserModel, StockMovementModel
 from event_learning import EventLearningStore
 from test_database_phase2 import sqlite_factory
 from security import AccessDenied, ResourceNotFound, StateConflict
@@ -79,6 +79,35 @@ class TestEventLearning(unittest.TestCase):
         result = self.store.set_eligibility("org-a", "user-org-a", "event-a", True, "", "r", None, "eligibility-1")
         self.assertTrue(result["eligible"])
         self.assertEqual(self.store.examples("org-a")[0]["event_id"], "event-a")
+
+    def test_execution_preserves_every_ledger_stage(self):
+        with self.factory.begin() as session:
+            for action in ("packed", "out", "returned"):
+                session.add(StockMovementModel(organization_id="org-a", event_id="event-a",
+                    actor_membership_id="membership-org-a", action=action,
+                    idempotency_key=action, lines=[{"holding_id": "holding-a", "quantity": 2}]))
+            session.flush()
+            self.store.sync_execution_in_session(session, session.get(EventModel, "event-a"))
+        execution = self.store.get("org-a", "event-a")["execution"]
+        for stage in ("packed", "dispatched", "returned"):
+            self.assertEqual(execution[stage], [[{"holding_id": "holding-a", "quantity": 2}]])
+
+    def test_metadata_edit_keeps_original_to_final_corrections_and_current_features(self):
+        with self.factory.begin() as session:
+            event = session.get(EventModel, "event-a")
+            previous = dict(event.data)
+            event.data = {**previous, "attendee_count": 110,
+                "capability_requirements": [{"capability": "pa.main", "amount": 4}]}
+            self.store.capture_edit_in_session(session, event, previous)
+            previous = dict(event.data)
+            event.data = {**previous, "title": "New title"}
+            self.store.capture_edit_in_session(session, event, previous)
+        record = self.store.get("org-a", "event-a")
+        self.assertTrue(record["corrections"]["changed"])
+        self.assertEqual(record["corrections"]["requirements"]["proposed"][0]["amount"], 2)
+        self.assertEqual(record["corrections"]["requirements"]["final_planned"][0]["amount"], 4)
+        self.assertEqual(record["features"]["guest_count"], 110)
+        self.assertIsNone(record["original_request"]["features"]["guest_count"])
 
 
 if __name__ == "__main__":

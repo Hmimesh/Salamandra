@@ -21,6 +21,8 @@ export default async function setup() {
     stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
   });
   let output = "";
+  const started = Date.now();
+  let lastProbe = "not attempted";
   child.stdout.on("data", (data) => { output = (output + data).slice(-8000); });
   child.stderr.on("data", (data) => { output = (output + data).slice(-8000); });
   let closed = false;
@@ -56,16 +58,24 @@ export default async function setup() {
       if (closed) throw new Error(`QA fixture exited before readiness: ${output}`);
       const response = await fetch("http://127.0.0.1:4173/health", {
         signal: AbortSignal.timeout(1000),
-      }).catch(() => undefined);
+      }).catch((error: Error & { cause?: Error }) => {
+        lastProbe = `${error.message}; ${error.cause?.message ?? "no cause"}`;
+        return undefined;
+      });
+      if (response) lastProbe = `HTTP ${response.status}`;
       if (response?.ok) {
         await response.text();
+        console.log(`QA fixture ready in ${Date.now() - started}ms; pid ${child.pid}.\n${output}`);
         return stop;
       }
+      await response?.body?.cancel();
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
-    throw new Error(`QA fixture readiness timed out: ${output}`);
+    throw new Error(`QA fixture readiness timed out after ${Date.now() - started}ms; pid ${child.pid}; last probe: ${lastProbe}.\n${output}`);
   } catch (error) {
-    await stop();
+    try { await stop(); } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "QA fixture startup and cleanup failed");
+    }
     throw error;
   }
 }

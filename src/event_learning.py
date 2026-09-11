@@ -86,8 +86,7 @@ def _original(data: dict[str, Any], request_payload: dict[str, Any] | None) -> d
     }
 
 
-def _corrections(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
-    old = _proposal(previous)
+def _corrections(old: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     new = _proposal(current)
     return {
         "requirements": {"proposed": old["requirements"], "final_planned": new["requirements"]},
@@ -127,7 +126,7 @@ class EventLearningStore:
         row = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.organization_id == event.organization_id, EventLearningRecordModel.event_id == event.id).with_for_update())
         if row is None:
             row = EventLearningStore.create_in_session(session, event, source_type=str((event.data or {}).get("source_type") or "unknown"))
-        movements = session.scalars(select(StockMovementModel).where(StockMovementModel.organization_id == event.organization_id, StockMovementModel.event_id == event.id).order_by(StockMovementModel.created_at, StockMovementModel.id))
+        movements = session.scalars(select(StockMovementModel).where(StockMovementModel.organization_id == event.organization_id, StockMovementModel.event_id == event.id).order_by(StockMovementModel.created_at, StockMovementModel.id)).all()
         row.execution = {
             "status": event.status,
             "packed": [m.lines for m in movements if m.action == "packed"],
@@ -143,7 +142,9 @@ class EventLearningStore:
     def capture_edit_in_session(session: Session, event: EventModel, previous_data: dict[str, Any]) -> None:
         row = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.organization_id == event.organization_id, EventLearningRecordModel.event_id == event.id).with_for_update())
         if row is not None:
-            row.corrections = _corrections(previous_data, dict(event.data or {}))
+            # Retain the original baseline across subsequent metadata-only edits.
+            row.corrections = _corrections(row.proposal, dict(event.data or {}))
+            row.features = _features(dict(event.data or {}))
             row.version += 1
 
     def get(self, organization_id: str, event_id: str) -> dict[str, Any]:

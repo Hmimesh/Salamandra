@@ -125,8 +125,9 @@ export function EventsPage() {
   const [description, setDescription] = useState("");
   const manualForm = useRef<HTMLFormElement>(null);
   const [planningMode, setPlanningMode] = useState<"describe" | "manual">("describe");
-  const [manualEvent, setManualEvent] = useState({ title: "", start_date: "", start_time: "", location: "", duration_minutes: 240, attendee_count: 0 });
-  const [manualRequirements, setManualRequirements] = useState<ManualRequirement[]>([{ id: crypto.randomUUID(), capability: "pa.main", customCapability: "", amount: 1, level: "required" }]);
+  const [manualEvent, setManualEventState] = useState({ title: "", start_date: "", start_time: "", location: "", duration_minutes: 240, attendee_count: 0 });
+  const [manualRequirements, setManualRequirementsState] = useState<ManualRequirement[]>([{ id: crypto.randomUUID(), capability: "pa.main", customCapability: "", amount: 1, level: "required" }]);
+  const draftRevision = useRef(0);
   const [draft, setDraft] = useState<EventDraft | null>(null);
   const [draftDirty, setDraftDirty] = useState(false);
   const [planning, setPlanning] = useState(false);
@@ -151,6 +152,7 @@ export function EventsPage() {
 
   async function planEvent(event: FormEvent) {
     event.preventDefault();
+    const revision = draftRevision.current;
     setPlanning(true);
     try {
       const eventDescription = planningMode === "manual"
@@ -165,6 +167,7 @@ export function EventsPage() {
           assigned_user_ids: [state!.auth.user!.id],
         } : { assigned_user_ids: [state!.auth.user!.id] },
       });
+      if (revision !== draftRevision.current) return;
       setDescription(eventDescription);
       setDraft(response.draft);
       setDraftDirty(false);
@@ -177,12 +180,31 @@ export function EventsPage() {
   }
 
   function updateDraft(field: "title" | "start_date" | "start_time" | "location" | "attendee_count", value: string | number) {
+    draftRevision.current += 1;
     setDraft((current) => current ? { ...current, event: { ...current.event, [field]: value } } : current);
+    if (planningMode === "manual") setManualEventState(current => ({ ...current, [field]: value }));
     setDraftDirty(true);
+  }
+
+  function markDraftChanged() {
+    draftRevision.current += 1;
+    if (draft) setDraftDirty(true);
+  }
+
+  function setManualRequirements(requirements: ManualRequirement[]) {
+    markDraftChanged();
+    setManualRequirementsState(requirements);
+  }
+
+  function setManualEvent(value: typeof manualEvent) {
+    markDraftChanged();
+    setManualEventState(value);
+    setDraft(current => current ? { ...current, event: { ...current.event, ...value } } : current);
   }
 
   async function recalculateDraft() {
     if (!draft) return;
+    const revision = draftRevision.current;
     setPlanning(true);
     try {
       const response = await mutate<{ draft: EventDraft }>("/api/events/describe", {
@@ -198,6 +220,7 @@ export function EventsPage() {
           ...(planningMode === "manual" ? { planning_mode: "manual", capability_requirements: manualRequirements.map(({ capability, customCapability, amount, level }) => ({ capability: capability === "custom.resource" ? customCapability : capability, amount, level })) } : {}),
         },
       });
+      if (revision !== draftRevision.current) return;
       setDraft(response.draft);
       setDraftDirty(false);
     } catch {
@@ -208,7 +231,7 @@ export function EventsPage() {
   }
 
   async function saveDraft() {
-    if (!draft || saving) return;
+    if (!draft || saving || draftDirty || planning) return;
     setSaving(true);
     try {
       await mutate<StateEnvelope & { event: EventRecord }>("/api/events/save", {
@@ -238,7 +261,7 @@ export function EventsPage() {
   }
 
   function applyHistoricalRequirements(suggestions: { capability: string; amount: number }[]) {
-    if (!draft) return;
+    if (!draft || draftDirty || planning) return;
     const replaced = new Set(suggestions.map(item => item.capability));
     const requirements = draft.event.capability_requirements.filter(item => !replaced.has(item.capability))
       .map(({ capability, amount, level }) => ({ capability, amount, level }));
@@ -312,9 +335,9 @@ export function EventsPage() {
         <section className="event-composer">
           <button className="back-link" type="button" onClick={() => navigate("/events")}><ArrowLeft size={17} />Back to events</button>
           <div className="composer-grid">
-            <form ref={manualForm} className="brief-editor" onSubmit={planEvent} onChange={() => { if (draft) setDraftDirty(true); }}>
+            <form ref={manualForm} className="brief-editor" onSubmit={planEvent} onChange={markDraftChanged}>
               <div className="brief-title"><span>{planningMode === "describe" ? <Sparkles size={20} /> : <SlidersHorizontal size={20} />}</span><div><h2>{planningMode === "describe" ? "Describe the event" : "Build manually"}</h2><p>{planningMode === "describe" ? "Write it the way the brief reaches you. Salamandra will use only stock in this workspace." : "Enter the schedule and operational needs directly. Inventory is still allocated by the same planner."}</p></div></div>
-              <div className="segmented-control composer-mode" aria-label="Event creation method"><button type="button" className={planningMode === "describe" ? "active" : ""} onClick={() => { setPlanningMode("describe"); setDraft(null); }}>Describe</button><button type="button" className={planningMode === "manual" ? "active" : ""} onClick={() => { setPlanningMode("manual"); setDraft(null); }}>Build manually</button></div>
+              <div className="segmented-control composer-mode" aria-label="Event creation method"><button type="button" className={planningMode === "describe" ? "active" : ""} onClick={() => { markDraftChanged(); setPlanningMode("describe"); setDraft(null); }}>Describe</button><button type="button" className={planningMode === "manual" ? "active" : ""} onClick={() => { markDraftChanged(); setPlanningMode("manual"); setDraft(null); }}>Build manually</button></div>
               {planningMode === "describe" ? <><label className="field-label" htmlFor="event-brief">Event brief</label><textarea dir="auto" id="event-brief" value={description} onChange={(event) => { setDescription(event.target.value); if (draft) setDraftDirty(true); }} rows={8} placeholder="Conference for 120 guests on 2026-09-12 at 18:00, speeches, panel microphones, stage lighting, and power at Main Hall." required /><div className="example-briefs"><span>Include:</span><span>date and time</span><span>venue</span><span>guest count</span><span>equipment, site, or transport needs</span></div></> : <div className="manual-builder"><div className="form-grid"><label className="form-field-wide">Event name<input dir="auto" value={manualEvent.title} onChange={(event) => setManualEvent({ ...manualEvent, title: event.target.value })} required /></label><label>Date<input type="date" value={manualEvent.start_date} onChange={(event) => setManualEvent({ ...manualEvent, start_date: event.target.value })} required /></label><label>Start time<input type="time" value={manualEvent.start_time} onChange={(event) => setManualEvent({ ...manualEvent, start_time: event.target.value })} required /></label><label>Duration (minutes)<input type="number" min="15" max="10080" value={manualEvent.duration_minutes} onChange={(event) => setManualEvent({ ...manualEvent, duration_minutes: Number(event.target.value) })} required /></label><label>Guests<input type="number" min="0" max="1000000" value={manualEvent.attendee_count || ""} onChange={(event) => setManualEvent({ ...manualEvent, attendee_count: Number(event.target.value || 0) })} /></label><label className="form-field-wide">Venue<input dir="auto" value={manualEvent.location} onChange={(event) => setManualEvent({ ...manualEvent, location: event.target.value })} /></label></div><div className="manual-requirements"><div className="subsection-title"><h3>Requirements</h3><button type="button" className="button button-secondary button-compact" onClick={() => setManualRequirements([...manualRequirements, { id: crypto.randomUUID(), capability: "pa.main", customCapability: "", amount: 1, level: "required" }])}><Plus size={15} />Add</button></div>{manualRequirements.map((requirement) => <div className="manual-requirement-row" key={requirement.id}><label>Department & item<select value={requirement.capability} onChange={(event) => setManualRequirements(manualRequirements.map((item) => item.id === requirement.id ? { ...item, capability: event.target.value } : item))}>{requirementOptions.map(([value, label, group]) => <option key={value} value={value}>{group} · {label}</option>)}<option value="custom.resource">Custom requirement</option></select></label>{requirement.capability === "custom.resource" ? <label>Custom capability<input value={requirement.customCapability} placeholder="example: catering.coffee" onChange={(event) => setManualRequirements(manualRequirements.map((item) => item.id === requirement.id ? { ...item, customCapability: event.target.value } : item))} required /></label> : null}<label>Quantity<input type="number" min="1" max="10000" value={requirement.amount} onChange={(event) => setManualRequirements(manualRequirements.map((item) => item.id === requirement.id ? { ...item, amount: Number(event.target.value) } : item))} required /></label><label>Priority<select value={requirement.level} onChange={(event) => setManualRequirements(manualRequirements.map((item) => item.id === requirement.id ? { ...item, level: event.target.value } : item))}><option value="required">Required</option><option value="recommended">Recommended</option><option value="optional">Optional</option></select></label><button type="button" className="icon-button" aria-label="Remove requirement" title="Remove requirement" disabled={manualRequirements.length === 1} onClick={() => setManualRequirements(manualRequirements.filter((item) => item.id !== requirement.id))}><Trash2 size={16} /></button></div>)}</div></div>}
               <button className="button button-primary button-large" type="submit" disabled={planning}>{planning ? "Building plan..." : "Build event plan"}<ChevronRight size={18} /></button>
             </form>
@@ -326,11 +349,11 @@ export function EventsPage() {
                   <div className="event-facts"><span><small>Scale</small><strong>{titleCase(draft.event.event_size)}</strong></span><span><small>Guests</small><strong>{draft.event.attendee_count || "Not stated"}</strong></span><span><small>Planning focus</small><strong>{planningFocus(draft.event.priority_score)}</strong></span><span><small>Venue</small><strong>{draft.event.venue_kind ? titleCase(draft.event.venue_kind.replaceAll("_", " ")) : "Not stated"}</strong></span></div>
                   <div className="draft-fields"><label>Event name<input value={draft.event.title} onChange={(event) => updateDraft("title", event.target.value)} /></label><label>Date<input type="date" value={draft.event.start_date} onChange={(event) => updateDraft("start_date", event.target.value)} /></label><label>Start<input type="time" value={draft.event.start_time} onChange={(event) => updateDraft("start_time", event.target.value)} /></label><label>Guests<input type="number" min="0" value={draft.event.attendee_count || ""} onChange={(event) => updateDraft("attendee_count", Number(event.target.value || 0))} /></label><label className="draft-field-wide">Venue<input value={draft.event.location} onChange={(event) => updateDraft("location", event.target.value)} /></label></div>
                   <CrewPicker users={state!.auth.users} selected={draft.event.assigned_user_ids} requiredId={state!.auth.user!.id} onChange={(assigned_user_ids) => setDraft({ ...draft, event: { ...draft.event, assigned_user_ids } })} />
-                  {draftDirty ? <div className="recalculate-strip"><AlertTriangle size={16} /><span>Schedule details changed. Recalculate availability before saving.</span><button className="button button-secondary button-compact" type="button" onClick={() => void recalculateDraft()} disabled={planning}><RotateCcw size={15} />Recalculate</button></div> : null}
+                  {draftDirty ? <div className="recalculate-strip"><AlertTriangle size={16} /><span>Plan details changed. Recalculate availability before saving.</span><button className="button button-secondary button-compact" type="button" onClick={() => void recalculateDraft()} disabled={planning}><RotateCcw size={15} />Recalculate</button></div> : null}
                   {draft.event.milestones.length ? <div className="run-of-show"><span>Run of show</span><div>{draft.event.milestones.map((milestone) => <div key={`${milestone.time}-${milestone.label}`}><strong>{milestone.time}</strong><span>{milestone.label}</span></div>)}</div></div> : null}
                   <div className="plan-summary"><div><span>Allocated lines</span><strong>{draft.event.plan.lines.filter((line) => line.item_id).length}</strong></div><div><span>Required missing</span><strong>{draft.event.plan.total_missing}</strong></div><div><span>Spare missing</span><strong>{draft.event.plan.recommended_missing}</strong></div></div>
                   <TransportBand plan={draft.event.plan} />
-                  {!draftDirty ? <HistoricalSuggestions event={draft.event} onApply={applyHistoricalRequirements} /> : null}
+                  {!draftDirty && !planning ? <HistoricalSuggestions event={draft.event} onApply={applyHistoricalRequirements} /> : null}
                   {draft.event.plan.reallocations.length ? <div className="reallocation-list"><div className="subsection-title"><h3><ArrowRightLeft size={16} />Overlap reallocation</h3><span>{draft.event.plan.reallocations.length} event affected</span></div>{draft.event.plan.reallocations.map((reallocation) => <div className="reallocation-row" key={reallocation.event_id}><strong>{reallocation.event_title}{reallocation.required_missing ? ` · ${reallocation.required_missing} now missing` : ""}</strong><span>{Object.entries(reallocation.removed).map(([item, amount]) => `${amount}x ${titleCase(item)}`).join(", ") || "Previous allocation"}</span><ArrowRightLeft size={15} /><span>{Object.entries(reallocation.added).map(([item, amount]) => `${amount}x ${titleCase(item)}`).join(", ") || "Rebalanced stock"}</span><small>{reallocation.reason}</small></div>)}</div> : null}
                   <div className="plan-lines">
                     {draft.event.plan.lines.map((line, index) => {
@@ -341,7 +364,7 @@ export function EventsPage() {
                     })}
                   </div>
                   {draft.event.plan.total_missing ? <div className="planning-warning"><AlertTriangle size={17} /><span><strong>Required stock is still missing</strong><small>The event can be saved in planning so the team can resolve rentals or inventory changes.</small></span></div> : null}
-                  <div className="composer-actions"><button className="button button-secondary" type="button" onClick={() => { setDraft(null); setDraftDirty(false); setCreateKey(crypto.randomUUID()); }}>Revise brief</button><button className="button button-primary" type="button" onClick={() => void saveDraft()} disabled={draftDirty || saving || planning}>{saving ? "Saving event..." : draft.event.plan.total_missing ? "Save as planning" : "Save event"}</button></div>
+                  <div className="composer-actions"><button className="button button-secondary" type="button" onClick={() => { markDraftChanged(); setDraft(null); setDraftDirty(false); setCreateKey(crypto.randomUUID()); }}>Revise brief</button><button className="button button-primary" type="button" onClick={() => void saveDraft()} disabled={draftDirty || saving || planning}>{saving ? "Saving event..." : draft.event.plan.total_missing ? "Save as planning" : "Save event"}</button></div>
                 </>
               ) : <EmptyState title="Your operations plan will appear here" message="Salamandra detects the schedule, venue, equipment, site needs, transport, linked requirements, and stock conflicts from the brief." />}
             </section>

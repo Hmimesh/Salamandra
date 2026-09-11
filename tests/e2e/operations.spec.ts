@@ -24,7 +24,8 @@ const test = base.extend<{ errorGuard: void }>({
         }
       }
     }
-    expect(errors).toEqual([]);
+    const expected = testInfo.annotations.filter(annotation => annotation.type === "expected-console-error").map(annotation => annotation.description);
+    expect(errors).toEqual(expected);
   }, { auto: true }],
 });
 
@@ -117,7 +118,7 @@ test("Phase D history suggestions remain operator controlled", async ({ page }, 
   await expect(history.getByRole("button", { name: "Review suggestions" })).toBeFocused();
   await expect(form.getByLabel("Quantity", { exact: true })).toHaveValue("1");
   await activate(history.getByRole("button", { name: "Review suggestions" }));
-  await quantity.focus();
+  await expect(quantity).toBeFocused();
   await quantity.fill("13");
   await page.keyboard.press("Tab");
   await expect(history.getByRole("button", { name: "Ignore", exact: true })).toBeFocused();
@@ -144,6 +145,125 @@ test("Phase D history suggestions remain operator controlled", async ({ page }, 
   expect(stored.event.capability_requirements).toContainEqual(expect.objectContaining({ capability: "furniture.chair", amount: 13 }));
   expect(requests.some(path => /inventory|status|feedback|eligibility/.test(path))).toBe(false);
   await expect(page).toHaveURL(/\/events$/);
+});
+
+test("history states reject stale drafts and in-flight plans", async ({ page }, testInfo) => {
+  await signIn(page, `owner@phase-d-${testInfo.project.name}.test`);
+  await page.goto("/events/new");
+  await activate(page.getByRole("button", { name: "Build manually" }));
+  const form = page.locator("form.brief-editor");
+  await form.getByLabel("Event name").fill("טיוטה عربي!");
+  await form.getByLabel("Date", { exact: true }).fill("2026-12-14");
+  await form.getByLabel("Start time").fill("19:00");
+  await form.getByLabel("Guests").fill("100");
+  await form.getByLabel("Duration (minutes)").fill("120");
+  await form.getByLabel("Department & item").selectOption("furniture.chair");
+  let releaseHistory!: () => void;
+  const historyGate = new Promise<void>(resolve => { releaseHistory = resolve; });
+  await page.route("**/api/events/learning/suggestions", async route => { await historyGate; await route.continue(); });
+  await activate(page.getByRole("button", { name: "Build event plan" }));
+  const history = page.getByRole("region", { name: "From your event history" });
+  await expect(history.getByRole("status")).toHaveText("Checking completed events...");
+  releaseHistory();
+  await expect(history.getByRole("button", { name: "Apply to manual plan" })).toBeVisible();
+  await activate(form.getByRole("button", { name: "Add", exact: true }));
+  await expect(history).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /Save as planning|Save event/ })).toBeDisabled();
+  await activate(form.getByRole("button", { name: "Remove requirement" }).last());
+  await form.getByLabel("Event name").fill("שם חדש عربي!");
+  let releasePlan!: () => void;
+  const planGate = new Promise<void>(resolve => { releasePlan = resolve; });
+  await page.route("**/api/events/describe", async route => {
+    const response = await route.fetch();
+    await planGate;
+    await route.fulfill({ response });
+  });
+  const planningRequest = page.waitForRequest("**/api/events/describe");
+  await activate(page.getByRole("button", { name: /Recalculate/ }));
+  await planningRequest;
+  await form.getByLabel("Quantity", { exact: true }).fill("17");
+  const staleResponse = page.waitForResponse("**/api/events/describe");
+  releasePlan();
+  await staleResponse;
+  await expect(page.getByRole("button", { name: /Recalculate/ })).toBeEnabled();
+  await expect(history).toHaveCount(0);
+  await expect(form.getByLabel("Quantity", { exact: true })).toHaveValue("17");
+  await expect(page.getByRole("button", { name: /Save as planning|Save event/ })).toBeDisabled();
+  await page.unroute("**/api/events/describe");
+  const recalculated = page.waitForResponse("**/api/events/describe");
+  await activate(page.getByRole("button", { name: /Recalculate/ }));
+  const updated = await (await recalculated).json();
+  expect(updated.draft.event.title).toBe("שם חדש عربي!");
+  expect(updated.draft.event.capability_requirements).toContainEqual(expect.objectContaining({ capability: "furniture.chair", amount: 17 }));
+  await expect(history.getByRole("button", { name: "Apply to manual plan" })).toBeVisible();
+  const applicationRequests: string[] = [];
+  const collectApplication = (request: import("@playwright/test").Request) => {
+    if (request.method() === "POST") applicationRequests.push(new URL(request.url()).pathname);
+  };
+  page.on("request", collectApplication);
+  await history.getByRole("spinbutton").fill("18");
+  await history.getByRole("button", { name: "Apply to manual plan" }).evaluate(button => {
+    (button as HTMLButtonElement).click();
+    (button as HTMLButtonElement).click();
+  });
+  await expect(form.getByLabel("Quantity", { exact: true })).toHaveValue("18");
+  await expect(history).toHaveCount(0);
+  expect(applicationRequests).toEqual([]);
+  page.off("request", collectApplication);
+  const appliedPlan = page.waitForResponse("**/api/events/describe");
+  await activate(page.getByRole("button", { name: /Recalculate/ }));
+  await appliedPlan;
+  await expect(page.getByRole("button", { name: /Save as planning|Save event/ })).toBeEnabled();
+  await expectNoViewportOverflow(page);
+  const savedResponse = page.waitForResponse(response => response.url().endsWith("/api/events/save") && response.status() === 201);
+  await activate(page.getByRole("button", { name: /Save as planning|Save event/ }));
+  const saved = (await (await savedResponse).json()).event;
+  await page.goto(`/events?event=${saved.id}`);
+  await activate(page.getByRole("button", { name: "Edit event", exact: true }));
+  const dialog = page.getByRole("dialog", { name: "Edit event", exact: true });
+  const newer = await page.request.post("/api/events/update", { data: {
+    event_id: saved.id, version: saved.version, description: saved.description,
+    overrides: { title: "Newer operator title", planning_mode: "manual", capability_requirements: saved.capability_requirements },
+  } });
+  expect(newer.status()).toBe(200);
+  await dialog.getByLabel("Event name").fill("Stale operator edit");
+  testInfo.annotations.push({ type: "expected-console-error", description: "console: Failed to load resource: the server responded with a status of 409 (Conflict)" });
+  const conflict = page.waitForResponse(response => response.url().endsWith("/api/events/update") && response.status() === 409);
+  await activate(dialog.getByRole("button", { name: "Save and rebuild plan" }));
+  const rejected = await (await conflict).json();
+  await expect(page.getByText(rejected.error, { exact: true })).toBeVisible();
+  await expect(dialog.getByLabel("Event name")).toHaveValue("Stale operator edit");
+  const state = await (await page.request.get("/api/state")).json();
+  expect(state.events.events.find((event: { id: string }) => event.id === saved.id).title).toBe("Newer operator title");
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+});
+
+test("history empty, insufficient and error states remain usable", async ({ page }, testInfo) => {
+  await signIn(page);
+  await page.goto("/events/new");
+  await page.getByLabel("Event brief").fill("Small indoor meeting for 100 guests on 2026-12-20 at 18:00.");
+  let mode = 0;
+  await page.route("**/api/events/learning/suggestions", route => route.fulfill({
+    status: mode === 2 ? 503 : 200, contentType: "application/json",
+    body: JSON.stringify(mode === 2 ? { error: "History is temporarily unavailable." } : { suggestions: [], evidence_count: mode, warnings: [], dimensions: [] }),
+  }));
+  for (mode = 0; mode < 3; mode++) {
+    if (mode === 2) testInfo.annotations.push({ type: "expected-console-error", description: "console: Failed to load resource: the server responded with a status of 503 (Service Unavailable)" });
+    await activate(page.getByRole("button", { name: "Build event plan" }));
+    const history = page.getByRole("region", { name: "From your event history" });
+    if (mode === 2) await expect(history.getByRole("status")).toHaveText("History is temporarily unavailable.");
+    else {
+      await expect(history).toContainText("No similar completed events with repeated quantity evidence yet.");
+      await expect(history.getByRole("button", { name: "Apply to manual plan" })).toHaveCount(0);
+      await activate(history.getByRole("button", { name: "Ignore", exact: true }));
+      await expect(history.getByRole("button", { name: "Review suggestions" })).toBeFocused();
+      await activate(history.getByRole("button", { name: "Review suggestions" }));
+      await expect(history.getByRole("button", { name: "Ignore", exact: true })).toBeFocused();
+    }
+    await activate(page.getByRole("button", { name: "Revise brief" }));
+  }
+  await expectNoViewportOverflow(page);
 });
 
 test("major operator routes remain responsive and error free", async ({ page }) => {

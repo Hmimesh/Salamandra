@@ -101,8 +101,9 @@ def evidence_quantities(example):
                 return {}, ["Past review contains equipment issues that need manual review."]
             for code in affected:
                 quantities.pop(code, None)
-            warnings.append("Past operators reported equipment issues; review affected requirements.")
-    for field in ("missing", "unnecessary", "additional_onsite"):
+            issue = item["kind"].replace("_", " ")
+            warnings.append(f"Past review reported {issue} equipment for {', '.join(sorted(affected))}; review quantities before reuse.")
+    for field in ("missing", "unnecessary", "additional_onsite", "failed"):
         if review.get(field) == "yes" and not any(i.get("kind") == field for i in review.get("items", [])):
             return {}, ["Past review reports unresolved equipment quantities."]
     return quantities, sorted(set(warnings))
@@ -155,6 +156,11 @@ class EventSimilarityService:
             suggestions.append({"capability": capability, "amount": median_low(sorted(values)),
                                 "minimum": min(values), "maximum": max(values), "evidence_count": len(values),
                                 "reason": "Similar " + ", ".join(labels[key] for key in dimensions) + "."})
+        warning_counts = defaultdict(int)
+        for match in matches:
+            for warning in set(match["warnings"]):
+                warning_counts[warning] += 1
         return {"suggestions": suggestions[:MAX_SUGGESTIONS], "evidence_count": len(matches),
-                "warnings": sorted({warning for match in matches for warning in match["warnings"]}),
+                "warnings": [f"{count} similar events: {warning}" if count > 1 else warning
+                             for warning, count in sorted(warning_counts.items())],
                 "dimensions": sorted({reason["dimension"] for match in matches for reason in match["reasons"]})}

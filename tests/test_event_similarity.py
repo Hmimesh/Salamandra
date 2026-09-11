@@ -95,3 +95,38 @@ class TestEventSimilarity(unittest.TestCase):
         result = self.service(a, {**deepcopy(a), "event_id": "b"}).suggestions("org-a", FEATURES)
         self.assertEqual([s["capability"] for s in result["suggestions"]], ["furniture.chair"])
         self.assertEqual(original, a)
+
+    def test_similarity_sanity_matrix_keeps_fixed_weights(self):
+        matrix = [
+            (FEATURES, 100),
+            ({**FEATURES, "guest_count": 1000}, 73),
+            ({**FEATURES, "departments": ["video"]}, 65),
+            ({"venue_type": "indoor"}, 20),
+            ({}, 0),
+            ({"departments": ["video"], "guest_count": 10000, "duration_minutes": 1200, "venue_type": "outdoor"}, 1.8),
+        ]
+        for historical, expected in matrix:
+            with self.subTest(historical=historical):
+                score, reasons = score_features(FEATURES, historical)
+                self.assertEqual(score, expected)
+                self.assertTrue(all(reason["similarity"] > 0 for reason in reasons))
+
+    def test_quantity_matrix_missing_noisy_corrected_and_two_examples(self):
+        for amounts, expected in (((12, 12, 14), 12), ((12, 30, 3), None), ((12,), None),
+                                  ((12, 12), 12), ((12, None), None), ((12, 0, 12), 12)):
+            with self.subTest(amounts=amounts):
+                result = self.service(*(example(str(i), amount) for i, amount in enumerate(amounts))).suggestions("a", FEATURES)
+                self.assertEqual(result["suggestions"][0]["amount"] if result["suggestions"] else None, expected)
+        a, b = example("a"), example("b")
+        b["corrections"] = {"changed": True, "requirements": {"final_planned": [{"capability": "furniture.chair", "amount": 30}]}}
+        self.assertEqual(self.service(a, b).suggestions("a", FEATURES)["suggestions"], [])
+
+    def test_repeated_onsite_issues_are_counted_not_added_to_planned_quantity(self):
+        review = {"additional_onsite": "yes", "items": [{"kind": "additional_onsite", "item_id": "כיסא عربي 🎛️", "quantity": 2}]}
+        result = self.service(example("a", feedback=review), example("b", feedback=review)).suggestions("a", FEATURES)
+        self.assertEqual(result["suggestions"], [])
+        self.assertTrue(any("2 similar events" in warning and "additional onsite" in warning and "furniture.chair" in warning for warning in result["warnings"]))
+
+    def test_failed_equipment_without_identified_item_is_not_preferred(self):
+        result = self.service(example("a", feedback={"failed": "yes"}), example("b")).suggestions("a", FEATURES)
+        self.assertEqual(result["suggestions"], [])

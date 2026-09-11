@@ -264,7 +264,11 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 require_permission(user.role, Permission.EVENTS_PLAN)
                 if self.database_runtime is None:
                     raise StateConflict("Historical suggestions require PostgreSQL.")
-                if len(json.dumps(body, ensure_ascii=False).encode("utf-8")) > 8192:
+                try:
+                    encoded_size = len(json.dumps(body, ensure_ascii=False).encode("utf-8"))
+                except UnicodeEncodeError:
+                    raise ValueError("Suggestion text must contain valid Unicode.") from None
+                if encoded_size > 8192:
                     raise ValueError("Suggestion request is too large.")
                 if set(body) - {"features", "event_id"}:
                     raise ValueError("Unsupported suggestion fields.")

@@ -11,11 +11,18 @@ export function HistoricalSuggestions({ event, onApply }: { event: EventRecord; 
   const [error, setError] = useState("");
   const [ignored, setIgnored] = useState(false);
   const reviewButton = useRef<HTMLButtonElement>(null);
-  useEffect(() => { if (ignored) reviewButton.current?.focus(); }, [ignored]);
+  const firstQuantity = useRef<HTMLInputElement>(null);
+  const ignoreButton = useRef<HTMLButtonElement>(null);
+  const applied = useRef(false);
+  const reviewing = useRef(false);
+  useEffect(() => {
+    if (ignored) reviewButton.current?.focus();
+    else if (reviewing.current) { (firstQuantity.current || ignoreButton.current)?.focus(); reviewing.current = false; }
+  }, [ignored]);
   const features = JSON.stringify({ departments: [...new Set(event.capability_requirements.map(item => item.capability.split(".")[0]))].sort(), guest_count: event.attendee_count || null, duration_minutes: event.duration_minutes || null, venue_type: event.venue_kind || null });
   useEffect(() => {
     let active = true;
-    setResult(null); setError(""); setIgnored(false);
+    setResult(null); setError(""); setIgnored(false); applied.current = false;
     const timer = window.setTimeout(() => {
       void apiRequest<Result>("/api/events/learning/suggestions", { method: "POST", body: { features: JSON.parse(features) } })
         .then(value => { if (active) setResult(value); })
@@ -23,7 +30,7 @@ export function HistoricalSuggestions({ event, onApply }: { event: EventRecord; 
     }, 300);
     return () => { active = false; window.clearTimeout(timer); };
   }, [features]);
-  if (ignored) return <section className="history-suggestions" aria-label="From your event history"><p>Suggestions ignored.</p><button ref={reviewButton} type="button" className="button button-secondary" onClick={() => setIgnored(false)}>Review suggestions</button></section>;
+  if (ignored) return <section className="history-suggestions" aria-label="From your event history"><p>Suggestions ignored.</p><button ref={reviewButton} type="button" className="button button-secondary" onClick={() => { reviewing.current = true; setIgnored(false); }}>Review suggestions</button></section>;
   return <section className="history-suggestions" aria-label="From your event history">
     <h3><History size={17} />From your event history</h3>
     {error ? <p role="status">{error}</p> : !result ? <p role="status">Checking completed events...</p> : <>
@@ -31,10 +38,10 @@ export function HistoricalSuggestions({ event, onApply }: { event: EventRecord; 
       {result.suggestions.length ? <p>{result.suggestions[0].reason}</p> : null}
       {result.suggestions.map((suggestion, index) => {
         const previous = event.capability_requirements.filter(item => item.capability === suggestion.capability).reduce((sum, item) => sum + item.amount, 0);
-        return <label key={suggestion.capability}><span><strong>{suggestion.capability.replaceAll(".", " ")}</strong><small>{previous ? `${previous} currently planned` : "Suggested addition"} · {suggestion.evidence_count} events · observed {suggestion.minimum}–{suggestion.maximum}</small></span><input aria-label={`Suggested quantity for ${suggestion.capability}`} type="number" min={1} max={10000} value={suggestion.amount} onChange={change => setResult({ ...result, suggestions: result.suggestions.map((item, i) => i === index ? { ...item, amount: Number(change.target.value) } : item) })} /></label>;
+        return <label key={suggestion.capability}><span><strong>{suggestion.capability.replaceAll(".", " ")}</strong><small>{previous ? `${previous} currently planned` : "Suggested addition"} · {suggestion.evidence_count} events · observed {suggestion.minimum}–{suggestion.maximum}</small></span><input ref={index === 0 ? firstQuantity : undefined} aria-label={`Suggested quantity for ${suggestion.capability}`} type="number" min={1} max={10000} value={suggestion.amount} onChange={change => setResult({ ...result, suggestions: result.suggestions.map((item, i) => i === index ? { ...item, amount: Number(change.target.value) } : item) })} /></label>;
       })}
       {result.warnings.map(warning => <p key={warning}>{warning}</p>)}
-      <div className="composer-actions"><button className="button button-secondary" type="button" onClick={() => setIgnored(true)}>Ignore</button>{result.suggestions.length ? <button className="button button-primary" type="button" disabled={result.suggestions.some(item => !Number.isInteger(item.amount) || item.amount < 1 || item.amount > 10000)} onClick={() => { onApply(result.suggestions); setIgnored(true); }}>Apply to manual plan</button> : null}</div>
+      <div className="composer-actions"><button ref={ignoreButton} className="button button-secondary" type="button" onClick={() => setIgnored(true)}>Ignore</button>{result.suggestions.length ? <button className="button button-primary" type="button" disabled={result.suggestions.some(item => !Number.isInteger(item.amount) || item.amount < 1 || item.amount > 10000)} onClick={() => { if (applied.current) return; applied.current = true; onApply(result.suggestions); setIgnored(true); }}>Apply to manual plan</button> : null}</div>
     </>}
   </section>;
 }

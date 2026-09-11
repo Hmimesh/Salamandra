@@ -388,6 +388,111 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         return org, user.id, ids, cookie
 
     @isolated_database_inserts
+    def test_learning_full_http_lifecycle_corrected_history_and_no_self_learning(self):
+        from event_learning import EventLearningStore
+        from event_similarity import EventSimilarityService
+
+        org, actor, _, cookie = self._learning_fixture(count=0)
+        store = EventLearningStore(self.factory)
+        service = EventSimilarityService(store)
+        port = self.ports[0]
+        brief = "אירוע קהילתי, عربي! Indoor hall meeting."
+        notes = "נשמר בדיוק: عربي / English; \"ציוד\"!"
+
+        def post(path, body, expected=200):
+            status, result, _ = _request(port, "POST", path, body, cookie)
+            self.assertEqual(status, expected, result)
+            return result
+
+        post("/api/inventory/items", {"id": "Folding chair", "type": "furniture",
+            "class_id": "event-chair", "amount": 40, "scope": "shared",
+            "idempotency_key": uuid4().hex})
+        for name, class_id in (("Transport cart", "utility-cart"), ("Estate car", "standard-vehicle")):
+            post("/api/inventory/items", {"id": name, "type": "transport", "class_id": class_id,
+                "amount": 1, "scope": "shared", "idempotency_key": uuid4().hex})
+
+        def request_body(index, guests, quantity):
+            return {"description": brief, "overrides": {
+                "title": f"אירוע {index} عربي!", "planning_mode": "manual",
+                "start_date": f"2026-09-{index + 10:02}", "start_time": "18:00",
+                "duration_minutes": 120, "attendee_count": guests,
+                "capability_requirements": [{"capability": "furniture.chair", "amount": quantity, "level": "required"}]}}
+
+        def finish(event, historical):
+            self.assertEqual(event["plan"]["total_missing"], 0, event["plan"])
+            for next_status in ("confirmed", "packed", "out", "returned"):
+                self.assertEqual({r["event_id"] for r in store.examples(org)}, set(historical))
+                if next_status in ("packed", "returned"):
+                    field = "checklist" if next_status == "packed" else "return_checklist"
+                    phase = "pack" if next_status == "packed" else "return"
+                    for line in event[field]:
+                        post("/api/events/checklist", {"event_id": event["id"],
+                            "item_id": line["item_id"], "phase": phase, "done": True})
+                event = post("/api/events/status", {"event_id": event["id"], "status": next_status})["event"]
+                self.assertNotIn(event["id"], [r["event_id"] for r in service.rank(org, features, current_event_id=event["id"])])
+            record = store.get(org, event["id"])
+            self.assertTrue(record["eligible"])
+            self.assertEqual(record["original_request"]["brief"], brief)
+            with self.factory() as session:
+                movements = session.scalars(select(StockMovementModel).where(
+                    StockMovementModel.organization_id == org, StockMovementModel.event_id == event["id"])).all()
+                for action, field in (("packed", "packed"), ("out", "dispatched"), ("returned", "returned")):
+                    self.assertTrue(record["execution"][field])
+                    self.assertEqual(record["execution"][field], [m.lines for m in movements if m.action == action])
+            return event
+
+        features = {"departments": ["furniture"], "guest_count": 100,
+                    "duration_minutes": 120, "venue_type": "hall"}
+        ids = []
+        for index, guests, quantity in ((1, 100, 12), (2, 110, 12), (3, 90, 14)):
+            body = request_body(index, guests, 2)
+            event = post("/api/events/save", {**body, "idempotency_key": uuid4().hex}, 201)["event"]
+            corrected = request_body(index, guests, quantity)
+            event = post("/api/events/update", {**corrected, "event_id": event["id"], "version": event["version"]})["event"]
+            # A subsequent metadata edit must not erase the original-to-final correction.
+            event = post("/api/events/update", {**corrected, "event_id": event["id"], "version": event["version"]})["event"]
+            event = finish(event, ids)
+            review = {"event_id": event["id"], "idempotency_key": uuid4().hex,
+                "missing": "no", "unnecessary": "no", "failed": "no", "additional_onsite": "no",
+                "plan_fit": "too_little" if index == 1 else "about_right",
+                "reuse_plan": "with_changes", "notes": notes, "items": []}
+            if index == 1:
+                review.update(additional_onsite="yes", items=[{"kind": "additional_onsite",
+                    "item_id": "folding chair", "quantity": 2, "note": notes}])
+            post("/api/events/feedback", review)
+            self.assertEqual(store.get(org, event["id"])["feedback"]["notes"], notes)
+            ids.append(event["id"])
+
+        body = request_body(4, 100, 1)
+        post("/api/events/describe", body)
+        self.assertEqual({r["event_id"] for r in store.examples(org)}, set(ids))
+        event = post("/api/events/save", {**body, "idempotency_key": uuid4().hex}, 201)["event"]
+        snapshot = self._database_state_snapshot()
+        suggestions = post("/api/events/learning/suggestions", {"features": features, "event_id": event["id"]})
+        self.assertEqual(suggestions["evidence_count"], 3)
+        self.assertEqual(suggestions["suggestions"][0]["amount"], 12)
+        self.assertEqual(suggestions["suggestions"][0]["evidence_count"], 2)
+        self.assertTrue(any("additional onsite" in warning for warning in suggestions["warnings"]))
+        self.assertEqual(service.rank(org, features), service.rank(org, features))
+        self.assertEqual({r["event_id"] for r in service.rank(org, features)}, set(ids))
+        self.assertEqual(self._database_state_snapshot(), snapshot)
+        applied = request_body(4, 100, 13)
+        stale = {**applied, "event_id": event["id"], "version": event["version"]}
+        event = post("/api/events/update", stale)["event"]
+        snapshot = self._database_state_snapshot()
+        post("/api/events/update", stale, 409)
+        self.assertEqual(self._database_state_snapshot(), snapshot)
+        event = finish(event, ids)
+        self.assertEqual({r["event_id"] for r in store.examples(org)}, {*ids, event["id"]})
+        self.assertEqual(post("/api/events/learning/suggestions", {"features": features})["evidence_count"], 4)
+        self.assertEqual(post("/api/events/learning/suggestions", {"features": features, "event_id": event["id"]})["evidence_count"], 3)
+        with self.factory() as session:
+            holding = session.scalar(select(InventoryHoldingModel).where(InventoryHoldingModel.organization_id == org,
+                InventoryHoldingModel.legacy_item_id == "folding chair"))
+            self.assertEqual((holding.available_quantity, holding.reserved_quantity,
+                holding.packed_quantity, holding.dispatched_quantity), (40, 0, 0, 0))
+
+    @isolated_database_inserts
     def test_learning_suggestions_http_isolation_validation_and_read_only(self):
         from event_learning import EventLearningStore
         from event_similarity import EventSimilarityService
@@ -428,6 +533,54 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         self.assertEqual(self._database_state_snapshot(), snapshot)
 
     @isolated_database_inserts
+    def test_learning_http_similar_tenants_and_validation_matrix(self):
+        from database import EventLearningRecordModel
+        org_a, _, ids_a, cookie_a = self._learning_fixture(count=2)
+        org_b, _, ids_b, cookie_b = self._learning_fixture(count=3)
+        with self.factory.begin() as session:
+            for row in session.scalars(select(EventLearningRecordModel).where(EventLearningRecordModel.organization_id == org_b)):
+                row.proposal = {**row.proposal, "requirements": [{"capability": "furniture.chair", "amount": 24}]}
+        path = "/api/events/learning/suggestions"
+        features = {"departments": ["furniture"], "guest_count": 100, "duration_minutes": 120, "venue_type": "indoor"}
+        body = {"features": features}
+        result_a = _request(self.ports[0], "POST", path, body, cookie_a)[1]
+        result_b = _request(self.ports[1], "POST", path, body, cookie_b)[1]
+        self.assertEqual((result_a["evidence_count"], result_a["suggestions"][0]["amount"]), (2, 12))
+        self.assertEqual((result_b["evidence_count"], result_b["suggestions"][0]["amount"]), (3, 24))
+        for identity in ids_a + ids_b:
+            self.assertNotIn(identity, json.dumps(result_a) + json.dumps(result_b))
+        for identity in ids_a:
+            status, result, _ = _request(self.ports[0], "POST", "/api/events/learning/eligibility",
+                {"event_id": identity, "eligible": False, "reason": "Private A", "idempotency_key": uuid4().hex}, cookie_a)
+            self.assertEqual(status, 200, result)
+        self.assertEqual(_request(self.ports[0], "POST", path, body, cookie_b)[1], result_b)
+        self.assertEqual(_request(self.ports[1], "POST", path, body, cookie_a)[1]["evidence_count"], 0)
+        snapshot = self._database_state_snapshot()
+        invalid = [{}, {"features": None}, {"features": "text"}, {"features": {"guest_count": -1}},
+            {"features": {"duration_minutes": -1}}, {"features": {"guest_count": float("nan")}},
+            {"features": {"guest_count": float("inf")}}, {"features": {"duration_minutes": "NaN"}},
+            {"features": {"departments": ["x"] * 10000}}, {"features": {"venue_type": "א" * 10000}},
+            {"features": {"venue_type": "\ud800"}}, {"features": {"unexpected": 1}},
+            {**body, "organization_id": org_a}, {**body, "event_id": []}]
+        for value in invalid:
+            with self.subTest(value=str(value)[:100]):
+                connection = http.client.HTTPConnection("127.0.0.1", self.ports[0], timeout=10)
+                connection.request("POST", path, json.dumps(value).encode("ascii"),
+                    {"Content-Type": "application/json", "Cookie": cookie_b})
+                response = connection.getresponse()
+                data = response.read().decode("utf-8")
+                connection.close()
+                self.assertEqual(response.status, 400, data)
+                self.assertNotIn("Traceback", data)
+                self.assertNotIn(org_a, data)
+        foreign = _request(self.ports[0], "POST", path, {**body, "event_id": ids_a[0]}, cookie_b)
+        absent = _request(self.ports[1], "POST", path, {**body, "event_id": "absent"}, cookie_b)
+        self.assertEqual(foreign[:2], absent[:2])
+        self.assertEqual(foreign[0], 404)
+        self.assertEqual(_request(self.ports[0], "POST", path, {**body, "event_id": "../bad"}, cookie_b)[:2], absent[:2])
+        self.assertEqual(self._database_state_snapshot(), snapshot)
+
+    @isolated_database_inserts
     def test_learning_candidates_enforce_eligibility_and_single_bounded_query(self):
         from database import EventLearningRecordModel
         from event_learning import EventLearningStore
@@ -462,6 +615,49 @@ class TestPostgresHttpRuntime(unittest.TestCase):
 
     @race_required
     @isolated_database_inserts
+    def test_learning_feedback_http_commit_exposes_only_complete_versions(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from event_learning import EventLearningStore
+        org, actor, ids, cookie = self._learning_fixture()
+        store = EventLearningStore(self.factory)
+        review = {"event_id": ids[0], "missing": "no", "unnecessary": "no", "failed": "no",
+            "additional_onsite": "no", "plan_fit": "about_right", "reuse_plan": "yes",
+            "notes": "قبل / לפני", "items": [], "idempotency_key": uuid4().hex}
+        status, first, _ = _request(self.ports[0], "POST", "/api/events/feedback", review, cookie)
+        self.assertEqual(status, 200, first)
+        update = {**review, "feedback_version": first["feedback"]["version"],
+            "idempotency_key": uuid4().hex, "notes": "بعد / אחרי", "unnecessary": "yes",
+            "items": [{"kind": "unnecessary", "item_id": "כיסא عربي", "quantity": 1}]}
+        body = {"features": {"departments": ["furniture"], "guest_count": 100, "duration_minutes": 120, "venue_type": "indoor"}}
+        path = "/api/events/learning/suggestions"
+        before = _request(self.ports[1], "POST", path, body, cookie)[1]
+        old_examples = store.examples(org)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with self.factory.begin() as session:
+                session.scalar(select(EventModel).where(EventModel.organization_id == org, EventModel.id == ids[0]).with_for_update())
+                writer = pool.submit(_request, self.ports[0], "POST", "/api/events/feedback", update, cookie)
+                deadline, waiting = time.monotonic() + 5, 0
+                while time.monotonic() < deadline:
+                    with self.factory() as observer:
+                        waiting = observer.scalar(text("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query ILIKE '%events%'"))
+                    if waiting:
+                        break
+                    time.sleep(.02)
+                self.assertGreaterEqual(waiting, 1)
+                self.assertFalse(writer.done())
+                self.assertEqual(_request(self.ports[1], "POST", path, body, cookie)[1], before)
+                self.assertEqual(store.examples(org), old_examples)
+            status, result, _ = writer.result(timeout=10)
+        self.assertEqual(status, 200, result)
+        current = next(record for record in store.examples(org) if record["event_id"] == ids[0])
+        self.assertEqual(current["feedback"]["version"], first["feedback"]["version"] + 1)
+        self.assertEqual(current["feedback"]["notes"], update["notes"])
+        self.assertEqual(len(current["feedback"]["items"]), 1)
+        self.assertEqual(current["feedback"]["items"][0]["kind"], "unnecessary")
+        self.assertEqual(_request(self.ports[1], "POST", path, body, cookie)[1]["suggestions"], [])
+
+    @race_required
+    @isolated_database_inserts
     def test_learning_reads_committed_feedback_eligibility_and_return_snapshots(self):
         from concurrent.futures import ThreadPoolExecutor
         from database import EventFeedbackModel, EventFeedbackItemModel, EventLearningRecordModel
@@ -480,7 +676,7 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             self.assertEqual(status, 200, result)
             return result
         with ThreadPoolExecutor(max_workers=2) as pool:
-            for mutation in ("feedback", "eligibility", "return"):
+            for mutation in ("feedback", "eligibility", "exclusion", "return"):
                 with self.subTest(mutation=mutation):
                     # Reset the fixture, then hold a deliberately half-written transaction.
                     with self.factory.begin() as session:
@@ -495,9 +691,12 @@ class TestPostgresHttpRuntime(unittest.TestCase):
                         if mutation == "feedback":
                             feedback = session.scalar(select(EventFeedbackModel).where(EventFeedbackModel.event_id == ids[0]).with_for_update())
                             feedback.unnecessary = "yes"
-                        elif mutation == "eligibility":
+                        elif mutation in ("eligibility", "exclusion"):
                             learning = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.event_id == ids[0]).with_for_update())
-                            learning.eligible = False
+                            if mutation == "eligibility":
+                                learning.eligible = False
+                            else:
+                                learning.exclusion_reason = "excluded_by_owner"
                         else:
                             session.get(EventModel, ids[0]).status = "returned"
                             EventLearningStore.sync_execution_in_session(session, session.get(EventModel, ids[0]))
