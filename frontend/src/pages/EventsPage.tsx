@@ -19,10 +19,11 @@ import {
   Users,
   XCircle,
 } from "lucide-react";
-import { type FormEvent, useMemo, useState } from "react";
+import { type FormEvent, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { Avatar, ConflictState, EmptyState, Modal, PageHeader, Readiness, StatusTag } from "../components/ui";
 import { useWorkspace } from "../context/WorkspaceContext";
+import { HistoricalSuggestions } from "../components/HistoricalSuggestions";
 import { eventCrew, eventReadiness, formatDateLong, formatEventDate, titleCase } from "../lib/format";
 import type { EventDraft, EventPlan, EventRecord, PlanLine, StateEnvelope, UserAccount } from "../types";
 
@@ -122,6 +123,7 @@ export function EventsPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [month, setMonth] = useState(() => new Date());
   const [description, setDescription] = useState("");
+  const manualForm = useRef<HTMLFormElement>(null);
   const [planningMode, setPlanningMode] = useState<"describe" | "manual">("describe");
   const [manualEvent, setManualEvent] = useState({ title: "", start_date: "", start_time: "", location: "", duration_minutes: 240, attendee_count: 0 });
   const [manualRequirements, setManualRequirements] = useState<ManualRequirement[]>([{ id: crypto.randomUUID(), capability: "pa.main", customCapability: "", amount: 1, level: "required" }]);
@@ -235,6 +237,20 @@ export function EventsPage() {
     }
   }
 
+  function applyHistoricalRequirements(suggestions: { capability: string; amount: number }[]) {
+    if (!draft) return;
+    const replaced = new Set(suggestions.map(item => item.capability));
+    const requirements = draft.event.capability_requirements.filter(item => !replaced.has(item.capability))
+      .map(({ capability, amount, level }) => ({ capability, amount, level }));
+    requirements.push(...suggestions.map(item => ({ ...item, level: "required" as const })));
+    setManualRequirements(requirements.map(item => ({ ...item, id: crypto.randomUUID(), customCapability: item.capability, capability: requirementOptions.some(option => option[0] === item.capability) ? item.capability : "custom.resource" })));
+    setManualEvent({ title: draft.event.title, start_date: draft.event.start_date, start_time: draft.event.start_time, location: draft.event.location, duration_minutes: draft.event.duration_minutes, attendee_count: draft.event.attendee_count });
+    setPlanningMode("manual");
+    setDraftDirty(true);
+    setCreateKey(crypto.randomUUID());
+    requestAnimationFrame(() => manualForm.current?.querySelector<HTMLInputElement>(".manual-requirement-row input[type=number]")?.focus());
+  }
+
   function beginEdit(event: EventRecord) {
     setEditing({ ...event });
   }
@@ -296,7 +312,7 @@ export function EventsPage() {
         <section className="event-composer">
           <button className="back-link" type="button" onClick={() => navigate("/events")}><ArrowLeft size={17} />Back to events</button>
           <div className="composer-grid">
-            <form className="brief-editor" onSubmit={planEvent}>
+            <form ref={manualForm} className="brief-editor" onSubmit={planEvent} onChange={() => { if (draft) setDraftDirty(true); }}>
               <div className="brief-title"><span>{planningMode === "describe" ? <Sparkles size={20} /> : <SlidersHorizontal size={20} />}</span><div><h2>{planningMode === "describe" ? "Describe the event" : "Build manually"}</h2><p>{planningMode === "describe" ? "Write it the way the brief reaches you. Salamandra will use only stock in this workspace." : "Enter the schedule and operational needs directly. Inventory is still allocated by the same planner."}</p></div></div>
               <div className="segmented-control composer-mode" aria-label="Event creation method"><button type="button" className={planningMode === "describe" ? "active" : ""} onClick={() => { setPlanningMode("describe"); setDraft(null); }}>Describe</button><button type="button" className={planningMode === "manual" ? "active" : ""} onClick={() => { setPlanningMode("manual"); setDraft(null); }}>Build manually</button></div>
               {planningMode === "describe" ? <><label className="field-label" htmlFor="event-brief">Event brief</label><textarea dir="auto" id="event-brief" value={description} onChange={(event) => { setDescription(event.target.value); if (draft) setDraftDirty(true); }} rows={8} placeholder="Conference for 120 guests on 2026-09-12 at 18:00, speeches, panel microphones, stage lighting, and power at Main Hall." required /><div className="example-briefs"><span>Include:</span><span>date and time</span><span>venue</span><span>guest count</span><span>equipment, site, or transport needs</span></div></> : <div className="manual-builder"><div className="form-grid"><label className="form-field-wide">Event name<input dir="auto" value={manualEvent.title} onChange={(event) => setManualEvent({ ...manualEvent, title: event.target.value })} required /></label><label>Date<input type="date" value={manualEvent.start_date} onChange={(event) => setManualEvent({ ...manualEvent, start_date: event.target.value })} required /></label><label>Start time<input type="time" value={manualEvent.start_time} onChange={(event) => setManualEvent({ ...manualEvent, start_time: event.target.value })} required /></label><label>Duration (minutes)<input type="number" min="15" max="10080" value={manualEvent.duration_minutes} onChange={(event) => setManualEvent({ ...manualEvent, duration_minutes: Number(event.target.value) })} required /></label><label>Guests<input type="number" min="0" max="1000000" value={manualEvent.attendee_count || ""} onChange={(event) => setManualEvent({ ...manualEvent, attendee_count: Number(event.target.value || 0) })} /></label><label className="form-field-wide">Venue<input dir="auto" value={manualEvent.location} onChange={(event) => setManualEvent({ ...manualEvent, location: event.target.value })} /></label></div><div className="manual-requirements"><div className="subsection-title"><h3>Requirements</h3><button type="button" className="button button-secondary button-compact" onClick={() => setManualRequirements([...manualRequirements, { id: crypto.randomUUID(), capability: "pa.main", customCapability: "", amount: 1, level: "required" }])}><Plus size={15} />Add</button></div>{manualRequirements.map((requirement) => <div className="manual-requirement-row" key={requirement.id}><label>Department & item<select value={requirement.capability} onChange={(event) => setManualRequirements(manualRequirements.map((item) => item.id === requirement.id ? { ...item, capability: event.target.value } : item))}>{requirementOptions.map(([value, label, group]) => <option key={value} value={value}>{group} · {label}</option>)}<option value="custom.resource">Custom requirement</option></select></label>{requirement.capability === "custom.resource" ? <label>Custom capability<input value={requirement.customCapability} placeholder="example: catering.coffee" onChange={(event) => setManualRequirements(manualRequirements.map((item) => item.id === requirement.id ? { ...item, customCapability: event.target.value } : item))} required /></label> : null}<label>Quantity<input type="number" min="1" max="10000" value={requirement.amount} onChange={(event) => setManualRequirements(manualRequirements.map((item) => item.id === requirement.id ? { ...item, amount: Number(event.target.value) } : item))} required /></label><label>Priority<select value={requirement.level} onChange={(event) => setManualRequirements(manualRequirements.map((item) => item.id === requirement.id ? { ...item, level: event.target.value } : item))}><option value="required">Required</option><option value="recommended">Recommended</option><option value="optional">Optional</option></select></label><button type="button" className="icon-button" aria-label="Remove requirement" title="Remove requirement" disabled={manualRequirements.length === 1} onClick={() => setManualRequirements(manualRequirements.filter((item) => item.id !== requirement.id))}><Trash2 size={16} /></button></div>)}</div></div>}
@@ -314,6 +330,7 @@ export function EventsPage() {
                   {draft.event.milestones.length ? <div className="run-of-show"><span>Run of show</span><div>{draft.event.milestones.map((milestone) => <div key={`${milestone.time}-${milestone.label}`}><strong>{milestone.time}</strong><span>{milestone.label}</span></div>)}</div></div> : null}
                   <div className="plan-summary"><div><span>Allocated lines</span><strong>{draft.event.plan.lines.filter((line) => line.item_id).length}</strong></div><div><span>Required missing</span><strong>{draft.event.plan.total_missing}</strong></div><div><span>Spare missing</span><strong>{draft.event.plan.recommended_missing}</strong></div></div>
                   <TransportBand plan={draft.event.plan} />
+                  {!draftDirty ? <HistoricalSuggestions event={draft.event} onApply={applyHistoricalRequirements} /> : null}
                   {draft.event.plan.reallocations.length ? <div className="reallocation-list"><div className="subsection-title"><h3><ArrowRightLeft size={16} />Overlap reallocation</h3><span>{draft.event.plan.reallocations.length} event affected</span></div>{draft.event.plan.reallocations.map((reallocation) => <div className="reallocation-row" key={reallocation.event_id}><strong>{reallocation.event_title}{reallocation.required_missing ? ` · ${reallocation.required_missing} now missing` : ""}</strong><span>{Object.entries(reallocation.removed).map(([item, amount]) => `${amount}x ${titleCase(item)}`).join(", ") || "Previous allocation"}</span><ArrowRightLeft size={15} /><span>{Object.entries(reallocation.added).map(([item, amount]) => `${amount}x ${titleCase(item)}`).join(", ") || "Rebalanced stock"}</span><small>{reallocation.reason}</small></div>)}</div> : null}
                   <div className="plan-lines">
                     {draft.event.plan.lines.map((line, index) => {

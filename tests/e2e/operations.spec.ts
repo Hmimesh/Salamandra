@@ -83,6 +83,69 @@ async function expectNoViewportOverflow(page: Page) {
   expect(sizes.scroll, `horizontal overflow: ${JSON.stringify(sizes)}`).toBeLessThanOrEqual(sizes.client + 1);
 }
 
+test("Phase D history suggestions remain operator controlled", async ({ page }, testInfo) => {
+  await signIn(page, `owner@phase-d-${testInfo.project.name}.test`);
+  await savePreference(page, () => activate(page.getByRole("button", { name: "dark", exact: true })));
+  await savePreference(page, () => page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption("largest"));
+  await page.goto("/events/new");
+  await expect(page).toHaveTitle(/Salamandra/i);
+  const requests: string[] = [];
+  page.on("request", request => { if (request.method() === "POST") requests.push(new URL(request.url()).pathname); });
+  await activate(page.getByRole("button", { name: "Build manually" }));
+  const form = page.locator("form.brief-editor");
+  await form.getByLabel("Event name").fill("אירוע عربي, mixed!");
+  await form.getByLabel("Date", { exact: true }).fill("2026-11-24");
+  await form.getByLabel("Start time").fill("19:00");
+  await form.getByLabel("Duration (minutes)").fill("120");
+  await form.getByLabel("Guests").fill("100");
+  await form.getByLabel("Department & item").selectOption("furniture.chair");
+  await activate(page.getByRole("button", { name: "Build event plan" }));
+  const history = page.getByRole("region", { name: "From your event history" });
+  await expect(history.getByText("Based on 3 similar past events", { exact: true })).toBeVisible();
+  const quantity = history.getByRole("spinbutton", { name: "Suggested quantity for furniture.chair" });
+  await expect(quantity).toHaveValue("12");
+  await expectNoViewportOverflow(page);
+  const clipped = await page.locator(".event-composer").evaluate(root => {
+    const boundary = root.getBoundingClientRect();
+    return [...root.querySelectorAll("button, input, select")].filter(control => {
+      const rect = control.getBoundingClientRect();
+      return rect.width > 0 && (rect.left < boundary.left - 1 || rect.right > boundary.right + 1);
+    }).map(control => control.getAttribute("aria-label") || control.textContent);
+  });
+  expect(clipped, "planner controls must not be hidden by ancestor clipping").toEqual([]);
+  await activate(history.getByRole("button", { name: "Ignore", exact: true }));
+  await expect(history.getByRole("button", { name: "Review suggestions" })).toBeFocused();
+  await expect(form.getByLabel("Quantity", { exact: true })).toHaveValue("1");
+  await activate(history.getByRole("button", { name: "Review suggestions" }));
+  await quantity.focus();
+  await quantity.fill("13");
+  await page.keyboard.press("Tab");
+  await expect(history.getByRole("button", { name: "Ignore", exact: true })).toBeFocused();
+  expect(await history.getByRole("button", { name: "Ignore", exact: true }).evaluate(el => getComputedStyle(el).outlineStyle)).not.toBe("none");
+  await page.keyboard.press("Tab");
+  await expect(history.getByRole("button", { name: "Apply to manual plan" })).toBeFocused();
+  await page.screenshot({ path: testInfo.outputPath("history-dark-largest.png"), fullPage: true });
+  await page.keyboard.press("Enter");
+  await expect(form.getByLabel("Quantity", { exact: true })).toHaveValue("13");
+  await expect(form.getByLabel("Quantity", { exact: true })).toBeFocused();
+  const save = page.getByRole("button", { name: /Save as planning|Save event/ });
+  await expect(save).toBeDisabled();
+  expect(requests).toEqual(["/api/events/describe", "/api/events/learning/suggestions"]);
+  const recalculated = page.waitForResponse(response => response.url().endsWith("/api/events/describe") && response.status() === 200);
+  await activate(page.getByRole("button", { name: /Recalculate/ }));
+  const draft = await (await recalculated).json();
+  expect(draft.draft.event.capability_requirements).toContainEqual(expect.objectContaining({ capability: "furniture.chair", amount: 13 }));
+  await expect(save).toBeEnabled();
+  await expectNoViewportOverflow(page);
+  const saved = page.waitForResponse(response => response.url().endsWith("/api/events/save") && response.status() === 201);
+  await activate(save);
+  const stored = await (await saved).json();
+  expect(stored.event.title).toBe("אירוע عربي, mixed!");
+  expect(stored.event.capability_requirements).toContainEqual(expect.objectContaining({ capability: "furniture.chair", amount: 13 }));
+  expect(requests.some(path => /inventory|status|feedback|eligibility/.test(path))).toBe(false);
+  await expect(page).toHaveURL(/\/events$/);
+});
+
 test("major operator routes remain responsive and error free", async ({ page }) => {
   const errors = watchErrors(page);
   await signIn(page);

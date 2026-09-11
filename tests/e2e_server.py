@@ -21,7 +21,8 @@ from server import SalamandraServer
 from web_config import WebConfig
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
-from database import Base, InventoryHoldingModel
+from database import Base, EventModel, InventoryHoldingModel
+from event_learning import EventLearningStore
 from postgres_runtime import PostgresRuntime
 
 
@@ -45,6 +46,24 @@ def handler_for(data_dir: Path, port: int):
     if owner is None:
         raise RuntimeError("Could not create the Playwright account fixture.")
     for viewport in ("mobile-360", "tablet-768", "desktop-1280", "wide-1440", "desktop-200-percent"):
+        history_org = f"history-{viewport}"
+        history_email = f"owner@phase-d-{viewport}.test"
+        accounts.create_user(name="History Owner", email=history_email,
+            password="playwright-password", role="owner",
+            organization_id=history_org, organization_name="History Workspace")
+        history_owner = accounts.authenticate(history_email, "playwright-password")
+        with runtime.factory.begin() as session:
+            for index, quantity in enumerate((12, 12, 14)):
+                record = EventModel(id=f"{history_org}-{index}", organization_id=history_org,
+                    owner_user_id=history_owner.id, title="אירוע عربي", status="returned", data={
+                        "description": "אירוע عربي", "attendee_count": 100,
+                        "duration_minutes": 120, "venue_kind": "indoor",
+                        "capability_requirements": [{"capability": "furniture.chair", "amount": quantity}],
+                        "plan": {"lines": []}})
+                session.add(record)
+                session.flush()
+                learning = EventLearningStore.create_in_session(session, record, source_type="real")
+                learning.eligible, learning.exclusion_reason = True, None
         accounts.create_user(
             name="Clear Owner", email=f"owner@phase-b5-{viewport}.test",
             password="playwright-password", role="owner",

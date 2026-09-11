@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from database import (
@@ -161,14 +161,36 @@ class EventLearningStore:
             return self._record(row, feedback, items)
 
     def examples(self, organization_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        if not organization_id:
+            raise ValueError("Organization context is required.")
         with self.factory() as session:
-            rows = session.scalars(select(EventLearningRecordModel).where(EventLearningRecordModel.organization_id == organization_id, EventLearningRecordModel.eligible.is_(True)).order_by(EventLearningRecordModel.event_id).limit(max(1, min(limit, 500))))
-            result = []
-            for row in rows:
-                feedback = session.scalar(select(EventFeedbackModel).where(EventFeedbackModel.organization_id == organization_id, EventFeedbackModel.event_id == row.event_id))
-                items = [self._item(item) for item in session.scalars(select(EventFeedbackItemModel).where(EventFeedbackItemModel.organization_id == organization_id, EventFeedbackItemModel.feedback_id == feedback.id))] if feedback else []
-                result.append(self._record(row, feedback, items))
-            return result
+            # Limit candidates before joining item rows. One statement provides a
+            # committed snapshot of eligibility, review answers and affected items.
+            candidates = select(EventLearningRecordModel.id).join(
+                EventModel, and_(EventModel.id == EventLearningRecordModel.event_id,
+                                 EventModel.organization_id == organization_id)
+            ).where(
+                EventLearningRecordModel.organization_id == organization_id,
+                EventLearningRecordModel.eligible.is_(True),
+                EventLearningRecordModel.source_type == "real",
+                EventLearningRecordModel.exclusion_reason.is_(None),
+                EventModel.status == "returned",
+            ).order_by(EventLearningRecordModel.event_id).limit(max(1, min(limit, 100))).subquery()
+            rows = session.execute(select(EventLearningRecordModel, EventFeedbackModel, EventFeedbackItemModel)
+                .join(candidates, candidates.c.id == EventLearningRecordModel.id)
+                .outerjoin(EventFeedbackModel, and_(EventFeedbackModel.event_id == EventLearningRecordModel.event_id,
+                                                   EventFeedbackModel.organization_id == organization_id))
+                .outerjoin(EventFeedbackItemModel, and_(EventFeedbackItemModel.feedback_id == EventFeedbackModel.id,
+                                                       EventFeedbackItemModel.organization_id == organization_id))
+                .where(EventLearningRecordModel.organization_id == organization_id)
+                .order_by(EventLearningRecordModel.event_id, EventFeedbackItemModel.id))
+            result = {}
+            for row, feedback, item in rows:
+                if row.event_id not in result:
+                    result[row.event_id] = self._record(row, feedback, [])
+                if item is not None:
+                    result[row.event_id]["feedback"]["items"].append(self._item(item))
+            return list(result.values())
 
     def save_feedback(self, organization_id: str, actor_user_id: str, event_id: str, payload: dict[str, Any], request_id: str, idempotency_key: str, expected_version: int | None) -> dict[str, Any]:
         with self.factory.begin() as session:

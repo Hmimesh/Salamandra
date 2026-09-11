@@ -658,14 +658,8 @@ class PostgresEventMemory:
             return [self._record(session, row) for row in rows]
 
     def suggest_from_history(self, description: str, organization_id: str | None = None) -> list[Requirement]:
-        tokens = self._tokens(description)
-        suggestions: dict[str, int] = {}
-        for event in self.list_events(organization_id):
-            if len(tokens.intersection(self._tokens(event.description))) < 2:
-                continue
-            for requirement in event.requested_items:
-                suggestions[requirement.item_id] = max(suggestions.get(requirement.item_id, 0), requirement.amount)
-        return [Requirement(item_id=item_id, amount=amount) for item_id, amount in sorted(suggestions.items())]
+        # History is offered by Phase D and enters the planner only after Apply.
+        return []
 
     def active_reservations(self, exclude_event_id: str | None = None, organization_id: str | None = None, start_date: str | None = None, start_time: str = "00:00", duration_minutes: int = 1440) -> dict[str, int]:
         reservations: dict[str, int] = {}

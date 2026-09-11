@@ -260,6 +260,25 @@ class SalamandraServer(BaseHTTPRequestHandler):
 
             user = self.require_user()
 
+            if parsed_url.path == "/api/events/learning/suggestions":
+                require_permission(user.role, Permission.EVENTS_PLAN)
+                if self.database_runtime is None:
+                    raise StateConflict("Historical suggestions require PostgreSQL.")
+                if len(json.dumps(body, ensure_ascii=False).encode("utf-8")) > 8192:
+                    raise ValueError("Suggestion request is too large.")
+                if set(body) - {"features", "event_id"}:
+                    raise ValueError("Unsupported suggestion fields.")
+                event_id = body.get("event_id")
+                if event_id is not None:
+                    event_id = self.required_identifier(event_id, "event_id")
+                    if self.memory.get_for_organization(event_id, user.organization_id) is None:
+                        raise ResourceNotFound("Event was not found.")
+                from event_similarity import EventSimilarityService
+                self.send_json(EventSimilarityService(self.database_runtime.learning).suggestions(
+                    user.organization_id, body.get("features"), event_id
+                ))
+                return
+
             if parsed_url.path == "/api/events/feedback":
                 if self.database_runtime is None:
                     raise StateConflict("Event feedback requires PostgreSQL.")

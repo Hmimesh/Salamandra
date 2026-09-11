@@ -359,6 +359,160 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         return headers["set-cookie"].split(";", 1)[0]
 
+    def _learning_fixture(self, role="owner", count=2):
+        from event_learning import EventLearningStore
+        from postgres_runtime import PostgresRuntime
+
+        org = "learning-" + uuid4().hex
+        email = org + "@example.test"
+        runtime = PostgresRuntime(self.factory)
+        runtime.accounts.create_user(name="History tester", email=email,
+                                     password="Learning-password-123", role=role,
+                                     organization_id=org, organization_name=org)
+        user = runtime.accounts.authenticate(email, "Learning-password-123")
+        ids = []
+        with self.factory.begin() as session:
+            for _ in range(count):
+                event = EventModel(id=uuid4().hex, organization_id=org, owner_user_id=user.id,
+                    title="אירוע عربي", status="returned", data={
+                        "description": "אירוע عربي, mixed!", "attendee_count": 100,
+                        "duration_minutes": 120, "venue_kind": "indoor",
+                        "capability_requirements": [{"capability": "furniture.chair", "amount": 12}],
+                        "plan": {"lines": [{"item_id": "כיסא عربي", "capability": "furniture.chair", "amount": 12}]}})
+                session.add(event)
+                session.flush()
+                row = EventLearningStore.create_in_session(session, event, source_type="real")
+                row.eligible, row.exclusion_reason = True, None
+                ids.append(event.id)
+        cookie = self._sign_in_credentials(self.ports[0], email, "Learning-password-123")
+        return org, user.id, ids, cookie
+
+    @isolated_database_inserts
+    def test_learning_suggestions_http_isolation_validation_and_read_only(self):
+        from event_learning import EventLearningStore
+        from event_similarity import EventSimilarityService
+
+        org_a, _, ids, cookie_a = self._learning_fixture()
+        org_b, _, _, cookie_b = self._learning_fixture(count=0)
+        _, _, _, tech_cookie = self._learning_fixture(role="technician", count=0)
+        features = {"departments": ["furniture"], "guest_count": 100,
+                    "duration_minutes": 120, "venue_type": "indoor"}
+        path = "/api/events/learning/suggestions"
+        snapshot = self._database_state_snapshot()
+        self.assertEqual(_request(self.ports[0], "POST", path, {"features": features})[0], 401)
+        self.assertEqual(_request(self.ports[0], "POST", path, {"features": features}, tech_cookie)[0], 403)
+        status, result, _ = _request(self.ports[0], "POST", path, {"features": features}, cookie_a)
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result["suggestions"][0]["amount"], 12)
+        self.assertEqual(result["evidence_count"], 2)
+        self.assertNotIn("אירוע", json.dumps(result, ensure_ascii=False))
+        for identity in ids:
+            self.assertNotIn(identity, json.dumps(result))
+        status, empty, _ = _request(self.ports[1], "POST", path, {"features": features}, cookie_b)
+        self.assertEqual(status, 200)
+        self.assertEqual(empty["evidence_count"], 0)
+        self.assertEqual(empty["suggestions"], [])
+        self.assertEqual(EventLearningStore(self.factory).examples(org_b), [])
+        self.assertEqual(EventSimilarityService(EventLearningStore(self.factory)).rank(org_b, features), [])
+        foreign = _request(self.ports[0], "POST", path, {"features": features, "event_id": ids[0]}, cookie_b)
+        absent = _request(self.ports[0], "POST", path, {"features": features, "event_id": "absent"}, cookie_b)
+        self.assertEqual(foreign[:2], absent[:2])
+        self.assertEqual(foreign[0], 404)
+        for body in ({"features": []}, {"features": {"guest_count": True}},
+                     {"features": features, "organization_id": org_a},
+                     {"features": features, "event_id": []},
+                     {"features": {"venue_type": "א" * 5000}}):
+            self.assertEqual(_request(self.ports[0], "POST", path, body, cookie_a)[0], 400)
+        own = _request(self.ports[0], "POST", path, {"features": features, "event_id": ids[0]}, cookie_a)
+        self.assertEqual(own[1]["suggestions"], [])
+        self.assertEqual(self._database_state_snapshot(), snapshot)
+
+    @isolated_database_inserts
+    def test_learning_candidates_enforce_eligibility_and_single_bounded_query(self):
+        from database import EventLearningRecordModel
+        from event_learning import EventLearningStore
+
+        org, _, ids, _ = self._learning_fixture(count=114)
+        with self.factory.begin() as session:
+            for identity, source in zip(ids, ("test", "synthetic", "demo", "unknown", "imported-unknown")):
+                row = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.event_id == identity))
+                row.source_type = source
+            for identity, status in zip(ids[5:], ("planning", "confirmed", "packed", "out", "cancelled")):
+                session.get(EventModel, identity).status = status
+            row = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.event_id == ids[10]))
+            row.exclusion_reason = "owner_excluded"
+            row = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.event_id == ids[11]))
+            row.eligible = False
+        statements = []
+        def capture(connection, cursor, statement, parameters, context, many):
+            statements.append(statement)
+        sqlalchemy_event.listen(self.engine, "before_cursor_execute", capture)
+        try:
+            examples = EventLearningStore(self.factory).examples(org, 10000)
+        finally:
+            sqlalchemy_event.remove(self.engine, "before_cursor_execute", capture)
+        self.assertEqual(len(statements), 1)
+        self.assertEqual(len(examples), 100)
+        self.assertTrue(set(ids[:12]).isdisjoint(e["event_id"] for e in examples))
+        self.assertEqual(examples[0]["original_request"]["brief"], "אירוע عربي, mixed!")
+        self.assertEqual(len(EventLearningStore(self.factory).examples(org, 3)), 3)
+        # Production planning cannot silently apply raw-text history matches.
+        from postgres_runtime import PostgresRuntime
+        self.assertEqual(PostgresRuntime(self.factory).memory.suggest_from_history("אירוע عربي", org), [])
+
+    @race_required
+    @isolated_database_inserts
+    def test_learning_reads_committed_feedback_eligibility_and_return_snapshots(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from database import EventFeedbackModel, EventFeedbackItemModel, EventLearningRecordModel
+        from event_learning import EventLearningStore
+
+        org, actor, ids, cookie = self._learning_fixture()
+        store = EventLearningStore(self.factory)
+        review = {"missing": "no", "unnecessary": "no", "failed": "no", "additional_onsite": "no",
+                  "plan_fit": "about_right", "reuse_plan": "yes", "notes": "פרטי عربي", "items": []}
+        store.save_feedback(org, actor, ids[0], review, "request", "feedback-seed", None)
+        path = "/api/events/learning/suggestions"
+        body = {"features": {"departments": ["furniture"], "guest_count": 100,
+                             "duration_minutes": 120, "venue_type": "indoor"}}
+        def read(port):
+            status, result, _ = _request(port, "POST", path, body, cookie)
+            self.assertEqual(status, 200, result)
+            return result
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for mutation in ("feedback", "eligibility", "return"):
+                with self.subTest(mutation=mutation):
+                    # Reset the fixture, then hold a deliberately half-written transaction.
+                    with self.factory.begin() as session:
+                        learning = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.event_id == ids[0]))
+                        learning.eligible, learning.exclusion_reason = True, None
+                        feedback = session.scalar(select(EventFeedbackModel).where(EventFeedbackModel.event_id == ids[0]))
+                        feedback.unnecessary = "no"
+                        session.execute(delete(EventFeedbackItemModel).where(EventFeedbackItemModel.feedback_id == feedback.id))
+                        session.get(EventModel, ids[0]).status = "out" if mutation == "return" else "returned"
+                    before = read(self.ports[0])
+                    with self.factory.begin() as session:
+                        if mutation == "feedback":
+                            feedback = session.scalar(select(EventFeedbackModel).where(EventFeedbackModel.event_id == ids[0]).with_for_update())
+                            feedback.unnecessary = "yes"
+                        elif mutation == "eligibility":
+                            learning = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.event_id == ids[0]).with_for_update())
+                            learning.eligible = False
+                        else:
+                            session.get(EventModel, ids[0]).status = "returned"
+                            EventLearningStore.sync_execution_in_session(session, session.get(EventModel, ids[0]))
+                        session.flush()
+                        futures = [pool.submit(read, port) for port in self.ports]
+                        for future in futures:
+                            self.assertEqual(future.result(timeout=8), before)
+                        if mutation == "feedback":
+                            session.add(EventFeedbackItemModel(organization_id=org, feedback_id=feedback.id,
+                                kind="unnecessary", item_id="כיסא عربي", label_snapshot="כיסא عربي", quantity=1, note="פרטי"))
+                    after = read(self.ports[1])
+                    self.assertNotEqual(after, before)
+                    self.assertEqual(bool(after["suggestions"]), mutation == "return")
+                    self.assertNotIn("פרטי", json.dumps(after, ensure_ascii=False))
+
     def test_workspace_registration_creates_an_empty_authoritative_workspace(self):
         email = f"new-owner-{uuid4().hex}@example.test"
         status, payload, headers = _request(
