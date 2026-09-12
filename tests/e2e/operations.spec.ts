@@ -1,5 +1,7 @@
 import { expect, test as base, type Page, type Locator } from "@playwright/test";
 import { execFileSync } from "node:child_process";
+import { inventoryLabel, inventoryDiagnostic, inventorySearch } from "../../frontend/src/lib/inventoryLabel";
+import type { InventoryItem } from "../../frontend/src/types";
 
 const test = base.extend<{ errorGuard: void }>({
   errorGuard: [async ({ page }, use, testInfo) => {
@@ -305,6 +307,107 @@ test("dialogs trap focus, restore focus, and close with Escape", async ({ page }
   await expect(trigger).toBeFocused();
 });
 
+test("inventory labels use readable fields before diagnostic IDs", () => {
+  const item = { id: "item_0ae36b63dae54087a946adbfe8489d26", display_name: "XLR cable 10m", manufacturer: "Shure", model: "SM58", category_label: "Microphone", type: "powered_speaker" };
+  expect(inventoryLabel(item)).toBe("XLR cable 10m");
+  expect(inventoryLabel({ ...item, display_name: "" })).toBe("Shure SM58");
+  expect(inventoryLabel({ ...item, display_name: "", manufacturer: "" })).toBe("SM58");
+  expect(inventoryLabel({ ...item, display_name: "", model: "" })).toBe("Microphone");
+  expect(inventoryLabel({ id: item.id, type: "powered_speaker" })).toBe("Powered Speaker");
+  expect(inventoryLabel({ id: item.id })).toBe("Unnamed inventory item");
+  expect(inventoryDiagnostic(item)).toBe("");
+  expect(inventoryDiagnostic({ id: item.id })).toBe(`Item ID: ${item.id}`);
+  expect(inventorySearch({ ...item, attributes: { aliases: ["מיקרופון", "ميكروفون"] } } as InventoryItem)).toContain("מיקרופון");
+  expect(inventorySearch(item as InventoryItem)).not.toContain(item.id);
+});
+
+test("dependency picker labels, search, scope, keyboard and bounded layout", async ({ page }, testInfo) => {
+  await signIn(page);
+  const envelope = await (await page.request.get("/api/state")).json();
+  const state = envelope.state || envelope;
+  const baseItem = state.inventory.items[0];
+  const item = (id: string, fields: Record<string, unknown>) => ({ ...baseItem, id, display_name: "", manufacturer: "", model: "", category_label: "", type: "", requirements: [], ...fields });
+  const named = item("item_0ae36b63dae54087a946adbfe8489d26", { display_name: "EV ZLX-15P", manufacturer: "Electro-Voice", model: "ZLX-15P", category_label: "Powered speaker", count: 4 });
+  const shared = [named, item("item_model", { manufacturer: "Shure", model: "SM58", type: "microphone" }), item("item_diagnostic", {}),
+    ...Array.from({ length: 70 }, (_, index) => item(`item_many_${index}`, { display_name: `Cable ${index}`, type: "cable" }))];
+  const personal = item("item_private", { display_name: "Personal monitor" });
+  state.inventories.shared.items = shared;
+  state.inventories.personal.items = [personal];
+  state.inventories.combined.items = [...shared, personal];
+  state.inventory.items = [...shared, personal];
+  await page.route("**/api/state", route => route.fulfill({ json: envelope }));
+  await page.goto("/inventory");
+  await page.getByRole("button", { name: "Add item", exact: true }).click();
+  await page.getByRole("button", { name: "Create a custom item" }).click();
+  const dialog = page.getByRole("dialog", { name: "Add custom item" });
+  const picker = dialog.getByRole("combobox", { name: "Linked inventory item" });
+  await picker.fill("ZLX-15P");
+  await expect(dialog.getByRole("listbox").getByRole("option")).toHaveCount(1);
+  await expect(dialog.getByRole("listbox").getByRole("option")).toContainText("EV ZLX-15P");
+  await expect(dialog.getByRole("listbox").getByRole("option")).not.toContainText(named.id);
+  await picker.press("ArrowDown");
+  await picker.press("Enter");
+  await expect(dialog.locator('input[name="requirement_id"]')).toHaveValue(named.id);
+  await picker.fill("SM58");
+  await expect(dialog.getByRole("listbox").getByRole("option")).toContainText("Shure SM58");
+  await picker.press("ArrowUp");
+  await picker.press("Enter");
+  await expect(dialog.locator('input[name="requirement_id"]')).toHaveValue("item_model");
+  await picker.fill("EV ZLX");
+  await picker.press("Escape");
+  await expect(picker).toHaveAttribute("aria-expanded", "false");
+  await expect(dialog).toBeVisible();
+  await expect(picker).toBeFocused();
+  await picker.fill("Personal monitor");
+  await expect(dialog.getByText("No matching items", { exact: true })).toBeVisible();
+  await dialog.locator('select[name="scope"]').selectOption("personal");
+  await picker.fill("Personal monitor");
+  await picker.press("ArrowDown");
+  await picker.press("Enter");
+  await expect(dialog.locator('input[name="requirement_id"]')).toHaveValue("item_private");
+  await dialog.locator('select[name="scope"]').selectOption("shared");
+  await expect(dialog.locator('input[name="requirement_id"]')).toHaveValue("");
+  await picker.fill("Cable");
+  await expect(dialog.getByRole("listbox").getByRole("option")).toHaveCount(50);
+  for (const theme of ["light", "dark"]) {
+    await page.evaluate(theme => { document.documentElement.dataset.theme = theme; document.documentElement.dataset.fontScale = "largest"; }, theme);
+    await picker.press("ArrowDown");
+    await expect(picker).toBeFocused();
+    await expectNoViewportOverflow(page);
+  }
+  await expectNoViewportOverflow(page);
+  const sizes = await dialog.evaluate(element => ({ width: element.clientWidth, scroll: element.scrollWidth }));
+  expect(sizes.scroll).toBeLessThanOrEqual(sizes.width + 1);
+  await picker.scrollIntoViewIfNeeded();
+  const dropdown = await dialog.getByRole("listbox").boundingBox();
+  const panel = await dialog.boundingBox();
+  expect(dropdown!.x).toBeGreaterThanOrEqual(panel!.x);
+  expect(dropdown!.x + dropdown!.width).toBeLessThanOrEqual(panel!.x + panel!.width);
+  expect(dropdown!.height).toBeLessThanOrEqual(page.viewportSize()!.height * 0.35 + 1);
+  await expect.poll(async () => {
+    const bounds = await dialog.getByRole("listbox").boundingBox();
+    return bounds!.y + bounds!.height;
+  }).toBeLessThanOrEqual(panel!.y + panel!.height);
+  await page.screenshot({ path: `${process.env.TEMP || "/tmp"}/salamandra-dependency-${testInfo.project.name}.png` });
+  await picker.press("Escape");
+  await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
+  await page.getByRole("button", { name: "Close dialog" }).click();
+  await page.getByRole("button", { name: `Edit ${named.id}`, exact: true }).click();
+  const edit = page.getByRole("dialog", { name: "Edit equipment" });
+  await edit.getByRole("combobox", { name: "Linked inventory item" }).fill("EV ZLX");
+  await expect(edit.getByRole("listbox").getByRole("option")).toHaveCount(0);
+  await edit.getByRole("combobox", { name: "Linked inventory item" }).press("Escape");
+  await edit.getByRole("button", { name: "Close dialog" }).click();
+  state.inventories.shared.items = [];
+  state.inventories.combined.items = [];
+  state.inventory.items = [];
+  await page.reload();
+  await page.getByRole("button", { name: "Add item", exact: true }).click();
+  await page.getByRole("button", { name: "Create a custom item" }).click();
+  await dialog.getByRole("combobox", { name: "Linked inventory item" }).press("ArrowDown");
+  await expect(dialog.getByText("No inventory items available", { exact: true })).toBeVisible();
+});
+
 test("custom inventory and dependencies can be created", async ({ page }, testInfo) => {
   const errors = watchErrors(page);
   await signIn(page);
@@ -315,10 +418,15 @@ test("custom inventory and dependencies can be created", async ({ page }, testIn
   const name = `Qa ${testInfo.project.name} microphone`;
   await dialog.getByLabel("Item name").fill(name);
   await dialog.getByLabel("Category").selectOption("microphone");
-  await dialog.getByLabel("Linked inventory item").selectOption("xlr cable");
+  const dependency = dialog.getByRole("combobox", { name: "Linked inventory item" });
+  await dependency.fill("xlr");
+  await dependency.press("ArrowDown");
+  await dependency.press("Enter");
+  await expect(dialog.locator('input[name="requirement_id"]')).toHaveValue("xlr cable");
   await dialog.getByLabel("Minimum quantity").fill("2");
   await expectNoViewportOverflow(page);
   await activate(dialog.getByRole("button", { name: "Add equipment" }));
+  await expect(dialog).toBeHidden();
   await page.getByPlaceholder("Search inventory").fill(name);
   await expect(page.getByText("2x Xlr Cable", { exact: true }).first()).toBeVisible();
   await expect(page.getByRole("button", { name: /Check out QA vocal microphone/i })).toHaveCount(0);
@@ -400,7 +508,7 @@ test("calendar overflow and destructive confirmations preserve keyboard focus", 
   const date = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-22`;
   for (let index = 0; index < 3; index++) {
     const response = await page.request.post("/api/events/save", {
-      headers: { Origin: "http://127.0.0.1:4173" },
+      headers: { Origin: new URL(page.url()).origin },
       data: {
         description: `Small meeting on ${date} at 19:00 with no lighting.`,
         overrides: { title: `Calendar ${testInfo.project.name} ${index}`, start_date: date },
@@ -560,7 +668,7 @@ test("compact text retains the operator floor without losing dense layout", asyn
   await assertControls();
   const date = new Date().toISOString().slice(0, 10);
   const response = await page.request.post("/api/events/save", {
-    headers: { Origin: "http://127.0.0.1:4173" },
+    headers: { Origin: new URL(page.url()).origin },
     data: {
       description: `Small meeting on ${date} at 19:00 with no lighting.`,
       overrides: { title: `Compact ${testInfo.project.name}`, start_date: date },

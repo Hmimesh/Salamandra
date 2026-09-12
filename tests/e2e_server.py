@@ -110,14 +110,14 @@ def handler_for(data_dir: Path, port: int):
     startup_stage("seeding inventory")
     workspace = runtime.workspace
     workspace.add_item(
-        ItemNode(id="xlr cable", type="cable", count=12, info="Balanced signal cable"),
+        ItemNode(id="xlr cable", display_name="Xlr Cable", type="cable", count=12, info="Balanced signal cable"),
         amount=12,
         scope="shared",
         user_id=owner.id,
         organization_id=owner.organization_id,
     )
     workspace.add_item(
-        ItemNode(id="main speaker", type="pa", count=4, info="Active 15 inch PA"),
+        ItemNode(id="main speaker", display_name="Main Speaker", type="pa", count=4, info="Active 15 inch PA"),
         amount=4,
         scope="shared",
         user_id=owner.id,

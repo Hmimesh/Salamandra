@@ -2,9 +2,12 @@ import { spawn } from "node:child_process";
 import net from "node:net";
 import path from "node:path";
 
+const port = Number(process.env.SALAMANDRA_E2E_PORT || 4173);
+if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("Invalid SALAMANDRA_E2E_PORT");
+
 async function listening(): Promise<boolean> {
   return new Promise((resolve) => {
-    const socket = net.connect(4173, "127.0.0.1");
+    const socket = net.connect(port, "127.0.0.1");
     socket.setTimeout(1000);
     socket.once("connect", () => { socket.destroy(); resolve(true); });
     socket.once("error", () => resolve(false));
@@ -13,11 +16,11 @@ async function listening(): Promise<boolean> {
 }
 
 export default async function setup() {
-  if (await listening()) throw new Error("QA port 4173 is already occupied; refusing to reuse it.");
+  if (await listening()) throw new Error(`QA port ${port} is already occupied; refusing to reuse it.`);
   const python = process.platform === "win32"
     ? path.join(process.cwd(), ".venv", "Scripts", "python.exe") : "python";
   // No shell/process tree: stdin EOF is the cross-platform shutdown protocol.
-  const child = spawn(python, ["-u", "tests/e2e_server.py", "--port", "4173", "--parent-stdin"], {
+  const child = spawn(python, ["-u", "tests/e2e_server.py", "--port", String(port), "--parent-stdin"], {
     stdio: ["pipe", "pipe", "pipe"], windowsHide: true,
   });
   let output = "";
@@ -45,8 +48,8 @@ export default async function setup() {
         }),
       ]);
       if (code !== 0) throw new Error(`QA fixture exited ${code}: ${output}`);
-      if (await listening()) throw new Error("QA fixture left port 4173 listening.");
-      console.log("QA fixture stopped cleanly; child exited 0; port 4173 closed.");
+      if (await listening()) throw new Error(`QA fixture left port ${port} listening.`);
+      console.log(`QA fixture stopped cleanly; child exited 0; port ${port} closed.`);
     } finally {
       clearTimeout(timer);
     }
@@ -56,7 +59,7 @@ export default async function setup() {
     while (Date.now() < deadline) {
       if (spawnError) throw spawnError;
       if (closed) throw new Error(`QA fixture exited before readiness: ${output}`);
-      const response = await fetch("http://127.0.0.1:4173/health", {
+      const response = await fetch(`http://127.0.0.1:${port}/health`, {
         signal: AbortSignal.timeout(1000),
       }).catch((error: Error & { cause?: Error }) => {
         lastProbe = `${error.message}; ${error.cause?.message ?? "no cause"}`;
