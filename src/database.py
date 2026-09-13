@@ -1317,6 +1317,9 @@ class TransactionalEventOperations:
                     changes={"released": released, "version": event.version},
                 )
             )
+            from event_learning import EventLearningStore
+            session.flush()
+            EventLearningStore.sync_execution_in_session(session, event)
             return event
 
     def delete_draft(

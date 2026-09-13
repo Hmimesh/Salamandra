@@ -86,6 +86,115 @@ async function expectNoViewportOverflow(page: Page) {
   expect(sizes.scroll, `horizontal overflow: ${JSON.stringify(sizes)}`).toBeLessThanOrEqual(sizes.client + 1);
 }
 
+test("event reviews isolate events and round-trip every affected item", async ({ page }, testInfo) => {
+  await signIn(page, `owner@phase-d-${testInfo.project.name}.test`);
+  const eventId = `review-${testInfo.project.name}-a`;
+  const items = [
+    { kind: "unnecessary", item_id: "review-chair", label_snapshot: "review-chair", quantity: 2, note: "First row" },
+    { kind: "unnecessary", item_id: "review-chair", label_snapshot: "review-chair", quantity: null, note: "Second row" },
+    { kind: "missing", item_id: null, label_snapshot: "ציוד عربي", quantity: null, note: "Unresolved evidence" },
+  ];
+  const ordered = (rows: typeof items) => [...rows].sort((a, b) => a.note.localeCompare(b.note));
+  const seeded = await page.request.post("/api/events/feedback", {
+    headers: { Origin: new URL(page.url()).origin },
+    data: { event_id: eventId, event_version: 1, idempotency_key: crypto.randomUUID(),
+      missing: "yes", unnecessary: "yes", failed: "no", additional_onsite: "no",
+      plan_fit: "too_much", reuse_plan: "no", notes: "FROM_EVENT_A", items },
+  });
+  expect(seeded.status()).toBe(200);
+  await page.goto("/returns");
+  const open = async (label: string) => activate(page.locator(".returned-history article")
+    .filter({ has: page.getByRole("heading", { name: `Review ${label}`, exact: true }) }).getByRole("button", { name: "Review event" }));
+  const dialog = page.getByRole("dialog", { name: "Review this event" });
+  await open("A");
+  await expect(dialog.getByLabel("How was the equipment plan?")).toHaveValue("too_much");
+  await expect(dialog.getByLabel("Would you use this plan again?")).toHaveValue("no");
+  await expect(dialog.getByLabel("Notes", { exact: true })).toHaveValue("FROM_EVENT_A");
+  await expect(dialog.locator(".event-review-affected")).toHaveCount(3);
+  expect(await dialog.getByLabel("Qty").evaluateAll(inputs => inputs.map(input => (input as HTMLInputElement).value).sort())).toEqual(["", "", "2"]);
+  await expectNoViewportOverflow(page);
+  await page.screenshot({ path: `${process.env.TEMP || "/tmp"}/salamandra-review-${testInfo.project.name}.png` });
+  const request = page.waitForRequest(request => request.url().endsWith("/api/events/feedback") && request.method() === "POST");
+  await activate(dialog.getByRole("button", { name: "Save review", exact: true }));
+  const submitted = (await request).postDataJSON();
+  expect(ordered(submitted.items)).toEqual(ordered(items));
+  await expect(dialog).toBeHidden();
+  const saved = await (await page.request.get(`/api/events/learning?event_id=${eventId}`)).json();
+  expect(ordered(saved.learning.feedback.items)).toEqual(ordered(items));
+  await open("A");
+  await expect(dialog.locator(".event-review-affected")).toHaveCount(3);
+  expect(await dialog.getByLabel("Qty").evaluateAll(inputs => inputs.map(input => (input as HTMLInputElement).value).sort())).toEqual(["", "", "2"]);
+  await activate(dialog.getByRole("button", { name: "Skip for now" }));
+  await open("B");
+  await expect(dialog.getByLabel("How was the equipment plan?")).toHaveValue("about_right");
+  await expect(dialog.getByLabel("Would you use this plan again?")).toHaveValue("yes");
+  await expect(dialog.getByLabel("Notes", { exact: true })).toHaveValue("");
+  await expect(dialog.locator(".event-review-affected")).toHaveCount(0);
+  for (const name of ["missing", "unnecessary", "failed", "additional_onsite"])
+    await expect(dialog.locator(`input[name="${name}"]`).first()).toBeChecked();
+});
+
+test("event review loading failures and late responses cannot cross form sessions", async ({ page }, testInfo) => {
+  testInfo.annotations.push({ type: "expected-console-error", description: "console: Failed to load resource: the server responded with a status of 503 (Service Unavailable)" });
+  await signIn(page, `owner@phase-d-${testInfo.project.name}.test`);
+  const identity = `review-${testInfo.project.name}-a`;
+  const response = await (await page.request.get(`/api/events/learning?event_id=${identity}`)).json();
+  const releases: Array<() => void> = [];
+  let aRequests = 0;
+  let failB = false;
+  const posts: unknown[] = [];
+  page.on("request", request => { if (request.url().endsWith("/api/events/feedback")) posts.push(request.postDataJSON()); });
+  await page.route("**/api/events/learning?*", async route => {
+    const id = new URL(route.request().url()).searchParams.get("event_id");
+    if (id === identity && ++aRequests <= 2) {
+      const serial = aRequests;
+      await new Promise<void>(resolve => releases.push(resolve));
+      await route.fulfill({ json: { ...response, learning: { ...response.learning, feedback: {
+        missing: "no", unnecessary: "no", failed: "no", additional_onsite: "no", plan_fit: "too_much",
+        reuse_plan: "no", notes: `STALE_A_${serial}`, items: [], version: 1 } } } });
+    } else if (id?.endsWith("-b") && failB) {
+      await route.fulfill({ status: 503, json: { error: "Test feedback read unavailable" } });
+    } else await route.continue();
+  });
+  await page.goto("/returns");
+  const open = async (label: string) => activate(page.locator(".returned-history article")
+    .filter({ has: page.getByRole("heading", { name: `Review ${label}`, exact: true }) }).getByRole("button", { name: "Review event" }));
+  const dialog = page.getByRole("dialog", { name: "Review this event" });
+  await open("A");
+  await expect(dialog.getByRole("status")).toHaveText("Loading event review...");
+  await expect(dialog.getByRole("button", { name: "Save review" })).toBeDisabled();
+  await expect.poll(() => releases.length).toBe(1);
+  await activate(dialog.getByRole("button", { name: "Skip for now" }));
+  await open("B");
+  await expect(dialog.getByLabel("Notes", { exact: true })).toHaveValue("");
+  const late = page.waitForResponse(response => response.url().includes(encodeURIComponent(identity)));
+  releases[0]();
+  await late;
+  await expect(dialog.getByLabel("Notes", { exact: true })).toHaveValue("");
+  await activate(dialog.getByRole("button", { name: "Skip for now" }));
+  await open("A");
+  await expect.poll(() => releases.length).toBe(2);
+  await expect(dialog.getByRole("button", { name: "Save review" })).toBeDisabled();
+  await activate(dialog.getByRole("button", { name: "Skip for now" }));
+  failB = true;
+  await open("B");
+  await expect(dialog.getByRole("alert")).toContainText("Could not load this event review");
+  await expect(dialog.getByRole("button", { name: "Save review" })).toBeDisabled();
+  await expect(dialog.getByLabel("Notes", { exact: true })).toHaveCount(0);
+  await dialog.locator("form").evaluate(form => (form as HTMLFormElement).requestSubmit());
+  expect(posts).toEqual([]);
+  await activate(dialog.getByRole("button", { name: "Skip for now" }));
+  await open("A");
+  await expect(dialog.getByLabel("Notes", { exact: true })).toHaveValue(response.learning.feedback?.notes || "");
+  const lateAgain = page.waitForResponse(response => response.url().includes(encodeURIComponent(identity)));
+  releases[1]();
+  await lateAgain;
+  await expect(dialog.getByLabel("Notes", { exact: true })).toHaveValue(response.learning.feedback?.notes || "");
+  expect(posts).toEqual([]);
+  await expectNoViewportOverflow(page);
+});
+
+
 test("Phase D history suggestions remain operator controlled", async ({ page }, testInfo) => {
   await signIn(page, `owner@phase-d-${testInfo.project.name}.test`);
   await savePreference(page, () => activate(page.getByRole("button", { name: "dark", exact: true })));

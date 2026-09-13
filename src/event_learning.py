@@ -136,6 +136,9 @@ class EventLearningStore:
         if event.status == "returned" and row.source_type == "real" and row.exclusion_reason == "awaiting_return":
             row.eligible = True
             row.exclusion_reason = None
+        if event.status == "cancelled":
+            row.eligible = False
+            row.exclusion_reason = "cancelled"
         row.version += 1
 
     @staticmethod
@@ -243,21 +246,20 @@ class EventLearningStore:
             event = session.scalar(select(EventModel).where(EventModel.organization_id == organization_id, EventModel.id == event_id).with_for_update())
             if event is None:
                 raise ResourceNotFound("Event was not found.")
-            if expected_version is not None and event.version != expected_version:
-                raise StateConflict("This event changed after you opened it. Reload before changing history eligibility.")
+            if type(expected_version) is not int or expected_version < 1:
+                raise ValueError("A positive integer learning_version is required.")
             payload = {"event_id": event_id, "eligible": eligible, "reason": reason, "expected_version": expected_version}
             fingerprint = _fingerprint(payload)
             operation = session.scalar(select(OperationRequestModel).where(OperationRequestModel.organization_id == organization_id, OperationRequestModel.operation == "event.learning.eligibility", OperationRequestModel.idempotency_key == idempotency_key).with_for_update())
             if operation:
                 if operation.request_fingerprint != fingerprint:
                     raise StateConflict("This idempotency key was already used for another history change.")
-                row = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.organization_id == organization_id, EventLearningRecordModel.event_id == event_id))
-                if row is None:
-                    raise StateConflict("The completed history record is unavailable.")
-                return self._record(row, None, [])
+                return dict(operation.response)
             row = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.organization_id == organization_id, EventLearningRecordModel.event_id == event_id).with_for_update())
             if row is None:
-                row = self.create_in_session(session, event, source_type=str((event.data or {}).get("source_type") or "unknown"))
+                raise StateConflict("The learning record is unavailable. Reload before changing history eligibility.")
+            if row.version != expected_version:
+                raise StateConflict("Learning history changed elsewhere. Reload before changing its eligibility.")
             if eligible and event.status != "returned":
                 raise StateConflict("Only returned events can be included in planning history.")
             if eligible and row.source_type != "real":
@@ -265,9 +267,10 @@ class EventLearningStore:
             row.eligible = bool(eligible)
             row.exclusion_reason = None if eligible else (reason.strip()[:80] or "excluded_by_owner")
             row.version += 1
-            session.add(OperationRequestModel(organization_id=organization_id, operation="event.learning.eligibility", idempotency_key=idempotency_key, request_fingerprint=fingerprint, status="completed", resource_id=row.id, response={"event_id": event_id}, completed_at=utc_now()))
+            result = self._record(row, None, [])
+            session.add(OperationRequestModel(organization_id=organization_id, operation="event.learning.eligibility", idempotency_key=idempotency_key, request_fingerprint=fingerprint, status="completed", resource_id=row.id, response=result, completed_at=utc_now()))
             session.add(AuditEventModel(organization_id=organization_id, actor_membership_id=membership.id, action="event.learning_eligibility.changed", resource_type="event", resource_id=event_id, request_id=request_id, changes={"eligible": bool(eligible), "version": row.version}))
-            return self._record(row, None, [])
+            return result
 
     @staticmethod
     def _validate_payload(payload: dict[str, Any]) -> dict[str, Any]:

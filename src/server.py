@@ -301,8 +301,10 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 event_id = self.required_identifier(body.get("event_id"), "event_id")
                 if not isinstance(body.get("eligible"), bool):
                     raise ValueError("Eligibility must be true or false.")
-                expected = body.get("event_version")
-                result = self.database_runtime.set_event_learning_eligibility(event_id, body["eligible"], str(body.get("reason", "")), user, self.correlation_id(), int(expected) if expected is not None else None, self.operation_request_id(body))
+                expected = body.get("learning_version")
+                if type(expected) is not int or expected < 1:
+                    raise ValueError("A positive integer learning_version is required.")
+                result = self.database_runtime.set_event_learning_eligibility(event_id, body["eligible"], str(body.get("reason", "")), user, self.correlation_id(), expected, self.operation_request_id(body))
                 self.send_json({"learning": result})
                 return
 

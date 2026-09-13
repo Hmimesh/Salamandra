@@ -81,6 +81,14 @@ def handler_for(data_dir: Path, port: int):
                 session.flush()
                 learning = EventLearningStore.create_in_session(session, record, source_type="real")
                 learning.eligible, learning.exclusion_reason = True, None
+            for label in ("A", "B"):
+                record = EventModel(id=f"review-{viewport}-{label.lower()}", organization_id=history_org,
+                    owner_user_id=history_owner.id, title=f"Review {label}", status="returned", data={
+                        "description": "Review isolation fixture", "source_type": "synthetic",
+                        "start_date": "2026-09-12", "plan": {"lines": [{"item_id": "review-chair", "amount": 1}]}})
+                session.add(record)
+                session.flush()
+                EventLearningStore.create_in_session(session, record, source_type="synthetic")
         create_user(
             name="Clear Owner", email=f"owner@phase-b5-{viewport}.test",
             password="playwright-password", role="owner",

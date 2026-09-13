@@ -359,6 +359,106 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         self.assertEqual(status, 200, payload)
         return headers["set-cookie"].split(";", 1)[0]
 
+    @isolated_database_inserts
+    @race_required
+    def test_learning_eligibility_two_process_version_race_and_replay(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from event_learning import EventLearningStore
+        org, _, ids, cookie = self._learning_fixture(count=1)
+        path = "/api/events/learning/eligibility"
+        bodies = [{"event_id": ids[0], "learning_version": 1, "eligible": value,
+                   "idempotency_key": uuid4().hex} for value in (True, False)]
+        barrier = threading.Barrier(2)
+
+        def submit(index):
+            barrier.wait(timeout=10)
+            return _request(self.ports[index], "POST", path, bodies[index], cookie)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(submit, (0, 1)))
+        self.assertEqual(sorted(result[0] for result in results), [200, 409], results)
+        winner = next(index for index, result in enumerate(results) if result[0] == 200)
+        record = EventLearningStore(self.factory).get(org, ids[0])
+        self.assertEqual(record["version"], 2)
+        self.assertEqual(record["eligible"], bodies[winner]["eligible"])
+        with self.factory() as session:
+            self.assertEqual(session.get(EventModel, ids[0]).version, 1)
+            for model in (AuditEventModel, OperationRequestModel):
+                rows = list(session.scalars(select(model).where(model.organization_id == org)))
+                if model is AuditEventModel:
+                    rows = [row for row in rows if row.action == "event.learning_eligibility.changed"]
+                self.assertEqual(len(rows), 1)
+        snapshot = self._database_state_snapshot()
+        for body in ({**bodies[winner], "idempotency_key": uuid4().hex},
+                     {**bodies[winner], "eligible": not bodies[winner]["eligible"]}):
+            self.assertEqual(_request(self.ports[1], "POST", path, body, cookie)[0], 409)
+            self.assertEqual(self._database_state_snapshot(), snapshot)
+        self.assertEqual(_request(self.ports[1], "POST", path, bodies[winner], cookie)[:2], results[winner][:2])
+        self.assertEqual(self._database_state_snapshot(), snapshot)
+        for version in (None, True, 0, -1, "1", 1.5):
+            body = {**bodies[winner], "learning_version": version, "event_version": 1, "idempotency_key": uuid4().hex}
+            self.assertEqual(_request(self.ports[0], "POST", path, body, cookie)[0], 400)
+            self.assertEqual(self._database_state_snapshot(), snapshot)
+        _, _, _, foreign_cookie = self._learning_fixture(count=0)
+        snapshot = self._database_state_snapshot()
+        self.assertEqual(_request(self.ports[1], "POST", path, {**bodies[0], "learning_version": 2}, foreign_cookie)[0], 404)
+        self.assertEqual(self._database_state_snapshot(), snapshot)
+        for role in ("admin", "operator", "technician"):
+            _, _, role_ids, role_cookie = self._learning_fixture(role=role, count=1)
+            result = _request(self.ports[0], "POST", path, {"event_id": role_ids[0],
+                "eligible": False, "learning_version": 1, "idempotency_key": uuid4().hex}, role_cookie)
+            self.assertEqual(result[0], 200 if role == "admin" else 403, result)
+        # An old receipt remains exact even after a newer opposite decision.
+        opposite = {**bodies[winner], "eligible": not bodies[winner]["eligible"],
+                    "learning_version": 2, "idempotency_key": uuid4().hex}
+        self.assertEqual(_request(self.ports[0], "POST", path, opposite, cookie)[0], 200)
+        snapshot = self._database_state_snapshot()
+        self.assertEqual(_request(self.ports[1], "POST", path, bodies[winner], cookie)[:2], results[winner][:2])
+        self.assertEqual(self._database_state_snapshot(), snapshot)
+
+    @isolated_database_inserts
+    def test_learning_cancel_http_preserves_ledger_for_all_legal_states(self):
+        from event_learning import EventLearningStore
+        from event_similarity import EventSimilarityService
+        org, _, _, cookie = self._learning_fixture(count=0)
+        store = EventLearningStore(self.factory)
+
+        def post(path, body, expected=200):
+            status, result, _ = _request(self.ports[0], "POST", path, body, cookie)
+            self.assertEqual(status, expected, result)
+            return result
+
+        for name, class_id, amount in (("Chair", "event-chair", 20), ("Cart", "utility-cart", 1), ("Car", "standard-vehicle", 1)):
+            post("/api/inventory/items", {"id": name, "type": "furniture", "class_id": class_id,
+                "amount": amount, "scope": "shared", "idempotency_key": uuid4().hex})
+        for stage in ("planning", "confirmed", "packed"):
+            event = post("/api/events/save", {"description": "Indoor meeting with no lighting",
+                "overrides": {"title": stage, "planning_mode": "manual", "start_date": "2026-10-10",
+                    "start_time": "18:00", "capability_requirements": [{"capability": "furniture.chair", "amount": 1, "level": "required"}]},
+                "idempotency_key": uuid4().hex}, 201)["event"]
+            if stage != "planning":
+                event = post("/api/events/status", {"event_id": event["id"], "status": "confirmed"})["event"]
+            if stage == "packed":
+                for line in event["checklist"]:
+                    post("/api/events/checklist", {"event_id": event["id"], "item_id": line["item_id"], "phase": "pack", "done": True})
+                post("/api/events/status", {"event_id": event["id"], "status": "packed"})
+            before = store.get(org, event["id"])["execution"]
+            post("/api/events/cancel", {"event_id": event["id"]})
+            record = store.get(org, event["id"])
+            self.assertEqual(record["execution"]["status"], "cancelled")
+            self.assertEqual(record["execution"]["packed"], before.get("packed", []))
+            self.assertEqual(record["execution"]["returned"], [])
+            self.assertFalse(record["eligible"])
+            with self.factory() as session:
+                self.assertEqual(session.get(EventModel, event["id"]).status, "cancelled")
+                packed = list(session.scalars(select(StockMovementModel).where(StockMovementModel.event_id == event["id"], StockMovementModel.action == "packed")))
+                self.assertEqual(record["execution"]["packed"], [row.lines for row in packed])
+                if stage == "packed":
+                    self.assertEqual(len(packed), 1)
+            self.assertEqual(store.examples(org), [])
+            self.assertEqual(EventSimilarityService(store).rank(org, {"departments": ["furniture"]}), [])
+
+
     def _learning_fixture(self, role="owner", count=2):
         from event_learning import EventLearningStore
         from postgres_runtime import PostgresRuntime
@@ -551,7 +651,7 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             self.assertNotIn(identity, json.dumps(result_a) + json.dumps(result_b))
         for identity in ids_a:
             status, result, _ = _request(self.ports[0], "POST", "/api/events/learning/eligibility",
-                {"event_id": identity, "eligible": False, "reason": "Private A", "idempotency_key": uuid4().hex}, cookie_a)
+                {"event_id": identity, "learning_version": 1, "eligible": False, "reason": "Private A", "idempotency_key": uuid4().hex}, cookie_a)
             self.assertEqual(status, 200, result)
         self.assertEqual(_request(self.ports[0], "POST", path, body, cookie_b)[1], result_b)
         self.assertEqual(_request(self.ports[1], "POST", path, body, cookie_a)[1]["evidence_count"], 0)

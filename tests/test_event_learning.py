@@ -76,9 +76,42 @@ class TestEventLearning(unittest.TestCase):
             self.store.set_eligibility("org-a", "operator-org-a", "event-a", True, "", "r", None, "eligibility-denied")
 
     def test_owner_can_include_only_returned_real_event(self):
-        result = self.store.set_eligibility("org-a", "user-org-a", "event-a", True, "", "r", None, "eligibility-1")
+        result = self.store.set_eligibility("org-a", "user-org-a", "event-a", True, "", "r", 1, "eligibility-1")
         self.assertTrue(result["eligible"])
         self.assertEqual(self.store.examples("org-a")[0]["event_id"], "event-a")
+
+    def test_eligibility_stale_version_and_committed_replay(self):
+        first = self.store.set_eligibility("org-a", "user-org-a", "event-a", True, "", "r", 1, "first")
+        self.assertEqual(first["version"], 2)
+        for value in (True, False):
+            with self.assertRaises(StateConflict):
+                self.store.set_eligibility("org-a", "user-org-a", "event-a", value, "", "r", 1, f"stale-{value}")
+        self.store.set_eligibility("org-a", "user-org-a", "event-a", False, "excluded", "r", 2, "second")
+        replay = self.store.set_eligibility("org-a", "user-org-a", "event-a", True, "", "r", 1, "first")
+        self.assertEqual(replay, first)
+        self.assertFalse(self.store.get("org-a", "event-a")["eligible"])
+
+    def test_cancellation_synchronizes_learning_for_all_legal_states(self):
+        from database import TransactionalEventOperations
+        for status in ("planning", "confirmed", "packed"):
+            with self.subTest(status=status):
+                with self.factory.begin() as session:
+                    event = session.get(EventModel, "event-a")
+                    event.status = status
+                    if status == "packed":
+                        session.add(StockMovementModel(organization_id="org-a", event_id="event-a",
+                            actor_membership_id="membership-org-a", action="packed", idempotency_key="packed",
+                            lines=[{"holding_id": "holding-a", "quantity": 2}]))
+                    session.flush()
+                    self.store.sync_execution_in_session(session, event)
+                TransactionalEventOperations(self.factory).cancel("org-a", "event-a", "user-org-a", "cancel")
+                record = self.store.get("org-a", "event-a")
+                self.assertEqual(record["execution"]["status"], "cancelled")
+                self.assertFalse(record["eligible"])
+                self.assertEqual(record["execution"]["returned"], [])
+                if status == "packed":
+                    self.assertEqual(record["execution"]["packed"], [[{"holding_id": "holding-a", "quantity": 2}]])
+                self.assertEqual(self.store.examples("org-a"), [])
 
     def test_execution_preserves_every_ledger_stage(self):
         with self.factory.begin() as session:
