@@ -247,6 +247,7 @@ export interface EventRecord {
   milestones: Array<{ time: string; label: string }>;
   attendee_count: number;
   event_size: "small" | "medium" | "large" | "festival";
+  feature_sources?: Record<string, string>;
   venue_kind: string;
   priority_score: number;
   plan: EventPlan;
@@ -305,6 +306,7 @@ export interface EventLearning {
 
 export interface WorkspaceState {
   auth: {
+    learning_summary_allowed?: boolean;
     authenticated: boolean;
     user: UserAccount | null;
     users: UserAccount[];

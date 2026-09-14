@@ -5,7 +5,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, cast, exists, func, literal, or_, select, union_all
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session, sessionmaker
 
 from database import (
@@ -43,6 +44,9 @@ def _features(data: dict[str, Any]) -> dict[str, Any]:
         return True if matching else None
     return {
         "event_type": data.get("event_type") or None,
+        "provenance": {name: (data.get("feature_sources") or {}).get(name, "unknown")
+                       for name in ("departments", "guest_count", "duration_minutes", "venue_type")},
+        "multi_day": data.get("duration_minutes", 0) >= 1440 if type(data.get("duration_minutes")) is int else None,
         "guest_count": data.get("attendee_count") if data.get("attendee_count") not in (None, "") else None,
         "venue_type": data.get("venue_kind") or None,
         "indoor_outdoor": data.get("indoor_outdoor") or None,
@@ -141,6 +145,9 @@ class EventLearningStore:
             row.exclusion_reason = "cancelled"
         row.version += 1
 
+        from suggestion_outcomes import SuggestionOutcomes
+        SuggestionOutcomes.evaluate_in_session(session, event)
+
     @staticmethod
     def capture_edit_in_session(session: Session, event: EventModel, previous_data: dict[str, Any]) -> None:
         row = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.organization_id == event.organization_id, EventLearningRecordModel.event_id == event.id).with_for_update())
@@ -164,13 +171,20 @@ class EventLearningStore:
                 items = [self._item(item) for item in session.scalars(select(EventFeedbackItemModel).where(EventFeedbackItemModel.organization_id == organization_id, EventFeedbackItemModel.feedback_id == feedback.id).order_by(EventFeedbackItemModel.id))]
             return self._record(row, feedback, items)
 
-    def examples(self, organization_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    def examples(self, organization_id: str, limit: int = 100, *, features: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         if not organization_id:
             raise ValueError("Organization context is required.")
+        if type(limit) is not int:
+            raise ValueError("Candidate limit must be an integer.")
+        limit = max(1, min(limit, 100))
+        if features is not None:
+            from event_similarity import validate_features
+            features = validate_features(features)
         with self.factory() as session:
             # Limit candidates before joining item rows. One statement provides a
             # committed snapshot of eligibility, review answers and affected items.
-            candidates = select(EventLearningRecordModel.id).join(
+            eligible = select(EventLearningRecordModel.id, EventLearningRecordModel.created_at,
+                              EventLearningRecordModel.event_id).join(
                 EventModel, and_(EventModel.id == EventLearningRecordModel.event_id,
                                  EventModel.organization_id == organization_id)
             ).where(
@@ -179,7 +193,12 @@ class EventLearningStore:
                 EventLearningRecordModel.source_type == "real",
                 EventLearningRecordModel.exclusion_reason.is_(None),
                 EventModel.status == "returned",
-            ).order_by(EventLearningRecordModel.event_id).limit(max(1, min(limit, 100))).subquery()
+            )
+            if features is None:
+                # Preserve the Phase C export contract; planning supplies features.
+                candidates = eligible.order_by(EventLearningRecordModel.event_id).limit(limit).subquery()
+            else:
+                candidates = self._candidates(session, eligible, features, limit)
             rows = session.execute(select(EventLearningRecordModel, EventFeedbackModel, EventFeedbackItemModel)
                 .join(candidates, candidates.c.id == EventLearningRecordModel.id)
                 .outerjoin(EventFeedbackModel, and_(EventFeedbackModel.event_id == EventLearningRecordModel.event_id,
@@ -195,6 +214,45 @@ class EventLearningStore:
                 if item is not None:
                     result[row.event_id]["feedback"]["items"].append(self._item(item))
             return list(result.values())
+
+    @staticmethod
+    def _candidates(session: Session, eligible, features: dict[str, Any], limit: int):
+        row = EventLearningRecordModel
+        departments = features.get("departments") or []
+        if session.bind.dialect.name == "postgresql":
+            department_match = or_(*(row.features.op("@>")(
+                cast({"departments": [department]}, JSONB)) for department in departments)) if departments else None
+        else:
+            values = func.json_each(row.features, "$.departments").table_valued("value")
+            department_match = exists(select(1).select_from(values).where(values.c.value.in_(departments))) if departments else None
+        venue = features.get("venue_type")
+        venue_match = row.features["venue_type"].as_string() == venue if venue else None
+        if venue and session.bind.dialect.name == "postgresql":
+            venue_match = row.features.op("@>")(cast({"venue_type": venue}, JSONB))
+        bands = []
+        for name in ("guest_count", "duration_minutes"):
+            value = features.get(name)
+            if value:
+                bands.append(row.features[name].as_integer().between(max(1, value // 2), value * 2))
+        related = [condition for condition in (department_match, venue_match) if condition is not None]
+        tiers = []
+        if related:
+            tiers.append(and_(*related, *bands))
+        if department_match is not None:
+            tiers.append(department_match)
+        if venue_match is not None:
+            tiers.append(venue_match)
+        tiers.append(literal(True))
+        # Each indexed pool is bounded before union/deduplication. All pools and
+        # feedback are read in one SQL statement, hence one committed snapshot.
+        pools = []
+        for priority, condition in enumerate(tiers):
+            pool = eligible.where(condition).order_by(row.created_at.desc(), row.event_id).limit(limit).subquery()
+            pools.append(select(pool.c.id, pool.c.created_at, pool.c.event_id, literal(priority).label("tier")))
+        combined = union_all(*pools).subquery()
+        return (select(combined.c.id).group_by(combined.c.id, combined.c.created_at, combined.c.event_id)
+                .order_by(func.min(combined.c.tier), combined.c.created_at.desc(), combined.c.event_id)
+                .limit(limit).subquery())
 
     def save_feedback(self, organization_id: str, actor_user_id: str, event_id: str, payload: dict[str, Any], request_id: str, idempotency_key: str, expected_version: int | None) -> dict[str, Any]:
         with self.factory.begin() as session:
@@ -236,6 +294,8 @@ class EventLearningStore:
             op = OperationRequestModel(organization_id=organization_id, operation="event.feedback", idempotency_key=idempotency_key, request_fingerprint=fingerprint, status="completed", resource_id=feedback.id, response={"feedback_id": feedback.id}, completed_at=utc_now())
             session.add(op)
             session.add(AuditEventModel(organization_id=organization_id, actor_membership_id=membership.id, action="event.feedback.saved", resource_type="event", resource_id=event_id, request_id=request_id, changes={"feedback_version": feedback.version}))
+            from suggestion_outcomes import SuggestionOutcomes
+            SuggestionOutcomes.evaluate_in_session(session, event)
             return self._feedback_response(session, organization_id, event_id)
 
     def set_eligibility(self, organization_id: str, actor_user_id: str, event_id: str, eligible: bool, reason: str, request_id: str, expected_version: int | None, idempotency_key: str) -> dict[str, Any]:

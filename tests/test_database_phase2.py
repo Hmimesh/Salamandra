@@ -1426,6 +1426,8 @@ class TestAlembicMigration(unittest.TestCase):
             "event_learning_records",
             "event_feedback",
             "event_feedback_items",
+            "suggestion_sessions",
+            "suggestion_evaluations",
             "alembic_version",
             "organizations",
             "users",

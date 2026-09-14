@@ -4,36 +4,64 @@ import { apiRequest } from "../lib/api";
 import type { EventRecord } from "../types";
 
 type Suggestion = { capability: string; amount: number; minimum: number; maximum: number; evidence_count: number; reason: string };
-type Result = { suggestions: Suggestion[]; evidence_count: number; warnings: string[]; dimensions: string[] };
+type Result = { session_id: string | null; suggestions: Suggestion[]; evidence_count: number; warnings: string[]; dimensions: string[] };
 
-export function HistoricalSuggestions({ event, onApply }: { event: EventRecord; onApply: (requirements: { capability: string; amount: number }[]) => void }) {
+export function HistoricalSuggestions({ event, onApply }: { event: EventRecord; onApply: (requirements: { capability: string; amount: number }[], sessionId: string) => void }) {
   const [result, setResult] = useState<Result | null>(null);
   const [error, setError] = useState("");
   const [ignored, setIgnored] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const command = useRef({ signature: "", key: "" });
+  const live = useRef(true);
+  const generation = useRef(0);
+  useEffect(() => { live.current = true; return () => { live.current = false; }; }, []);
   const reviewButton = useRef<HTMLButtonElement>(null);
   const firstQuantity = useRef<HTMLInputElement>(null);
   const ignoreButton = useRef<HTMLButtonElement>(null);
   const applied = useRef(false);
   const reviewing = useRef(false);
   useEffect(() => {
-    if (ignored) reviewButton.current?.focus();
-    else if (reviewing.current) { (firstQuantity.current || ignoreButton.current)?.focus(); reviewing.current = false; }
-  }, [ignored]);
+    if (ignored && !saving) reviewButton.current?.focus();
+    else if (!ignored && reviewing.current && result) { (firstQuantity.current || ignoreButton.current)?.focus(); reviewing.current = false; }
+  }, [ignored, result, saving]);
   const features = JSON.stringify({ departments: [...new Set(event.capability_requirements.map(item => item.capability.split(".")[0]))].sort(), guest_count: event.attendee_count || null, duration_minutes: event.duration_minutes || null, venue_type: event.venue_kind || null });
+  const provenance = JSON.stringify(event.feature_sources || {});
   useEffect(() => {
     let active = true;
+    generation.current += 1;
+    setSaving(false);
     setResult(null); setError(""); setIgnored(false); applied.current = false;
     const timer = window.setTimeout(() => {
-      void apiRequest<Result>("/api/events/learning/suggestions", { method: "POST", body: { features: JSON.parse(features) } })
+      void apiRequest<Result>("/api/events/learning/sessions", { method: "POST", body: { features: JSON.parse(features), provenance: JSON.parse(provenance), idempotency_key: crypto.randomUUID() } })
         .then(value => { if (active) setResult(value); })
         .catch(failure => { if (active) setError(failure instanceof Error ? failure.message : "History is unavailable."); });
     }, 300);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [features]);
-  if (ignored) return <section className="history-suggestions" aria-label="From your event history"><p>Suggestions ignored.</p><button ref={reviewButton} type="button" className="button button-secondary" onClick={() => { reviewing.current = true; setIgnored(false); }}>Review suggestions</button></section>;
+  }, [features, provenance, attempt, event.id]);
+  async function respond(action: "apply" | "ignored") {
+    if (!result || saving || applied.current) return;
+    if (!result.session_id) { setIgnored(true); return; }
+    const quantities = action === "apply" ? Object.fromEntries(result.suggestions.map(item => [item.capability, item.amount])) : {};
+    const body = { session_id: result.session_id, action, quantities };
+    const currentGeneration = generation.current;
+    const signature = JSON.stringify(body);
+    if (command.current.signature !== signature) command.current = { signature, key: crypto.randomUUID() };
+    applied.current = true; setSaving(true); setError("");
+    if (action === "ignored") setIgnored(true);
+    try {
+      await apiRequest("/api/events/learning/outcome", { method: "POST", body: { ...body, idempotency_key: command.current.key } });
+      if (!live.current || generation.current !== currentGeneration) return;
+      if (action === "apply") { onApply(result.suggestions, result.session_id); setIgnored(true); }
+    } catch (failure) {
+      if (live.current && generation.current === currentGeneration) { setIgnored(false); setError(failure instanceof Error ? failure.message : "Response was not saved. Retry your action."); applied.current = false; }
+    } finally { if (live.current && generation.current === currentGeneration) setSaving(false); }
+  }
+  if (ignored) return <section className="history-suggestions" aria-label="From your event history"><p>{saving ? "Saving response..." : "Suggestions ignored."}</p><button disabled={saving} ref={reviewButton} type="button" className="button button-secondary" onClick={() => { reviewing.current = true; setResult(null); setIgnored(false); setAttempt(value => value + 1); }}>Review suggestions</button></section>;
   return <section className="history-suggestions" aria-label="From your event history">
     <h3><History size={17} />From your event history</h3>
-    {error ? <p role="status">{error}</p> : !result ? <p role="status">Checking completed events...</p> : <>
+    {error ? <p role="alert">{error}</p> : null}
+    {!result ? <p role="status">{error ? "History is unavailable." : "Checking completed events..."}</p> : <>
       <p>{result.suggestions.length ? `Based on ${result.evidence_count} similar past events` : "No similar completed events with repeated quantity evidence yet."}</p>
       {result.suggestions.length ? <p>{result.suggestions[0].reason}</p> : null}
       {result.suggestions.map((suggestion, index) => {
@@ -41,7 +69,7 @@ export function HistoricalSuggestions({ event, onApply }: { event: EventRecord; 
         return <label key={suggestion.capability}><span><strong>{suggestion.capability.replaceAll(".", " ")}</strong><small>{previous ? `${previous} currently planned` : "Suggested addition"} · {suggestion.evidence_count} events · observed {suggestion.minimum}–{suggestion.maximum}</small></span><input ref={index === 0 ? firstQuantity : undefined} aria-label={`Suggested quantity for ${suggestion.capability}`} type="number" min={1} max={10000} value={suggestion.amount} onChange={change => setResult({ ...result, suggestions: result.suggestions.map((item, i) => i === index ? { ...item, amount: Number(change.target.value) } : item) })} /></label>;
       })}
       {result.warnings.map(warning => <p key={warning}>{warning}</p>)}
-      <div className="composer-actions"><button ref={ignoreButton} className="button button-secondary" type="button" onClick={() => setIgnored(true)}>Ignore</button>{result.suggestions.length ? <button className="button button-primary" type="button" disabled={result.suggestions.some(item => !Number.isInteger(item.amount) || item.amount < 1 || item.amount > 10000)} onClick={() => { if (applied.current) return; applied.current = true; onApply(result.suggestions); setIgnored(true); }}>Apply to manual plan</button> : null}</div>
+      <div className="composer-actions"><button disabled={saving} ref={ignoreButton} className="button button-secondary" type="button" onClick={() => void respond("ignored")}>Ignore</button>{result.suggestions.length ? <button className="button button-primary" type="button" disabled={saving || result.suggestions.some(item => !Number.isInteger(item.amount) || item.amount < 1 || item.amount > 10000)} onClick={() => void respond("apply")}>{saving ? "Applying..." : "Apply to manual plan"}</button> : null}</div>
     </>}
   </section>;
 }

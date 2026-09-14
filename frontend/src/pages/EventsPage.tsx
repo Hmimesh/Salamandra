@@ -20,7 +20,7 @@ import {
   Users,
   XCircle,
 } from "lucide-react";
-import { type FormEvent, useMemo, useRef, useState } from "react";
+import { type FormEvent, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { Avatar, ConflictState, EmptyState, Modal, PageHeader, Readiness, StatusTag } from "../components/ui";
 import { useWorkspace } from "../context/WorkspaceContext";
@@ -125,11 +125,21 @@ export function EventsPage() {
   const [month, setMonth] = useState(() => new Date());
   const [description, setDescription] = useState("");
   const manualForm = useRef<HTMLFormElement>(null);
+  const historicalFocusPending = useRef(false);
+  useLayoutEffect(() => {
+    if (!historicalFocusPending.current) return;
+    const quantity = manualForm.current?.querySelector<HTMLInputElement>(".manual-requirement-row input[type=number]");
+    if (quantity) {
+      historicalFocusPending.current = false;
+      quantity.focus();
+    }
+  });
   const [planningMode, setPlanningMode] = useState<"describe" | "manual">("describe");
   const [manualEvent, setManualEventState] = useState({ title: "", start_date: "", start_time: "", location: "", duration_minutes: 240, attendee_count: 0 });
   const [manualRequirements, setManualRequirementsState] = useState<ManualRequirement[]>([{ id: crypto.randomUUID(), capability: "pa.main", customCapability: "", amount: 1, level: "required" }]);
   const draftRevision = useRef(0);
   const [draft, setDraft] = useState<EventDraft | null>(null);
+  const [suggestionSession, setSuggestionSession] = useState<string | null>(null);
   const [draftDirty, setDraftDirty] = useState(false);
   const [planning, setPlanning] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -248,8 +258,10 @@ export function EventsPage() {
           ...(planningMode === "manual" ? { planning_mode: "manual", capability_requirements: manualRequirements.map(({ capability, customCapability, amount, level }) => ({ capability: capability === "custom.resource" ? customCapability : capability, amount, level })) } : {}),
         },
         idempotency_key: createKey,
+        ...(suggestionSession ? { suggestion_session_id: suggestionSession } : {}),
       }, { success: "Event saved to the workspace." });
       setDraft(null);
+      setSuggestionSession(null);
       setDescription("");
       setDraftDirty(false);
       setCreateKey(crypto.randomUUID());
@@ -261,8 +273,10 @@ export function EventsPage() {
     }
   }
 
-  function applyHistoricalRequirements(suggestions: { capability: string; amount: number }[]) {
+  function applyHistoricalRequirements(suggestions: { capability: string; amount: number }[], sessionId: string) {
     if (!draft || draftDirty || planning) return;
+    historicalFocusPending.current = true;
+    setSuggestionSession(sessionId);
     const replaced = new Set(suggestions.map(item => item.capability));
     const requirements = draft.event.capability_requirements.filter(item => !replaced.has(item.capability))
       .map(({ capability, amount, level }) => ({ capability, amount, level }));
@@ -272,7 +286,6 @@ export function EventsPage() {
     setPlanningMode("manual");
     setDraftDirty(true);
     setCreateKey(crypto.randomUUID());
-    requestAnimationFrame(() => manualForm.current?.querySelector<HTMLInputElement>(".manual-requirement-row input[type=number]")?.focus());
   }
 
   function beginEdit(event: EventRecord) {

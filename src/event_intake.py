@@ -76,6 +76,7 @@ class EventDescriptionPlanner:
             overrides.get("duration_minutes")
             or self._extract_duration(clean_description, milestones)
         )
+        duration_source = "operator" if overrides.get("duration_minutes") else self._duration_with_source(clean_description, milestones)[1]
         attendee_count = (
             int(overrides["attendee_count"])
             if overrides.get("attendee_count") not in (None, "")
@@ -164,6 +165,12 @@ class EventDescriptionPlanner:
             attendee_count=attendee_count,
             event_size=event_size,
             venue_kind=venue_kind,
+            feature_sources={
+                "duration_minutes": duration_source,
+                "guest_count": "operator" if overrides.get("attendee_count") not in (None, "") else "intake" if attendee_count else "unknown",
+                "venue_type": "intake" if venue_kind else "unknown",
+                "departments": "structured" if overrides.get("planning_mode") == "manual" else "intake",
+            },
             priority_score=priority_score,
             plan=plan.to_dict(),
         )
@@ -587,14 +594,17 @@ class EventDescriptionPlanner:
         description: str,
         milestones: list[dict[str, str]],
     ) -> int:
+        return self._duration_with_source(description, milestones)[0]
+
+    def _duration_with_source(self, description: str, milestones: list[dict[str, str]]) -> tuple[int, str]:
         duration_match = re.search(r"\b(\d+)\s*(hour|hours|hr|hrs)\b", description.lower())
         if duration_match:
-            return int(duration_match.group(1)) * 60
+            return int(duration_match.group(1)) * 60, "intake"
         if len(milestones) >= 2:
             start = datetime.strptime(milestones[0]["time"], "%H:%M")
             end = datetime.strptime(milestones[-1]["time"], "%H:%M")
-            return max(240, int((end - start).total_seconds() / 60) + 120)
-        return 240
+            return max(240, int((end - start).total_seconds() / 60) + 120), "structured"
+        return 240, "defaulted"
 
     def _extract_location(self, description: str) -> str:
         text = description.lower()

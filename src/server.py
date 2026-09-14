@@ -44,6 +44,7 @@ from security import (
     ResourceNotFound,
     StateConflict,
     require_permission,
+    permissions_for_role,
     validate_assignable_role,
 )
 from operational_logging import configure_logging, log_event
@@ -158,6 +159,14 @@ class SalamandraServer(BaseHTTPRequestHandler):
             self.send_json(self.state_payload(user))
             return
 
+        if parsed_url.path == "/api/learning/summary":
+            user = self.require_user()
+            if self.database_runtime is None:
+                raise StateConflict("Learning summaries require PostgreSQL.")
+            from suggestion_outcomes import SuggestionOutcomes
+            self.send_json(SuggestionOutcomes(self.database_runtime.learning.factory).summary(user.organization_id, user.id))
+            return
+
         if parsed_url.path == "/api/events/learning":
             user = self.require_user()
             require_permission(user.role, Permission.EVENTS_FEEDBACK_READ)
@@ -259,6 +268,24 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 return
 
             user = self.require_user()
+
+            if parsed_url.path in {"/api/events/learning/sessions", "/api/events/learning/outcome", "/api/events/learning/evaluate"}:
+                if self.database_runtime is None:
+                    raise StateConflict("Suggestion outcomes require PostgreSQL.")
+                if len(json.dumps(body, ensure_ascii=True).encode("utf-8")) > 8192:
+                    raise ValueError("Suggestion request is too large.")
+                from suggestion_outcomes import SuggestionOutcomes
+                service = SuggestionOutcomes(self.database_runtime.learning.factory)
+                if parsed_url.path.endswith("/sessions"):
+                    result = service.generate(user.organization_id, user.id, body, self.correlation_id())
+                elif parsed_url.path.endswith("/outcome"):
+                    result = service.interact(user.organization_id, user.id, body, self.correlation_id())
+                else:
+                    if set(body) != {"event_id"}:
+                        raise ValueError("Provide only an event ID.")
+                    result = service.evaluate(user.organization_id, user.id, body.get("event_id"))
+                self.send_json(result)
+                return
 
             if parsed_url.path == "/api/events/learning/suggestions":
                 require_permission(user.role, Permission.EVENTS_PLAN)
@@ -735,6 +762,8 @@ class SalamandraServer(BaseHTTPRequestHandler):
                     "description": description,
                     "overrides": overrides,
                 }
+                if "suggestion_session_id" in body:
+                    request_payload["suggestion_session_id"] = body["suggestion_session_id"]
                 idempotency_key = self.operation_request_id(body)
                 event = self.build_event_from_description(
                     description, overrides, user
@@ -1684,6 +1713,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
             "users": [account.to_public_dict() for account in organization_users],
             "demo_available": self.accounts.allow_demo,
             "registration_mode": self.web_config.registration_mode,
+            "learning_summary_allowed": Permission.LEARNING_SUMMARY_READ in permissions_for_role(user.role),
         }
         inventories = self.workspace.to_dict(
             user.id if user else None,

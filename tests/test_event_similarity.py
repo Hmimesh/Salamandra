@@ -28,7 +28,7 @@ class TestEventSimilarity(unittest.TestCase):
         self.assertEqual(first, service.rank("org-a", FEATURES))
         self.assertEqual([m["event_id"] for m in first], ["a", "b"])
         self.assertEqual(first[0]["score"], 100)
-        self.store.examples.assert_called_with("org-a", MAX_CANDIDATE_EXAMPLES)
+        self.store.examples.assert_called_with("org-a", MAX_CANDIDATE_EXAMPLES, features=FEATURES)
 
     def test_different_and_missing_features_do_not_match_strongly(self):
         service = self.service(example())

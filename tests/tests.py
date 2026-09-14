@@ -269,6 +269,30 @@ class TestEventDescriptionPlanner(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
+    def test_learning_feature_provenance_distinguishes_explicit_default_and_missing(self):
+        from event_learning import _features
+        from event_memory import EventRecord
+        default = self.description_planner.draft_from_description("Community meeting").record
+        explicit = self.description_planner.draft_from_description("Community meeting", {
+            "duration_minutes": 240, "attendee_count": 100, "planning_mode": "manual",
+            "capability_requirements": [{"capability": "furniture.chair", "amount": 12, "level": "required"}],
+        }).record
+        self.assertEqual(default.duration_minutes, explicit.duration_minutes)
+        self.assertEqual(default.feature_sources["duration_minutes"], "defaulted")
+        self.assertEqual(explicit.feature_sources["duration_minutes"], "operator")
+        self.assertEqual(default.feature_sources["guest_count"], "unknown")
+        self.assertEqual(explicit.feature_sources["guest_count"], "operator")
+        self.assertEqual(explicit.feature_sources["departments"], "structured")
+        self.assertEqual(default.feature_sources["venue_type"], "unknown")
+        inferred = self.description_planner.draft_from_description("Outdoor community meeting for 100 guests, 4 hours.").record
+        self.assertEqual(inferred.feature_sources["duration_minutes"], "intake")
+        self.assertEqual(inferred.feature_sources["venue_type"], "intake")
+        restored = EventRecord.from_dict(explicit.to_dict())
+        self.assertEqual(restored.feature_sources, explicit.feature_sources)
+        self.assertEqual(_features(explicit.to_dict())["provenance"], explicit.feature_sources)
+        self.assertEqual(_features({})["provenance"]["duration_minutes"], "unknown")
+        self.assertTrue(_features({"duration_minutes": 1500})["multi_day"])
+
     def test_manual_event_uses_structured_capabilities_without_text_inference(self):
         draft = self.description_planner.draft_from_description(
             "Manual community dinner.",

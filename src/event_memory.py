@@ -31,6 +31,7 @@ class EventRecord:
     attendee_count: int = 0
     event_size: str = "medium"
     venue_kind: str = ""
+    feature_sources: dict[str, str] = field(default_factory=dict)
     priority_score: int = 50
     plan: dict[str, Any] = field(default_factory=dict)
     checklist: list[dict[str, Any]] = field(default_factory=list)
@@ -72,6 +73,7 @@ class EventRecord:
             "attendee_count": self.attendee_count,
             "event_size": self.event_size,
             "venue_kind": self.venue_kind,
+            "feature_sources": dict(self.feature_sources),
             "priority_score": self.priority_score,
             "plan": self.plan,
             "checklist": self.checklist,
@@ -113,6 +115,7 @@ class EventRecord:
             attendee_count=int(data.get("attendee_count", 0)),
             event_size=data.get("event_size", "medium"),
             venue_kind=data.get("venue_kind", ""),
+            feature_sources=dict(data.get("feature_sources") or {}),
             priority_score=int(data.get("priority_score", 50)),
             plan=data.get("plan", {}),
             checklist=list(data.get("checklist", [])),

@@ -120,7 +120,7 @@ class EventSimilarityService:
         if not features:
             return []
         results = []
-        for example in self.store.examples(organization_id, MAX_CANDIDATE_EXAMPLES):
+        for example in self.store.examples(organization_id, MAX_CANDIDATE_EXAMPLES, features=features):
             if example["event_id"] == current_event_id:
                 continue
             score, reasons = score_features(features, example.get("features") or {})

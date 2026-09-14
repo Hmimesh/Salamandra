@@ -266,6 +266,54 @@ class EventLearningRecordModel(Base):
         ),
         CheckConstraint("version > 0", name="ck_learning_records_version"),
         Index("ix_learning_records_org_eligible", "organization_id", "eligible", "event_id"),
+        Index("ix_learning_candidates_recent", "organization_id", "eligible", "created_at", "event_id"),
+        Index("ix_learning_candidates_features", "features", postgresql_using="gin",
+              postgresql_ops={"features": "jsonb_path_ops"}).ddl_if(dialect="postgresql"),
+    )
+
+
+class SuggestionSessionModel(Base):
+    __tablename__ = "suggestion_sessions"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    event_id_snapshot: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    event_title_snapshot: Mapped[str] = mapped_column(String(300), nullable=False, default="")
+    event_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    algorithm_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    retrieval_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    evidence_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, nullable=False)
+    action: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    applied: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
+    committed: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    acted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        UniqueConstraint("id", "organization_id", name="uq_suggestion_session_org"),
+        ForeignKeyConstraint(["event_id", "organization_id"], ["events.id", "events.organization_id"], name="fk_suggestion_event_org", ondelete="RESTRICT"),
+        ForeignKeyConstraint(["organization_id", "actor_user_id"], ["memberships.organization_id", "memberships.user_id"], name="fk_suggestion_actor_org", ondelete="RESTRICT"),
+        CheckConstraint("action IS NULL OR action IN ('ignored', 'applied', 'applied_with_edits')", name="ck_suggestion_action"),
+        CheckConstraint("evidence_count BETWEEN 0 AND 8", name="ck_suggestion_evidence"),
+        Index("ix_suggestion_org_action", "organization_id", "action", "created_at"),
+        Index("ix_suggestion_org_event", "organization_id", "event_id"),
+    )
+
+
+class SuggestionEvaluationModel(Base):
+    __tablename__ = "suggestion_evaluations"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    suggestion_session_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    learning_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    feedback_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    comparisons: Mapped[list[dict[str, Any]]] = mapped_column(JSON_VALUE, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    __table_args__ = (
+        ForeignKeyConstraint(["suggestion_session_id", "organization_id"], ["suggestion_sessions.id", "suggestion_sessions.organization_id"], name="fk_suggestion_evaluation_org", ondelete="CASCADE"),
+        UniqueConstraint("suggestion_session_id", "learning_version", "feedback_version", name="uq_suggestion_evaluation_version"),
+        Index("ix_suggestion_evaluation_org", "organization_id", "suggestion_session_id", "created_at"),
     )
 
 
@@ -783,6 +831,8 @@ class TransactionalEventCreation:
                 session.flush()
                 from event_learning import EventLearningStore
                 EventLearningStore.create_in_session(session, event, request_payload)
+                from suggestion_outcomes import SuggestionOutcomes
+                SuggestionOutcomes.link_in_session(session, event, owner_user_id, request_payload.get("suggestion_session_id"))
 
                 operation.status = "completed"
                 operation.resource_id = event.id
@@ -1362,6 +1412,11 @@ class TransactionalEventOperations:
                     OperationRequestModel.resource_id == event.id,
                 )
             )
+            for suggestion in session.scalars(select(SuggestionSessionModel).where(
+                SuggestionSessionModel.organization_id == organization_id,
+                SuggestionSessionModel.event_id == event.id).with_for_update()):
+                suggestion.event_id = None
+            session.flush()
             session.delete(event)
             session.add(
                 AuditEventModel(

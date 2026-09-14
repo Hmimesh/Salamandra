@@ -242,7 +242,7 @@ test("Phase D history suggestions remain operator controlled", async ({ page }, 
   await expect(form.getByLabel("Quantity", { exact: true })).toBeFocused();
   const save = page.getByRole("button", { name: /Save as planning|Save event/ });
   await expect(save).toBeDisabled();
-  expect(requests).toEqual(["/api/events/describe", "/api/events/learning/suggestions"]);
+  expect(requests).toEqual(["/api/events/describe", "/api/events/learning/sessions", "/api/events/learning/outcome", "/api/events/learning/sessions", "/api/events/learning/outcome"]);
   const recalculated = page.waitForResponse(response => response.url().endsWith("/api/events/describe") && response.status() === 200);
   await activate(page.getByRole("button", { name: /Recalculate/ }));
   const draft = await (await recalculated).json();
@@ -271,7 +271,7 @@ test("history states reject stale drafts and in-flight plans", async ({ page }, 
   await form.getByLabel("Department & item").selectOption("furniture.chair");
   let releaseHistory!: () => void;
   const historyGate = new Promise<void>(resolve => { releaseHistory = resolve; });
-  await page.route("**/api/events/learning/suggestions", async route => { await historyGate; await route.continue(); });
+  await page.route("**/api/events/learning/sessions", async route => { await historyGate; await route.continue(); });
   await activate(page.getByRole("button", { name: "Build event plan" }));
   const history = page.getByRole("region", { name: "From your event history" });
   await expect(history.getByRole("status")).toHaveText("Checking completed events...");
@@ -319,7 +319,7 @@ test("history states reject stale drafts and in-flight plans", async ({ page }, 
   });
   await expect(form.getByLabel("Quantity", { exact: true })).toHaveValue("18");
   await expect(history).toHaveCount(0);
-  expect(applicationRequests).toEqual([]);
+  expect(applicationRequests).toEqual(["/api/events/learning/outcome"]);
   page.off("request", collectApplication);
   const appliedPlan = page.waitForResponse("**/api/events/describe");
   await activate(page.getByRole("button", { name: /Recalculate/ }));
@@ -355,7 +355,7 @@ test("history empty, insufficient and error states remain usable", async ({ page
   await page.goto("/events/new");
   await page.getByLabel("Event brief").fill("Small indoor meeting for 100 guests on 2026-12-20 at 18:00.");
   let mode = 0;
-  await page.route("**/api/events/learning/suggestions", route => route.fulfill({
+  await page.route("**/api/events/learning/sessions", route => route.fulfill({
     status: mode === 2 ? 503 : 200, contentType: "application/json",
     body: JSON.stringify(mode === 2 ? { error: "History is temporarily unavailable." } : { suggestions: [], evidence_count: mode, warnings: [], dimensions: [] }),
   }));
@@ -363,7 +363,7 @@ test("history empty, insufficient and error states remain usable", async ({ page
     if (mode === 2) testInfo.annotations.push({ type: "expected-console-error", description: "console: Failed to load resource: the server responded with a status of 503 (Service Unavailable)" });
     await activate(page.getByRole("button", { name: "Build event plan" }));
     const history = page.getByRole("region", { name: "From your event history" });
-    if (mode === 2) await expect(history.getByRole("status")).toHaveText("History is temporarily unavailable.");
+    if (mode === 2) await expect(history.getByRole("alert")).toHaveText("History is temporarily unavailable.");
     else {
       await expect(history).toContainText("No similar completed events with repeated quantity evidence yet.");
       await expect(history.getByRole("button", { name: "Apply to manual plan" })).toHaveCount(0);
@@ -375,6 +375,63 @@ test("history empty, insufficient and error states remain usable", async ({ page
     await activate(page.getByRole("button", { name: "Revise brief" }));
   }
   await expectNoViewportOverflow(page);
+});
+
+test("Learning summary respects roles and shows real saved and returned outcomes", async ({ page }, testInfo) => {
+  test.setTimeout(90_000);
+  await signIn(page);
+  const learning = page.getByRole("region", { name: "Learning", exact: true });
+  await expect(learning.getByText("No suggestion sessions yet.")).toBeVisible();
+  await page.request.post("/api/auth/signout");
+  await signIn(page, `owner@phase-d-${testInfo.project.name}.test`);
+  const post = async (path: string, body: object) => {
+    const response = await page.request.post(path, { data: body });
+    expect(response.ok(), `${path}: ${await response.text()}`).toBe(true);
+    return response.json();
+  };
+  const features = { departments: ["furniture"], guest_count: 100, duration_minutes: 120, venue_type: "indoor" };
+  let appliedId = "";
+  for (const [action, amount] of [["ignored", 0], ["apply", 13], ["apply", 12]] as const) {
+    const session = await post("/api/events/learning/sessions", { features, idempotency_key: crypto.randomUUID() });
+    const body = { session_id: session.session_id, action, quantities: amount ? { "furniture.chair": amount } : {}, idempotency_key: crypto.randomUUID() };
+    const first = await post("/api/events/learning/outcome", body);
+    expect(await post("/api/events/learning/outcome", body)).toEqual(first);
+    if (amount === 12) appliedId = session.session_id;
+  }
+  for (const [id, type, class_id, amount] of [["Phase E chairs", "furniture", "event-chair", 40], ["Phase E cart", "transport", "utility-cart", 1], ["Phase E car", "transport", "standard-vehicle", 1]] as const) {
+    await post("/api/inventory/items", { id, type, class_id, amount, scope: "shared", idempotency_key: crypto.randomUUID() });
+  }
+  let event = (await post("/api/events/save", { description: "Indoor hall event", suggestion_session_id: appliedId, idempotency_key: crypto.randomUUID(), overrides: {
+    title: "אירוע عربي Phase E", start_date: "2027-02-15", start_time: "18:00", duration_minutes: 120, attendee_count: 100, planning_mode: "manual",
+    capability_requirements: [{ capability: "furniture.chair", amount: 12, level: "required" }],
+  } })).event;
+  expect(event.plan.total_missing).toBe(0);
+  for (const status of ["confirmed", "packed", "out", "returned"]) {
+    if (status === "packed" || status === "returned") {
+      for (const line of event[status === "packed" ? "checklist" : "return_checklist"]) {
+        await post("/api/events/checklist", { event_id: event.id, item_id: line.item_id, phase: status === "packed" ? "pack" : "return", done: true });
+      }
+    }
+    event = (await post("/api/events/status", { event_id: event.id, status })).event;
+  }
+  const summary = await (await page.request.get("/api/learning/summary")).json();
+  expect(summary.counts.applied).toBeGreaterThanOrEqual(1);
+  expect(summary.counts.applied_with_edits).toBeGreaterThanOrEqual(1);
+  expect(summary.counts.ignored).toBeGreaterThanOrEqual(1);
+  expect(summary.outcomes.retained).toBeGreaterThanOrEqual(1);
+  await page.goto("/settings");
+  await expect(learning.getByText(/12 suggested.*12 applied.*12 final/)).toBeVisible();
+  await activate(learning.getByRole("button", { name: "Refresh learning summary" }));
+  await expect(learning.getByRole("button", { name: "Refresh learning summary" })).toBeFocused();
+  await expectNoViewportOverflow(page);
+  await savePreference(page, () => activate(page.getByRole("button", { name: "dark", exact: true })));
+  await savePreference(page, () => page.locator(".preference-row").filter({ hasText: "Text size" }).getByRole("combobox").selectOption("largest"));
+  await expectNoViewportOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("learning-summary.png"), fullPage: true });
+  await page.request.post("/api/auth/signout");
+  await signIn(page, "tech@playwright.test");
+  await expect(learning).toHaveCount(0);
+  expect((await page.request.get("/api/learning/summary")).status()).toBe(403);
 });
 
 test("major operator routes remain responsive and error free", async ({ page }) => {

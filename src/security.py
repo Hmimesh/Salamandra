@@ -30,6 +30,9 @@ class Permission(StrEnum):
     EVENTS_FEEDBACK_READ = "events.feedback.read"
     EVENTS_FEEDBACK_WRITE = "events.feedback.write"
     EVENTS_LEARNING_MANAGE = "events.learning.manage"
+    LEARNING_OUTCOME_WRITE = "learning.outcome.write"
+    LEARNING_SUMMARY_READ = "learning.summary.read"
+    LEARNING_HISTORY_READ = "learning.history.read"
 
 
 ALL_PERMISSIONS = frozenset(Permission)
@@ -43,6 +46,7 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
             Permission.INVENTORY_READ,
             Permission.INVENTORY_PERSONAL_WRITE,
             Permission.EVENTS_PLAN,
+            Permission.LEARNING_OUTCOME_WRITE,
             Permission.EVENTS_CREATE,
             Permission.EVENTS_UPDATE,
             Permission.EVENTS_CANCEL,
@@ -63,6 +67,7 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
             Permission.INVENTORY_EXPORT,
             Permission.INVENTORY_IMPORT,
             Permission.EVENTS_PLAN,
+            Permission.LEARNING_OUTCOME_WRITE,
             Permission.EVENTS_CREATE,
             Permission.EVENTS_UPDATE,
             Permission.EVENTS_CANCEL,

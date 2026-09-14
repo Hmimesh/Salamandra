@@ -681,6 +681,184 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         self.assertEqual(self._database_state_snapshot(), snapshot)
 
     @isolated_database_inserts
+    @race_required
+    def test_suggestion_outcomes_two_process_races_and_isolation(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from database import SuggestionSessionModel
+        org, actor, ids, cookie = self._learning_fixture(count=2)
+        other_org, _, _, other_cookie = self._learning_fixture(count=2)
+        feature_body = {"features": {"departments": ["furniture"], "guest_count": 100, "duration_minutes": 120, "venue_type": "indoor"}, "idempotency_key": uuid4().hex}
+        status, generated, _ = _request(self.ports[0], "POST", "/api/events/learning/sessions", feature_body, cookie)
+        self.assertEqual(status, 200, generated)
+        self.assertEqual(_request(self.ports[1], "POST", "/api/events/learning/sessions", feature_body, cookie)[1], generated)
+        def race(bodies):
+            barrier = threading.Barrier(2)
+            def send(index):
+                barrier.wait(timeout=5)
+                return _request(self.ports[index], "POST", "/api/events/learning/outcome", bodies[index], cookie)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                return list(pool.map(send, range(2)))
+        apply = {"session_id": generated["session_id"], "action": "apply", "quantities": {"furniture.chair": 12}, "idempotency_key": uuid4().hex}
+        result = race([apply, apply])
+        self.assertEqual([value[0] for value in result], [200, 200], result)
+        self.assertEqual(result[0][1], result[1][1])
+        fresh = _request(self.ports[0], "POST", "/api/events/learning/sessions", {**feature_body, "idempotency_key": uuid4().hex}, cookie)[1]
+        apply = {**apply, "session_id": fresh["session_id"], "idempotency_key": uuid4().hex}
+        ignore = {"session_id": fresh["session_id"], "action": "ignored", "quantities": {}, "idempotency_key": uuid4().hex}
+        results = race([apply, ignore])
+        self.assertEqual(sorted(value[0] for value in results), [200, 409], results)
+        with self.factory() as session:
+            self.assertEqual(session.scalar(select(func.count()).select_from(SuggestionSessionModel).where(SuggestionSessionModel.organization_id == org)), 2)
+            self.assertEqual(session.scalar(select(func.count()).select_from(AuditEventModel).where(AuditEventModel.organization_id == org, AuditEventModel.action.like("learning.suggestion.%"))), 2)
+        foreign = _request(self.ports[0], "POST", "/api/events/learning/outcome", ignore, other_cookie)
+        missing = _request(self.ports[1], "POST", "/api/events/learning/outcome", {**ignore, "session_id": "not-found"}, other_cookie)
+        self.assertEqual(foreign[:2], missing[:2])
+        self.assertEqual(foreign[0], 404)
+        summary = _request(self.ports[0], "GET", "/api/learning/summary", cookie=cookie)
+        self.assertEqual(summary[0], 200, summary)
+        self.assertEqual(summary[1]["sessions"], 2)
+        other = _request(self.ports[1], "GET", "/api/learning/summary", cookie=other_cookie)
+        self.assertEqual(other[1]["sessions"], 0)
+        self.assertNotIn(generated["session_id"], json.dumps(other[1]))
+        self.assertEqual(_request(self.ports[0], "GET", "/api/learning/summary")[0], 401)
+        with self.factory.begin() as session:
+            membership = session.scalar(select(MembershipModel).where(MembershipModel.organization_id == org, MembershipModel.user_id == actor))
+            membership.role = "technician"
+        self.assertEqual(_request(self.ports[0], "GET", "/api/learning/summary", cookie=cookie)[0], 403)
+        self.assertEqual(_request(self.ports[0], "POST", "/api/events/learning/outcome", apply, cookie)[0], 403)
+        self.assertEqual(_request(self.ports[0], "POST", "/api/events/learning/sessions", {**feature_body, "features": {"venue_type": "x" * 10000}}, other_cookie)[0], 400)
+
+    @isolated_database_inserts
+    @race_required
+    def test_suggestion_apply_waits_for_event_edit_and_summary_is_committed(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from database import SuggestionSessionModel
+        org, actor, ids, cookie = self._learning_fixture(count=2)
+        event_id = uuid4().hex
+        with self.factory.begin() as session:
+            session.add(EventModel(id=event_id, organization_id=org, owner_user_id=actor, title="Draft", status="planning", data={}))
+        body = {"features": {"departments": ["furniture"], "guest_count": 100, "duration_minutes": 120, "venue_type": "indoor"},
+                "event_id": event_id, "event_version": 1, "idempotency_key": uuid4().hex}
+        status, generated, _ = _request(self.ports[0], "POST", "/api/events/learning/sessions", body, cookie)
+        self.assertEqual(status, 200, generated)
+        apply = {"session_id": generated["session_id"], "action": "apply", "quantities": {"furniture.chair": 12}, "event_version": 1, "idempotency_key": uuid4().hex}
+        before = _request(self.ports[0], "GET", "/api/learning/summary", cookie=cookie)[1]
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with self.factory.begin() as session:
+                event = session.scalar(select(EventModel).where(EventModel.id == event_id).with_for_update())
+                future = pool.submit(_request, self.ports[1], "POST", "/api/events/learning/outcome", apply, cookie)
+                deadline = time.monotonic() + 5
+                waiting = 0
+                while time.monotonic() < deadline:
+                    with self.factory() as observer:
+                        waiting = observer.scalar(text("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock' AND query ILIKE '%events%'"))
+                    if waiting:
+                        break
+                    time.sleep(.02)
+                self.assertGreater(waiting, 0)
+                self.assertEqual(_request(self.ports[0], "GET", "/api/learning/summary", cookie=cookie)[1], before)
+                event.version += 1
+            self.assertEqual(future.result(timeout=10)[0], 409)
+        with self.factory() as session:
+            self.assertIsNone(session.get(SuggestionSessionModel, generated["session_id"]).action)
+
+    @isolated_database_inserts
+    @race_required
+    def test_suggestion_return_feedback_and_evaluation_two_process_races(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from database import SuggestionEvaluationModel, SuggestionSessionModel
+        org, actor, ids, cookie = self._learning_fixture(count=2)
+        def post(path, body, expected=200):
+            status, result, _ = _request(self.ports[0], "POST", path, body, cookie)
+            self.assertEqual(status, expected, result)
+            return result
+        for name, kind, class_id, amount in (("chairs", "furniture", "event-chair", 40), ("cart", "transport", "utility-cart", 1), ("car", "transport", "standard-vehicle", 1)):
+            post("/api/inventory/items", {"id": name, "type": kind, "class_id": class_id, "amount": amount, "scope": "shared", "idempotency_key": uuid4().hex})
+        generated = post("/api/events/learning/sessions", {"features": {"departments": ["furniture"], "guest_count": 100, "duration_minutes": 120, "venue_type": "indoor"}, "idempotency_key": uuid4().hex})
+        identity = generated["session_id"]
+        post("/api/events/learning/outcome", {"session_id": identity, "action": "apply", "quantities": {"furniture.chair": 12}, "idempotency_key": uuid4().hex})
+        event = post("/api/events/save", {"description": "Indoor hall meeting", "suggestion_session_id": identity, "idempotency_key": uuid4().hex,
+            "overrides": {"title": "\u05d0\u05d9\u05e8\u05d5\u05e2 \u0639\u0631\u0628\u064a", "planning_mode": "manual", "start_date": "2027-01-20", "start_time": "18:00", "duration_minutes": 120, "attendee_count": 100,
+                "capability_requirements": [{"capability": "furniture.chair", "amount": 12, "level": "required"}]}}, 201)["event"]
+        self.assertEqual(event["plan"]["total_missing"], 0)
+        for status in ("confirmed", "packed", "out"):
+            if status == "packed":
+                for line in event["checklist"]:
+                    post("/api/events/checklist", {"event_id": event["id"], "item_id": line["item_id"], "phase": "pack", "done": True})
+            event = post("/api/events/status", {"event_id": event["id"], "status": status})["event"]
+        for line in event["return_checklist"]:
+            post("/api/events/checklist", {"event_id": event["id"], "item_id": line["item_id"], "phase": "return", "done": True})
+        def race(commands):
+            barrier = threading.Barrier(2)
+            def send(index):
+                barrier.wait(timeout=5)
+                return _request(self.ports[index], "POST", commands[index][0], commands[index][1], cookie)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                return list(pool.map(send, range(2)))
+        evaluate = ("/api/events/learning/evaluate", {"event_id": event["id"]})
+        results = race([("/api/events/status", {"event_id": event["id"], "status": "returned"}), evaluate])
+        self.assertEqual(results[0][0], 200, results)
+        self.assertIn(results[1][0], (200, 409), results)
+        self.assertEqual([r[0] for r in race([evaluate, evaluate])], [200, 200])
+        with self.factory() as session:
+            self.assertEqual(session.scalar(select(func.count()).select_from(SuggestionEvaluationModel).where(SuggestionEvaluationModel.organization_id == org)), 1)
+            saved = session.get(SuggestionSessionModel, identity)
+            self.assertEqual(saved.event_id, event["id"])
+            self.assertEqual(saved.committed, {"furniture.chair": 12})
+        review = {"event_id": event["id"], "missing": "yes", "unnecessary": "no", "failed": "no", "additional_onsite": "no", "plan_fit": "about_right", "reuse_plan": "yes", "notes": "PRIVATE FEEDBACK", "items": [], "idempotency_key": uuid4().hex}
+        results = race([("/api/events/feedback", review), evaluate])
+        self.assertEqual([r[0] for r in results], [200, 200], results)
+        post("/api/events/status", {"event_id": event["id"], "status": "returned"})
+        with self.factory() as session:
+            rows = session.scalars(select(SuggestionEvaluationModel).where(SuggestionEvaluationModel.organization_id == org).order_by(SuggestionEvaluationModel.feedback_version)).all()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0].comparisons[0]["outcome"], "retained")
+            self.assertEqual(rows[1].comparisons[0]["outcome"], "unresolved_feedback")
+            self.assertNotIn("PRIVATE", str([row.comparisons for row in rows]))
+        summary = _request(self.ports[1], "GET", "/api/learning/summary", cookie=cookie)[1]
+        self.assertEqual(summary["outcomes"], {"unresolved_feedback": 1})
+        self.assertNotIn("PRIVATE", json.dumps(summary))
+        _, _, _, other_cookie = self._learning_fixture(count=0)
+        foreign = _request(self.ports[0], "POST", evaluate[0], evaluate[1], other_cookie)
+        absent = _request(self.ports[1], "POST", evaluate[0], {"event_id": "absent"}, other_cookie)
+        self.assertEqual(foreign[:2], absent[:2])
+        self.assertEqual(foreign[0], 404)
+
+    @isolated_database_inserts
+    def test_learning_prefilter_http_finds_relevant_history_after_first_hundred(self):
+        from datetime import datetime, timezone
+        from database import EventLearningRecordModel
+        org_a, _, ids_a, cookie_a = self._learning_fixture(count=303)
+        org_b, _, _, cookie_b = self._learning_fixture(count=2)
+        relevant_ids = sorted(ids_a)[-3:]
+        with self.factory.begin() as session:
+            for row in session.scalars(select(EventLearningRecordModel).where(EventLearningRecordModel.organization_id == org_a)):
+                if row.event_id in relevant_ids:
+                    row.created_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+                else:
+                    row.features = {"departments": ["lighting"], "guest_count": 10000,
+                                    "duration_minutes": 900, "venue_type": "outdoor"}
+            for row in session.scalars(select(EventLearningRecordModel).where(EventLearningRecordModel.organization_id == org_b)):
+                row.proposal = {**row.proposal, "requirements": [{"capability": "furniture.chair", "amount": 24}]}
+        snapshot = self._database_state_snapshot()
+        body = {"features": {"departments": ["furniture"], "guest_count": 100,
+                             "duration_minutes": 120, "venue_type": "indoor"}}
+        path = "/api/events/learning/suggestions"
+        status, result_a, _ = _request(self.ports[0], "POST", path, body, cookie_a)
+        self.assertEqual(status, 200, result_a)
+        self.assertEqual((result_a["evidence_count"], result_a["suggestions"][0]["amount"]), (3, 12))
+        self.assertEqual(_request(self.ports[1], "POST", path, body, cookie_a)[1], result_a)
+        status, result_b, _ = _request(self.ports[1], "POST", path, body, cookie_b)
+        self.assertEqual(status, 200, result_b)
+        self.assertEqual((result_b["evidence_count"], result_b["suggestions"][0]["amount"]), (2, 24))
+        foreign = _request(self.ports[0], "POST", path, {**body, "event_id": relevant_ids[0]}, cookie_b)
+        absent = _request(self.ports[1], "POST", path, {**body, "event_id": "absent"}, cookie_b)
+        self.assertEqual(foreign[:2], absent[:2])
+        self.assertEqual(foreign[0], 404)
+        self.assertTrue(all(identity not in json.dumps(result_b) for identity in ids_a))
+        self.assertEqual(self._database_state_snapshot(), snapshot)
+
+    @isolated_database_inserts
     def test_learning_candidates_enforce_eligibility_and_single_bounded_query(self):
         from database import EventLearningRecordModel
         from event_learning import EventLearningStore
