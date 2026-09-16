@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from copy import deepcopy
 import json
 from datetime import datetime, timezone
 from typing import Any
@@ -136,7 +137,15 @@ class EventLearningStore:
             "packed": [m.lines for m in movements if m.action == "packed"],
             "dispatched": [m.lines for m in movements if m.action == "out"],
             "returned": [m.lines for m in movements if m.action == "returned"],
+            "supplemental_dispatch": [m.lines for m in movements if m.action == "supplemental_dispatch"],
+            "supplemental_pack": [m.lines for m in movements if m.action == "supplemental_pack"],
+            "released": [m.lines for m in movements if m.action == "release"],
         }
+        from database import FieldAdjustmentModel
+        row.execution["field_adjustments"] = [{"id": adjustment.id, "status": adjustment.status,
+            "reason": adjustment.reason, "data": deepcopy(adjustment.data)} for adjustment in session.scalars(
+                select(FieldAdjustmentModel).where(FieldAdjustmentModel.organization_id == event.organization_id,
+                    FieldAdjustmentModel.event_id == event.id).order_by(FieldAdjustmentModel.created_at, FieldAdjustmentModel.id))]
         if event.status == "returned" and row.source_type == "real" and row.exclusion_reason == "awaiting_return":
             row.eligible = True
             row.exclusion_reason = None

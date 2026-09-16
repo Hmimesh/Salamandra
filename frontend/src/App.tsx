@@ -9,9 +9,11 @@ const ActivityPage = lazy(() => import("./pages/ActivityPage").then((module) => 
 const ContactPage = lazy(() => import("./pages/ContactPage").then((module) => ({ default: module.ContactPage })));
 const DashboardPage = lazy(() => import("./pages/DashboardPage").then((module) => ({ default: module.DashboardPage })));
 const EventsPage = lazy(() => import("./pages/EventsPage").then((module) => ({ default: module.EventsPage })));
+const ExternalAssignmentPage = lazy(() => import("./pages/ExternalAssignmentPage").then((module) => ({ default: module.ExternalAssignmentPage })));
 const InventoryPage = lazy(() => import("./pages/InventoryPage").then((module) => ({ default: module.InventoryPage })));
 const InventoryCleanupPage = lazy(() => import("./pages/InventoryCleanupPage").then((module) => ({ default: module.InventoryCleanupPage })));
 const KitsPage = lazy(() => import("./pages/KitsPage").then((module) => ({ default: module.KitsPage })));
+const MaintenancePage = lazy(() => import("./pages/MaintenancePage").then((module) => ({ default: module.MaintenancePage })));
 const LandingPage = lazy(() => import("./pages/LandingPage").then((module) => ({ default: module.LandingPage })));
 const PrivacyPage = lazy(() => import("./pages/PrivacyPage").then((module) => ({ default: module.PrivacyPage })));
 const RegisterPage = lazy(() => import("./pages/RegisterPage").then((module) => ({ default: module.RegisterPage })));
@@ -27,6 +29,7 @@ function LoadingScreen() {
 
 export function App() {
   const { state, loading, toast } = useWorkspace();
+  if (location.pathname === "/external") return <Suspense fallback={<LoadingScreen />}><ExternalAssignmentPage /></Suspense>;
   if (loading) return <LoadingScreen />;
 
   return (
@@ -41,6 +44,7 @@ export function App() {
               <Route path="/inventory" element={<InventoryPage />} />
               <Route path="/inventory/cleanup" element={<InventoryCleanupPage />} />
               <Route path="/kits" element={<KitsPage />} />
+              <Route path="/maintenance" element={state.auth.maintenance_allowed ? <MaintenancePage /> : <Navigate to="/" replace />} />
               <Route path="/returns" element={<ReturnsPage />} />
               <Route path="/team" element={<TeamPage />} />
               <Route path="/activity" element={<ActivityPage />} />

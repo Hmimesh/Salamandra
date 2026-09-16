@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from uuid import uuid4
@@ -153,6 +154,7 @@ class InventoryHoldingModel(Base):
     reserved_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     packed_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     dispatched_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    condition_quantity: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     active: Mapped[bool] = mapped_column(nullable=False, default=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     data: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
@@ -176,6 +178,7 @@ class InventoryHoldingModel(Base):
         CheckConstraint("reserved_quantity >= 0", name="ck_holdings_reserved"),
         CheckConstraint("packed_quantity >= 0", name="ck_holdings_packed"),
         CheckConstraint("dispatched_quantity >= 0", name="ck_holdings_dispatched"),
+        CheckConstraint("condition_quantity >= 0", name="ck_holdings_condition"),
         CheckConstraint("version > 0", name="ck_holdings_version"),
         ForeignKeyConstraint(
             ["organization_id", "owner_user_id"],
@@ -204,6 +207,52 @@ class InventoryHoldingModel(Base):
     )
 
 
+class ConditionIncidentModel(Base):
+    __tablename__ = "condition_incidents"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    holding_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    issue: Mapped[str] = mapped_column(String(1000), nullable=False)
+    resolution: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    __table_args__ = (
+        UniqueConstraint("id", "organization_id", name="uq_condition_incident_org"),
+        ForeignKeyConstraint(["event_id", "organization_id"], ["events.id", "events.organization_id"], ondelete="RESTRICT", name="fk_condition_event_org"),
+        ForeignKeyConstraint(["holding_id", "organization_id"], ["inventory_holdings.id", "inventory_holdings.organization_id"], ondelete="RESTRICT", name="fk_condition_holding_org"),
+        CheckConstraint("quantity > 0", name="ck_condition_quantity"),
+        CheckConstraint("version > 0", name="ck_condition_version"),
+        CheckConstraint("status IN ('ready','needs_repair','in_repair','quarantine','missing','retired')", name="ck_condition_status"),
+        Index("ix_condition_org_status", "organization_id", "status", "created_at"),
+    )
+
+
+class ConditionMovementModel(Base):
+    __tablename__ = "condition_movements"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    incident_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_membership_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    from_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    to_state: Mapped[str] = mapped_column(String(32), nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    available_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    available_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    reason: Mapped[str] = mapped_column(String(1000), nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    __table_args__ = (
+        ForeignKeyConstraint(["incident_id", "organization_id"], ["condition_incidents.id", "condition_incidents.organization_id"], ondelete="RESTRICT", name="fk_condition_movement_incident_org"),
+        ForeignKeyConstraint(["actor_membership_id", "organization_id"], ["memberships.id", "memberships.organization_id"], ondelete="RESTRICT", name="fk_condition_movement_actor_org"),
+        UniqueConstraint("organization_id", "idempotency_key", name="uq_condition_movement_key"),
+        CheckConstraint("quantity > 0 AND available_before >= 0 AND available_after >= 0", name="ck_condition_movement_quantities"),
+        Index("ix_condition_movement_incident", "organization_id", "incident_id", "created_at"),
+    )
+
+
 class EventModel(Base):
     __tablename__ = "events"
 
@@ -216,6 +265,8 @@ class EventModel(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="planning")
     starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reservation_starts_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reservation_ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     priority_score: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     data: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
@@ -234,6 +285,24 @@ class EventModel(Base):
             name="fk_events_owner_same_org",
         ),
         Index("ix_events_org_window", "organization_id", "status", "starts_at", "ends_at"),
+        Index("ix_events_org_reservation_window", "organization_id", "reservation_starts_at", "reservation_ends_at"),
+    )
+
+
+class EventProposalModel(Base):
+    __tablename__ = "event_proposals"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_user_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    original_request: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, nullable=False)
+    proposal: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, nullable=False)
+    consumed: Mapped[bool] = mapped_column(nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    __table_args__ = (
+        ForeignKeyConstraint(["organization_id", "actor_user_id"],
+            ["memberships.organization_id", "memberships.user_id"], ondelete="RESTRICT",
+            name="fk_event_proposal_actor_org"),
+        Index("ix_event_proposals_org_actor", "organization_id", "actor_user_id"),
     )
 
 
@@ -437,6 +506,120 @@ class IntegrationConnectionModel(Base):
     )
 
 
+class CrewProfileModel(Base):
+    __tablename__ = "crew_profiles"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), ForeignKey("organizations.id", ondelete="RESTRICT"))
+    name: Mapped[str] = mapped_column(String(200))
+    kind: Mapped[str] = mapped_column(String(16))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    complexity: Mapped[int] = mapped_column(Integer, default=1)
+    contact: Mapped[str] = mapped_column(String(400), default="")
+    notes: Mapped[str] = mapped_column(String(2000), default="")
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    __table_args__ = (
+        UniqueConstraint("id", "organization_id", name="uq_crew_profile_org"),
+        CheckConstraint("kind IN ('internal','external')", name="ck_crew_kind"),
+        CheckConstraint("complexity BETWEEN 1 AND 3", name="ck_crew_complexity"),
+        CheckConstraint("version > 0", name="ck_crew_version"),
+        Index("ix_crew_org", "organization_id", "name", "id"),
+    )
+
+
+class CrewSkillModel(Base):
+    __tablename__ = "crew_skills"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    profile_id: Mapped[str] = mapped_column(String(64))
+    organization_id: Mapped[str] = mapped_column(String(64))
+    skill: Mapped[str] = mapped_column(String(100))
+    level: Mapped[int] = mapped_column(Integer)
+    __table_args__ = (
+        UniqueConstraint("profile_id", "skill", name="uq_crew_skill_profile"),
+        ForeignKeyConstraint(["profile_id", "organization_id"], ["crew_profiles.id", "crew_profiles.organization_id"], ondelete="RESTRICT", name="fk_crew_skill_org"),
+        CheckConstraint("level BETWEEN 1 AND 3", name="ck_crew_skill_level"),
+    )
+
+
+class CrewRoleModel(Base):
+    __tablename__ = "crew_roles"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64))
+    event_id: Mapped[str] = mapped_column(String(64))
+    name: Mapped[str] = mapped_column(String(200))
+    quantity: Mapped[int] = mapped_column(Integer)
+    complexity: Mapped[int] = mapped_column(Integer)
+    skills: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, default=dict)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    __table_args__ = (
+        UniqueConstraint("id", "event_id", "organization_id", name="uq_crew_role_event_org"),
+        ForeignKeyConstraint(["event_id", "organization_id"], ["events.id", "events.organization_id"], ondelete="RESTRICT", name="fk_crew_role_event"),
+        CheckConstraint("quantity BETWEEN 1 AND 100", name="ck_crew_role_quantity"),
+        CheckConstraint("complexity BETWEEN 1 AND 3", name="ck_crew_role_complexity"),
+        CheckConstraint("version > 0", name="ck_crew_role_version"),
+        Index("ix_crew_role_event", "organization_id", "event_id"),
+    )
+
+
+class CrewAssignmentModel(Base):
+    __tablename__ = "crew_assignments"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64))
+    event_id: Mapped[str] = mapped_column(String(64))
+    role_id: Mapped[str] = mapped_column(String(64))
+    profile_id: Mapped[str] = mapped_column(String(64))
+    call_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    release_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(String(16), default="assigned")
+    notes: Mapped[str] = mapped_column(String(2000), default="")
+    equipment: Mapped[list] = mapped_column(JSON_VALUE, default=list)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    updates: Mapped[list] = mapped_column(JSON_VALUE, default=list)
+    __table_args__ = (
+        UniqueConstraint("id", "organization_id", name="uq_crew_assignment_org"),
+        ForeignKeyConstraint(["role_id", "event_id", "organization_id"], ["crew_roles.id", "crew_roles.event_id", "crew_roles.organization_id"], ondelete="RESTRICT", name="fk_crew_assignment_role"),
+        ForeignKeyConstraint(["profile_id", "organization_id"], ["crew_profiles.id", "crew_profiles.organization_id"], ondelete="RESTRICT", name="fk_crew_assignment_profile"),
+        CheckConstraint("release_at > call_at", name="ck_crew_assignment_window"),
+        CheckConstraint("status IN ('assigned','cancelled')", name="ck_crew_assignment_status"),
+        CheckConstraint("version > 0", name="ck_crew_assignment_version"),
+        Index("ix_crew_assignment_window", "organization_id", "profile_id", "call_at", "release_at"),
+        Index("ix_crew_assignment_event", "organization_id", "event_id"),
+    )
+
+
+class CrewAccessModel(Base):
+    __tablename__ = "crew_access"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64))
+    assignment_id: Mapped[str] = mapped_column(String(64))
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked: Mapped[bool] = mapped_column(Boolean, default=False)
+    __table_args__ = (
+        ForeignKeyConstraint(["assignment_id", "organization_id"], ["crew_assignments.id", "crew_assignments.organization_id"], ondelete="RESTRICT", name="fk_crew_access_assignment"),
+        Index("ix_crew_access_assignment", "organization_id", "assignment_id"),
+    )
+
+
+class FieldAdjustmentModel(Base):
+    __tablename__ = "field_adjustments"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
+    organization_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_membership_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    reason: Mapped[str] = mapped_column(String(1000), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    data: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE, nullable=False, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    __table_args__ = (
+        ForeignKeyConstraint(["event_id", "organization_id"], ["events.id", "events.organization_id"], ondelete="RESTRICT", name="fk_adjustment_event_org"),
+        ForeignKeyConstraint(["actor_membership_id", "organization_id"], ["memberships.id", "memberships.organization_id"], ondelete="RESTRICT", name="fk_adjustment_actor_org"),
+        CheckConstraint("status IN ('pending','fulfilled','cancelled')", name="ck_adjustment_status"),
+        CheckConstraint("version > 0", name="ck_adjustment_version"),
+        Index("ix_adjustment_event", "organization_id", "event_id", "created_at"),
+    )
+
+
 class AllocationModel(Base):
     __tablename__ = "allocations"
 
@@ -488,7 +671,7 @@ class AllocationLineModel(Base):
         ),
         CheckConstraint("quantity > 0", name="ck_allocation_lines_quantity"),
         CheckConstraint(
-            "state IN ('reserved', 'packed', 'dispatched', 'returned')",
+            "state IN ('reserved', 'packed', 'dispatched', 'returned', 'released')",
             name="ck_allocation_lines_state",
         ),
         Index("ix_allocation_lines_allocation", "organization_id", "allocation_id"),
@@ -830,7 +1013,10 @@ class TransactionalEventCreation:
                 session.add(event)
                 session.flush()
                 from event_learning import EventLearningStore
-                EventLearningStore.create_in_session(session, event, request_payload)
+                learning = EventLearningStore.create_in_session(session, event, request_payload)
+                if request_payload.get("proposal_id") is not None:
+                    from event_proposals import consume_proposal
+                    consume_proposal(session, learning, event, owner_user_id, request_payload["proposal_id"])
                 from suggestion_outcomes import SuggestionOutcomes
                 SuggestionOutcomes.link_in_session(session, event, owner_user_id, request_payload.get("suggestion_session_id"))
 
@@ -1139,6 +1325,10 @@ class TransactionalEventDetails:
             event.priority_score = int(authoritative_data.get("priority_score", 50))
             event.version += 1
             authoritative_data["version"] = event.version
+            authoritative_data["logistics"] = deepcopy(previous_data.get("logistics", {}))
+            if authoritative_data["logistics"]:
+                from event_logistics import logistics_window
+                event.reservation_starts_at, event.reservation_ends_at = logistics_window(authoritative_data)
             event.data = authoritative_data
             from event_learning import EventLearningStore
             EventLearningStore.capture_edit_in_session(session, event, previous_data)
@@ -1265,6 +1455,9 @@ class TransactionalEventOperations:
 
         event.status = next_status
         event.version += 1
+        if next_status == "returned":
+            from field_adjustments import close_adjustments
+            close_adjustments(session, event, actor_membership_id, request_id)
         event_data["status"] = next_status
         history = list(event_data.get("history", []))
         history.append(
@@ -1332,6 +1525,8 @@ class TransactionalEventOperations:
             released = self._release_allocation(session, event)
             event.status = "cancelled"
             event.version += 1
+            from field_adjustments import close_adjustments
+            close_adjustments(session, event, membership.id, request_id)
             data = dict(event.data or {})
             data["status"] = "cancelled"
             history = list(data.get("history", []))
@@ -1394,6 +1589,9 @@ class TransactionalEventOperations:
                 raise ResourceNotFound("Event was not found.")
             if event.status != "planning":
                 raise StateConflict("Only an unconfirmed planning event can be deleted permanently.")
+            if session.scalar(select(CrewRoleModel.id).where(CrewRoleModel.organization_id == organization_id,
+                    CrewRoleModel.event_id == event.id).limit(1)):
+                raise StateConflict("This event has crew records. Cancel it to preserve their history.")
             if session.scalar(
                 select(AllocationModel.id).where(
                     AllocationModel.organization_id == organization_id,
@@ -1469,6 +1667,7 @@ class TransactionalEventOperations:
                 .with_for_update()
             )
         }
+        lines = [line for line in lines if line.state != "released"]
         bucket = f"{allocation.status}_quantity"
         released: list[dict[str, Any]] = []
         for line in lines:
@@ -1622,6 +1821,8 @@ class TransactionalEventOperations:
         source_column = f"{source}_quantity"
         target_column = "available_quantity" if target == "returned" else f"{target}_quantity"
         for line in lines:
+            if line.state == "released":
+                continue
             if line.state != source:
                 raise StateConflict("Allocation line state does not match the event transition.")
             holding = holdings[line.holding_id]
@@ -1662,6 +1863,7 @@ class TransactionalEventOperations:
                 select(AllocationLineModel).where(
                     AllocationLineModel.allocation_id == allocation.id,
                     AllocationLineModel.organization_id == event.organization_id,
+                    AllocationLineModel.state != "released",
                 )
             )
         ]
@@ -1681,6 +1883,7 @@ class TransactionalInventoryOperations:
             "reserved_quantity",
             "packed_quantity",
             "dispatched_quantity",
+            "condition_quantity",
             "scope",
             "owner_user_id",
             "active",
@@ -2436,6 +2639,7 @@ class TransactionalInventoryOperations:
                 holding.reserved_quantity,
                 holding.packed_quantity,
                 holding.dispatched_quantity,
+                holding.condition_quantity,
             )
         )
         if operational_quantity and protected_changes:
@@ -2511,6 +2715,7 @@ class TransactionalInventoryOperations:
                 holding.reserved_quantity,
                 holding.packed_quantity,
                 holding.dispatched_quantity,
+                holding.condition_quantity,
             )
         )
 

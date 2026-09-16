@@ -151,12 +151,97 @@ class SalamandraServer(BaseHTTPRequestHandler):
             self.send_json({"status": "ready"})
             return
 
+        if parsed_url.path == "/api/external/assignment":
+            if self.database_runtime is None:
+                raise ResourceNotFound()
+            from event_crew import EventCrew
+            authorization = self.headers.get("Authorization", "")
+            token = authorization[7:] if authorization.startswith("Bearer ") else ""
+            self.send_json(EventCrew(self.database_runtime.learning.factory).external(token))
+            return
+
         user = self.current_user()
+
+        if parsed_url.path in {"/api/crew", "/api/events/crew"}:
+            user = self.require_user()
+            if self.database_runtime is None:
+                raise StateConflict("Crew operations require PostgreSQL.")
+            from event_crew import EventCrew
+            service = EventCrew(self.database_runtime.learning.factory)
+            self.send_json({"profiles": service.profiles(user.organization_id, user.id)} if parsed_url.path == "/api/crew" else
+                service.event(user.organization_id, user.id, parse_qs(parsed_url.query).get("event_id", [None])[0]))
+            return
 
         if parsed_url.path == "/api/state":
             if user is not None:
                 require_permission(user.role, Permission.STATE_READ)
             self.send_json(self.state_payload(user))
+            return
+
+        if parsed_url.path == "/api/events/logistics/export":
+            user = self.require_user()
+            if self.database_runtime is None:
+                raise StateConflict("Logistics requires PostgreSQL.")
+            from event_logistics import EventLogistics
+            rows = EventLogistics(self.database_runtime.learning.factory).export(
+                user.organization_id, user.id, parse_qs(parsed_url.query).get("event_id", [None])[0])
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerows([[self.spreadsheet_safe_value(value) for value in row] for row in rows])
+            payload = output.getvalue().encode("utf-8-sig")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="salamandra-logistics.csv"')
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_security_headers()
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        if parsed_url.path == "/api/events/logistics":
+            user = self.require_user()
+            if self.database_runtime is None:
+                raise StateConflict("Logistics requires PostgreSQL.")
+            from event_logistics import EventLogistics
+            self.send_json(EventLogistics(self.database_runtime.learning.factory).get(
+                user.organization_id, user.id, parse_qs(parsed_url.query).get("event_id", [None])[0]))
+            return
+
+        if parsed_url.path == "/api/events/adjustments":
+            user = self.require_user()
+            if self.database_runtime is None:
+                raise StateConflict("Field adjustments require PostgreSQL.")
+            from field_adjustments import FieldAdjustments
+            self.send_json(FieldAdjustments(self.database_runtime.learning.factory).list(
+                user.organization_id, user.id, parse_qs(parsed_url.query).get("event_id", [None])[0]))
+            return
+
+        if parsed_url.path == "/api/events/return":
+            user = self.require_user()
+            if self.database_runtime is None:
+                raise StateConflict("Return reconciliation requires PostgreSQL.")
+            from event_returns import EventReturns
+            self.send_json(EventReturns(self.database_runtime.learning.factory).preview(
+                user.organization_id, user.id, parse_qs(parsed_url.query).get("event_id", [None])[0]))
+            return
+
+        if parsed_url.path == "/api/inventory/operations":
+            user = self.require_user()
+            if self.database_runtime is None:
+                raise StateConflict("Operational inventory requires PostgreSQL.")
+            from equipment_conditions import EquipmentConditions
+            self.send_json(EquipmentConditions(self.database_runtime.learning.factory).summary(
+                user.organization_id, user.id, parse_qs(parsed_url.query).get("scope", ["combined"])[0]))
+            return
+
+        if parsed_url.path == "/api/maintenance":
+            user = self.require_user()
+            if self.database_runtime is None:
+                raise StateConflict("Maintenance requires PostgreSQL.")
+            from equipment_conditions import EquipmentConditions
+            self.send_json(EquipmentConditions(self.database_runtime.learning.factory).list(
+                user.organization_id, user.id, parse_qs(parsed_url.query).get("status", [None])[0]))
             return
 
         if parsed_url.path == "/api/learning/summary":
@@ -268,6 +353,69 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 return
 
             user = self.require_user()
+
+            if parsed_url.path in {"/api/crew", "/api/events/crew/role", "/api/events/crew/assign", "/api/events/crew/access"}:
+                if self.database_runtime is None:
+                    raise StateConflict("Crew operations require PostgreSQL.")
+                if len(json.dumps(body, ensure_ascii=True).encode("utf-8")) > 32768:
+                    raise ValueError("Crew request is too large.")
+                from event_crew import EventCrew
+                service = EventCrew(self.database_runtime.learning.factory)
+                command = {"/api/crew": service.profile, "/api/events/crew/role": service.role,
+                    "/api/events/crew/assign": service.assign, "/api/events/crew/access": service.access}[parsed_url.path]
+                self.send_json(command(user.organization_id, user.id, body, self.correlation_id()))
+                return
+
+            if parsed_url.path in {"/api/events/logistics", "/api/events/logistics/stage"}:
+                if self.database_runtime is None:
+                    raise StateConflict("Logistics requires PostgreSQL.")
+                if len(json.dumps(body, ensure_ascii=True).encode("utf-8")) > 32768:
+                    raise ValueError("Logistics request is too large.")
+                from event_logistics import EventLogistics
+                result = EventLogistics(self.database_runtime.learning.factory).update(user.organization_id, user.id,
+                    body, self.correlation_id(), staging=parsed_url.path.endswith("/stage"))
+                self.send_json({"logistics": result, "state": self.state_payload(user)})
+                return
+
+            if parsed_url.path in {"/api/events/adjustments", "/api/events/adjustments/preview", "/api/events/adjustments/fulfill", "/api/events/adjustments/cancel"}:
+                if self.database_runtime is None:
+                    raise StateConflict("Field adjustments require PostgreSQL.")
+                if len(json.dumps(body, ensure_ascii=True).encode("utf-8")) > 32768:
+                    raise ValueError("Adjustment request is too large.")
+                from field_adjustments import FieldAdjustments
+                service = FieldAdjustments(self.database_runtime.learning.factory)
+                if parsed_url.path.endswith("/preview"):
+                    self.send_json(service.preview(user.organization_id, user.id, body))
+                else:
+                    if parsed_url.path.endswith(("/fulfill", "/cancel")):
+                        result = service.act(user.organization_id, user.id, body, self.correlation_id(), cancel=parsed_url.path.endswith("/cancel"))
+                    else:
+                        result = service.create(user.organization_id, user.id, body, self.correlation_id())
+                    self.send_json({**result, "state": self.state_payload(user)})
+                return
+
+            if parsed_url.path == "/api/events/return":
+                if self.database_runtime is None:
+                    raise StateConflict("Return reconciliation requires PostgreSQL.")
+                if len(json.dumps(body, ensure_ascii=True).encode("utf-8")) > 262144:
+                    raise ValueError("Return request is too large.")
+                from event_returns import EventReturns
+                result = EventReturns(self.database_runtime.learning.factory).reconcile(
+                    user.organization_id, user.id, body, self.correlation_id())
+                self.send_json({"reconciliation": result, "state": self.state_payload(user)})
+                return
+
+            if parsed_url.path in {"/api/maintenance/report", "/api/maintenance/transition"}:
+                if self.database_runtime is None:
+                    raise StateConflict("Maintenance requires PostgreSQL.")
+                if len(json.dumps(body, ensure_ascii=True).encode("utf-8")) > 8192:
+                    raise ValueError("Condition request is too large.")
+                from equipment_conditions import EquipmentConditions
+                service = EquipmentConditions(self.database_runtime.learning.factory)
+                result = (service.report if parsed_url.path.endswith("/report") else service.transition)(
+                    user.organization_id, user.id, body, self.correlation_id())
+                self.send_json({"incident": result, "state": self.state_payload(user)})
+                return
 
             if parsed_url.path in {"/api/events/learning/sessions", "/api/events/learning/outcome", "/api/events/learning/evaluate"}:
                 if self.database_runtime is None:
@@ -752,7 +900,15 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 draft.record.assigned_user_ids = self.valid_event_assignees(
                     draft.record.assigned_user_ids, user
                 )
-                self.send_json({"draft": draft.to_dict(), "state": self.state_payload(user)})
+                result = draft.to_dict()
+                if body.get("capture_proposal") is True and self.database_runtime is not None:
+                    from event_proposals import capture_proposal
+                    captured = capture_proposal(self.database_runtime.learning.factory,
+                        user.organization_id, user.id, draft.record.to_dict(),
+                        {"description": body.get("description", ""), "overrides": body.get("overrides") or {}},
+                        self.operation_request_id(body), self.correlation_id())
+                    result.update(captured)
+                self.send_json({"draft": result, "state": self.state_payload(user)})
                 return
 
             if parsed_url.path == "/api/events/save":
@@ -764,6 +920,8 @@ class SalamandraServer(BaseHTTPRequestHandler):
                 }
                 if "suggestion_session_id" in body:
                     request_payload["suggestion_session_id"] = body["suggestion_session_id"]
+                if "proposal_id" in body:
+                    request_payload["proposal_id"] = body["proposal_id"]
                 idempotency_key = self.operation_request_id(body)
                 event = self.build_event_from_description(
                     description, overrides, user
@@ -1714,6 +1872,7 @@ class SalamandraServer(BaseHTTPRequestHandler):
             "demo_available": self.accounts.allow_demo,
             "registration_mode": self.web_config.registration_mode,
             "learning_summary_allowed": Permission.LEARNING_SUMMARY_READ in permissions_for_role(user.role),
+            "maintenance_allowed": self.database_runtime is not None and Permission.MAINTENANCE_READ in permissions_for_role(user.role),
         }
         inventories = self.workspace.to_dict(
             user.id if user else None,

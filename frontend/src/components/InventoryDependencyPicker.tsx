@@ -6,8 +6,8 @@ import { inventoryDiagnostic, inventoryLabel, inventorySearch } from "../lib/inv
 
 const RESULT_LIMIT = 50;
 
-export function InventoryDependencyPicker({ items, value, onChange }: {
-  items: InventoryItem[]; value: string; onChange: (id: string) => void;
+export function InventoryDependencyPicker({ items, value, onChange, label = "Linked inventory item" }: {
+  items: InventoryItem[]; value: string; onChange: (id: string) => void; label?: string;
 }) {
   const id = useId();
   const input = useRef<HTMLInputElement>(null);
@@ -35,7 +35,7 @@ export function InventoryDependencyPicker({ items, value, onChange }: {
   return <div ref={root} className="inventory-dependency-picker" onBlur={event => {
     if (!event.currentTarget.contains(event.relatedTarget)) close();
   }}>
-    <label htmlFor={id}>Linked inventory item</label>
+    <label htmlFor={id}>{label}</label>
     <input type="hidden" name="requirement_id" value={value} />
     <div className="dependency-search-control">
       <input ref={input} id={id} role="combobox" autoComplete="off" dir="auto"

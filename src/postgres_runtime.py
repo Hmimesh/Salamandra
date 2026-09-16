@@ -663,11 +663,12 @@ class PostgresEventMemory:
 
     def active_reservations(self, exclude_event_id: str | None = None, organization_id: str | None = None, start_date: str | None = None, start_time: str = "00:00", duration_minutes: int = 1440) -> dict[str, int]:
         reservations: dict[str, int] = {}
+        current = self.get_for_organization(exclude_event_id, organization_id) if exclude_event_id and organization_id else None
         for event in self.list_events(organization_id):
             # Confirmed and packed quantities are already absent from the available bucket.
             if event.id == exclude_event_id or event.status != "planning":
                 continue
-            if start_date and not self._events_overlap(event, start_date, start_time, duration_minutes):
+            if start_date and not self._events_overlap(event, start_date, start_time, duration_minutes, current.logistics if current else None):
                 continue
             for line in event.plan.get("lines", []):
                 if int(line.get("missing", 0)) > 0:
@@ -678,7 +679,8 @@ class PostgresEventMemory:
         return reservations
 
     def overlapping_events(self, start_date: str, start_time: str, duration_minutes: int, organization_id: str, exclude_event_id: str | None = None) -> list[EventRecord]:
-        return [event for event in self.list_events(organization_id) if event.id != exclude_event_id and event.status in {"planning", "confirmed", "packed", "out"} and self._events_overlap(event, start_date, start_time, duration_minutes)]
+        current = self.get_for_organization(exclude_event_id, organization_id) if exclude_event_id else None
+        return [event for event in self.list_events(organization_id) if event.id != exclude_event_id and event.status in {"planning", "confirmed", "packed", "out"} and self._events_overlap(event, start_date, start_time, duration_minutes, current.logistics if current else None)]
 
     def to_dict(self, organization_id: str | None = None) -> dict[str, Any]:
         events = self.list_events(organization_id)
@@ -708,12 +710,13 @@ class PostgresEventMemory:
         return {token.strip(".,:;!?()[]").lower() for token in description.split() if len(token.strip(".,:;!?()[]")) > 2}
 
     @staticmethod
-    def _events_overlap(event: EventRecord, start_date: str, start_time: str, duration_minutes: int) -> bool:
+    def _events_overlap(event: EventRecord, start_date: str, start_time: str, duration_minutes: int, logistics: dict | None = None) -> bool:
         try:
-            requested_start = datetime.fromisoformat(f"{start_date}T{start_time}:00")
-            requested_end = requested_start + timedelta(minutes=duration_minutes)
-            event_start = datetime.fromisoformat(f"{event.start_date}T{event.start_time}:00")
-            return requested_start < event_start + timedelta(minutes=event.duration_minutes) and event_start < requested_end
+            from event_logistics import logistics_window
+            requested_start, requested_end = logistics_window({"start_date": start_date, "start_time": start_time,
+                "duration_minutes": duration_minutes, "logistics": logistics or {}})
+            event_start, event_end = logistics_window(event.to_dict())
+            return requested_start < event_end and event_start < requested_end
         except ValueError:
             return False
 

@@ -27,12 +27,12 @@ class InventoryRemoval(TransactionalInventoryOperations):
         return {"definitions": len(rows), "units": sum(row.available_quantity for row in rows),
                 "preview_token": self._fingerprint([
                     [row.id, row.version, row.available_quantity, row.reserved_quantity,
-                     row.packed_quantity, row.dispatched_quantity] for row in rows
+                     row.packed_quantity, row.dispatched_quantity, row.condition_quantity] for row in rows
                 ])}
 
     def _safe(self, session, org, rows):
         if any(self._total(row) != row.available_quantity for row in rows):
-            raise StateConflict("Inventory is reserved, packed or dispatched. Return or release it before clearing.")
+            raise StateConflict("Inventory is reserved, packed, dispatched or held for a condition issue. Resolve it before clearing.")
         self._validate_dependency_graph(session, org, {}, removed_keys=[
             (row.scope, row.owner_user_id, row.legacy_item_id) for row in rows
         ])

@@ -3,6 +3,7 @@ import { CheckCircle2, ClipboardCheck, PackageCheck, Truck } from "lucide-react"
 import { useMemo, useState } from "react";
 import { EmptyState, PageHeader, StatusTag } from "../components/ui";
 import { EventReviewModal } from "../components/EventReviewModal";
+import { ReturnInspection } from "../components/ReturnInspection";
 import { useWorkspace } from "../context/WorkspaceContext";
 import { formatDateLong, titleCase } from "../lib/format";
 import type { EventRecord } from "../types";
@@ -11,7 +12,7 @@ function nextAction(event: EventRecord): { label: string; status: EventRecord["s
   if (event.status === "planning") return { label: "Confirm event", status: "confirmed", icon: CheckCircle2 };
   if (event.status === "confirmed" && event.checklist.every((item) => item.done)) return { label: "Mark packed", status: "packed", icon: PackageCheck };
   if (event.status === "packed") return { label: "Dispatch load", status: "out", icon: Truck };
-  if (event.status === "out" && event.return_checklist.every((item) => item.done)) return { label: "Complete return", status: "returned", icon: CheckCircle2 };
+  if (event.status === "out") return { label: "Inspect return", status: "returned", icon: CheckCircle2 };
   return null;
 }
 
@@ -20,6 +21,7 @@ export function ReturnsPage() {
   const active = useMemo(() => state!.events.events.filter((event) => event.status !== "returned").sort((a, b) => a.start_date.localeCompare(b.start_date)), [state]);
   const returnEvents = active.filter((event) => event.status === "out");
   const [reviewEvent, setReviewEvent] = useState<EventRecord | null>(null);
+  const [inspectEvent, setInspectEvent] = useState<EventRecord | null>(null);
   const returned = state!.events.events.filter((event) => event.status === "returned").sort((a, b) => b.start_date.localeCompare(a.start_date));
   const dueItems = returnEvents.reduce((sum, event) => sum + event.return_checklist.filter((item) => !item.done).reduce((count, item) => count + item.amount, 0), 0);
   const allChecks = active.flatMap((event) => event.status === "out" ? event.return_checklist : event.checklist);
@@ -30,6 +32,7 @@ export function ReturnsPage() {
   }
 
   async function advance(event: EventRecord, status: EventRecord["status"]) {
+    if (status === "returned") { setInspectEvent(event); return; }
     await mutate("/api/events/status", { event_id: event.id, status }, { success: `Event marked ${titleCase(status).toLowerCase()}.` }).catch(() => undefined);
   }
 
@@ -49,6 +52,7 @@ export function ReturnsPage() {
       </section>
       {returned.length ? <section className="return-work-list returned-history"><div className="section-title-row"><div><h2>Recently returned</h2><p>Leave a short note while the job is still fresh.</p></div></div>{returned.slice(0, 12).map((event) => <article className="return-work" key={event.id}><header><span className="return-stage-icon returned"><CheckCircle2 size={20} /></span><div><h2>{event.title}</h2><p>{formatDateLong(event.start_date)} · {event.location || "Location TBD"}</p></div><button className="button button-secondary" onClick={() => setReviewEvent(event)}>Review event</button></header></article>)}</section> : null}
       <EventReviewModal event={reviewEvent} onClose={() => setReviewEvent(null)} />
+      <ReturnInspection event={inspectEvent} onClose={() => setInspectEvent(null)} />
     </div>
   );
 }

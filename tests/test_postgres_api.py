@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -71,12 +72,15 @@ def _request(
     path: str,
     body: dict | None = None,
     cookie: str = "",
+    bearer: str = "",
 ) -> tuple[int, dict, dict[str, str]]:
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     payload = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     headers = {"Content-Type": "application/json"} if payload is not None else {}
     if cookie:
         headers["Cookie"] = cookie
+    if bearer:
+        headers["Authorization"] = "Bearer " + bearer
     connection.request(method, path, body=payload, headers=headers)
     response = connection.getresponse()
     raw = response.read()
@@ -189,20 +193,19 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             future=True,
             connect_args={"options": f"-csearch_path={cls.schema}"},
         )
-        Base.metadata.create_all(cls.engine)
+        migration_env = os.environ.copy()
+        separator = "&" if "?" in cls.database_url else "?"
+        migration_env["SALAMANDRA_DATABASE_URL"] = cls.database_url + separator + "options=-csearch_path=" + cls.schema
+        migrated = subprocess.run([sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=ROOT, env=migration_env, capture_output=True, text=True)
+        if migrated.returncode:
+            cls.engine.dispose()
+            with cls.admin_engine.connect() as connection:
+                connection.execute(text(f'DROP SCHEMA "{cls.schema}" CASCADE'))
+            cls.admin_engine.dispose()
+            raise RuntimeError(migrated.stdout + migrated.stderr)
         readiness = DatabaseReadiness(cls.engine, ROOT)
         cls.expected_revision = next(iter(readiness.expected_revisions))
-        with cls.engine.begin() as connection:
-            connection.execute(
-                text(
-                    "CREATE TABLE alembic_version "
-                    "(version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
-                )
-            )
-            connection.execute(
-                text("INSERT INTO alembic_version (version_num) VALUES (:revision)"),
-                {"revision": cls.expected_revision},
-            )
         cls.factory = sessionmaker(bind=cls.engine, expire_on_commit=False)
         with cls.factory.begin() as session:
             session.add(OrganizationModel(id="runtime-org", name="Runtime Organization"))
@@ -1133,6 +1136,535 @@ class TestPostgresHttpRuntime(unittest.TestCase):
             cookie,
         )
         self.assertEqual(conflict_status, 409)
+
+    @isolated_database_inserts
+    @race_required
+    def test_original_proposal_http_retry_and_competing_saves(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from database import EventProposalModel, EventLearningRecordModel
+        org, _, _, cookie = self._learning_fixture(count=0)
+        _, _, _, other_cookie = self._learning_fixture(count=0)
+        body = {"description": "Original \u05d0\u05d9\u05e8\u05d5\u05e2 \u0639\u0631\u0628\u064a",
+                "capture_proposal": True, "idempotency_key": uuid4().hex,
+                "overrides": {"planning_mode": "manual", "capability_requirements": [{"capability": "monitor.stage", "amount": 2}]}}
+        def race(path, bodies):
+            barrier = threading.Barrier(2)
+            def send(index):
+                barrier.wait(timeout=5)
+                return _request(self.ports[index], "POST", path, bodies[index], cookie)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                return list(pool.map(send, range(2)))
+        results = race("/api/events/describe", [body, body])
+        self.assertEqual([r[0] for r in results], [200, 200], results)
+        first = results[0][1]["draft"]
+        self.assertEqual(first["event"], results[1][1]["draft"]["event"])
+        identity = first["proposal_id"]
+        self.assertEqual(identity, results[1][1]["draft"]["proposal_id"])
+        self.assertEqual(_request(self.ports[0], "POST", "/api/events/describe", {**body, "description": "changed"}, cookie)[0], 409)
+        save = {"description": body["description"], "proposal_id": identity,
+                "overrides": {"planning_mode": "manual", "capability_requirements": [{"capability": "monitor.stage", "amount": 4}]},
+                "idempotency_key": uuid4().hex}
+        foreign = _request(self.ports[0], "POST", "/api/events/save", save, other_cookie)
+        absent = _request(self.ports[0], "POST", "/api/events/save", {**save, "proposal_id": "absent"}, other_cookie)
+        self.assertEqual(foreign[:2], absent[:2])
+        self.assertEqual(foreign[0], 404)
+        results = race("/api/events/save", [save, {**save, "idempotency_key": uuid4().hex}])
+        self.assertEqual(sorted(r[0] for r in results), [201, 409], results)
+        with self.factory() as session:
+            proposals = session.scalars(select(EventProposalModel).where(EventProposalModel.organization_id == org)).all()
+            self.assertEqual(len(proposals), 1)
+            self.assertTrue(proposals[0].consumed)
+            events = session.scalars(select(EventModel).where(EventModel.organization_id == org)).all()
+            self.assertEqual(len(events), 1)
+            learning = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.event_id == events[0].id))
+            self.assertEqual(learning.proposal["requirements"][0]["amount"], 2)
+            self.assertEqual(learning.corrections["requirements"]["final_planned"][0]["amount"], 4)
+
+    @isolated_database_inserts
+    @race_required
+    def test_condition_http_races_isolation_and_stock_conservation(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from database import ConditionMovementModel
+        org, actor, _, cookie = self._learning_fixture(count=0)
+        _, _, _, other_cookie = self._learning_fixture(count=0)
+        body = {"id": "condition-mic", "type": "microphone", "amount": 3, "scope": "shared", "idempotency_key": uuid4().hex}
+        status, payload, _ = _request(self.ports[0], "POST", "/api/inventory/items", body, cookie)
+        self.assertEqual(status, 200, payload)
+        item = next(i["id"] for i in payload["state"]["inventory"]["items"] if i["id"] == "condition-mic")
+        def race(path, bodies):
+            barrier = threading.Barrier(2)
+            def send(index):
+                barrier.wait(timeout=5)
+                return _request(self.ports[index], "POST", path, bodies[index], cookie)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                return list(pool.map(send, range(2)))
+        report = {"item_id": item, "quantity": 2, "status": "needs_repair", "issue": "Failed test", "idempotency_key": uuid4().hex}
+        results = race("/api/maintenance/report", [report, {**report, "idempotency_key": uuid4().hex}])
+        self.assertEqual(sorted(r[0] for r in results), [200, 409], results)
+        row = next(r[1]["incident"] for r in results if r[0] == 200)
+        self.assertEqual(_request(self.ports[0], "GET", "/api/maintenance")[0], 401)
+        self.assertEqual(_request(self.ports[0], "GET", "/api/maintenance", cookie=other_cookie)[1]["incidents"], [])
+        transition = {"incident_id": row["id"], "version": 1, "status": "in_repair", "reason": "At workshop", "idempotency_key": uuid4().hex}
+        foreign = _request(self.ports[0], "POST", "/api/maintenance/transition", transition, other_cookie)
+        absent = _request(self.ports[1], "POST", "/api/maintenance/transition", {**transition, "incident_id": "absent"}, other_cookie)
+        self.assertEqual(foreign[:2], absent[:2])
+        self.assertEqual(foreign[0], 404)
+        self.assertEqual(_request(self.ports[0], "POST", "/api/maintenance/transition", transition, cookie)[0], 200)
+        done = {**transition, "version": 2, "status": "ready", "reason": "Repaired", "idempotency_key": uuid4().hex}
+        self.assertEqual([r[0] for r in race("/api/maintenance/transition", [done, done])], [200, 200])
+        with self.factory() as session:
+            holding = session.scalar(select(InventoryHoldingModel).where(InventoryHoldingModel.organization_id == org))
+            self.assertEqual((holding.available_quantity, holding.condition_quantity), (3, 0))
+            self.assertEqual(session.scalar(select(func.count()).select_from(ConditionMovementModel).where(ConditionMovementModel.organization_id == org)), 3)
+        with self.factory.begin() as session:
+            session.scalar(select(MembershipModel).where(MembershipModel.organization_id == org, MembershipModel.user_id == actor)).role = "read_only"
+        self.assertEqual(_request(self.ports[0], "POST", "/api/maintenance/report", {**report, "role": "owner"}, cookie)[0], 400)
+        self.assertEqual(_request(self.ports[0], "POST", "/api/maintenance/report", report, cookie)[0], 403)
+
+    @isolated_database_inserts
+    def test_integrated_field_release_supplement_dispatch_inspected_return(self):
+        from copy import deepcopy
+        from database import ConditionIncidentModel, CrewAccessModel, utc_now
+        from datetime import timedelta
+        from postgres_runtime import PostgresRuntime
+        org, _, _, cookie = self._learning_fixture(count=0)
+
+        def post(path, body, expected=200):
+            status, result, _ = _request(self.ports[0], "POST", path, body, cookie)
+            self.assertEqual(status, expected, result)
+            return result
+
+        runtime = PostgresRuntime(self.factory)
+        role_cookies = {}
+        for role_name in ("operator", "producer", "read_only"):
+            email = uuid4().hex + "@example.test"
+            runtime.accounts.create_user(name=role_name, email=email, password="Integrated-password-123",
+                role=role_name, organization_id=org, organization_name=org)
+            role_cookies[role_name] = self._sign_in_credentials(self.ports[0], email, "Integrated-password-123")
+
+        post("/api/inventory/items", {"id": "integrated-cart", "display_name": "Cart \u05e2\u05d2\u05dc\u05d4 \u0639\u0631\u0628\u064a",
+            "type": "transport", "class_id": "utility-cart", "amount": 12, "scope": "shared", "idempotency_key": uuid4().hex})
+        event = post("/api/events/save", {"description": "Equipment movement without lighting",
+            "overrides": {"title": "Integrated lifecycle", "planning_mode": "manual", "start_date": "2027-10-10",
+                "start_time": "18:00", "capability_requirements": [{"capability": "transport.cart", "amount": 6, "level": "required"}]},
+            "idempotency_key": uuid4().hex}, 201)["event"]
+        identity = event["id"]
+        with self.factory() as session:
+            holding_id = session.scalar(select(InventoryHoldingModel.id).where(InventoryHoldingModel.organization_id == org))
+
+        def version():
+            with self.factory() as session:
+                return session.get(EventModel, identity).version
+
+        def stock(expected):
+            with self.factory() as session:
+                row = session.get(InventoryHoldingModel, holding_id)
+                actual = (row.available_quantity, row.reserved_quantity, row.packed_quantity, row.dispatched_quantity, row.condition_quantity)
+                self.assertEqual(actual, expected)
+                self.assertEqual(sum(actual), 12)
+            status, summary, _ = _request(self.ports[0], "GET", "/api/inventory/operations?scope=shared", cookie=cookie)
+            self.assertEqual(status, 200, summary)
+            self.assertEqual((summary["ready"], summary["reserved"], summary["packed"] + summary["standby"], summary["out"]), expected[:4])
+            self.assertEqual(sum(summary.values()), 12)
+
+        post("/api/events/logistics", {"event_id": identity, "version": version(), "idempotency_key": uuid4().hex,
+            "milestones": {"prepare_at": "2027-10-09T10:00+03:00", "return_due_at": "2027-10-11T12:00+03:00"},
+            "notes": "Private warehouse notes"})
+        profile = post("/api/crew", {"name": "Crew \u05e9\u05dc\u05d5\u05dd \u0639\u0631\u0628\u064a", "kind": "external", "skills": {"rigging": 2}, "idempotency_key": uuid4().hex})
+        role = post("/api/events/crew/role", {"event_id": identity, "event_version": version(), "name": "Rigging",
+            "quantity": 2, "skills": {"rigging": 1}, "idempotency_key": uuid4().hex})
+        assignment = post("/api/events/crew/assign", {"event_id": identity, "event_version": version(),
+            "role_id": role["id"], "profile_id": profile["id"], "call_at": "2027-10-10T12:00+03:00",
+            "release_at": "2027-10-10T23:00+03:00", "notes": "Assigned \u05e9\u05dc\u05d5\u05dd \u0639\u0631\u0628\u064a", "idempotency_key": uuid4().hex})
+        internal = post("/api/crew", {"name": "Second technician", "kind": "internal", "skills": {"rigging": 2}, "idempotency_key": uuid4().hex})
+        post("/api/events/crew/assign", {"event_id": identity, "event_version": version(), "role_id": role["id"],
+            "profile_id": internal["id"], "call_at": "2027-10-10T12:00+03:00", "release_at": "2027-10-10T23:00+03:00", "idempotency_key": uuid4().hex})
+        other = post("/api/events/save", {"description": "Overlapping crew call", "overrides": {"planning_mode": "manual",
+            "start_date": "2027-10-10", "start_time": "18:00", "capability_requirements": [{"capability": "transport.cart", "amount": 1, "level": "required"}]}, "idempotency_key": uuid4().hex}, 201)["event"]
+        other_role = post("/api/events/crew/role", {"event_id": other["id"], "event_version": other["version"],
+            "name": "Rigging", "skills": {"rigging": 1}, "idempotency_key": uuid4().hex})
+        overlap = {"event_id": other["id"], "event_version": other_role["event_version"], "role_id": other_role["id"],
+            "profile_id": profile["id"], "call_at": "2027-10-10T12:00+03:00", "release_at": "2027-10-10T23:00+03:00", "idempotency_key": uuid4().hex}
+        post("/api/events/crew/assign", overlap, 409)
+        override = {**overlap, "override_reason": "Supervisor approved shared coverage"}
+        self.assertEqual(_request(self.ports[0], "POST", "/api/events/crew/assign", override, role_cookies["producer"])[0], 403)
+        status, approved, _ = _request(self.ports[0], "POST", "/api/events/crew/assign", override, role_cookies["operator"])
+        self.assertEqual(status, 200, approved)
+        self.assertTrue(approved["warnings"])
+        with self.factory() as session:
+            audit = session.scalar(select(AuditEventModel).where(AuditEventModel.resource_id == approved["id"], AuditEventModel.action == "crew.assign"))
+            self.assertEqual(audit.changes["override_reason"], override["override_reason"])
+        link = post("/api/events/crew/access", {"assignment_id": assignment["id"], "version": assignment["version"],
+            "action": "issue", "idempotency_key": uuid4().hex})
+        before_read = self._database_state_snapshot()
+        for _ in range(2):
+            status, view, _ = _request(self.ports[0], "GET", "/api/external/assignment", bearer=link["token"])
+            self.assertEqual(status, 200, view)
+            self.assertEqual(view["notes"], "Assigned \u05e9\u05dc\u05d5\u05dd \u0639\u0631\u0628\u064a")
+            for hidden in (identity, org, "Private warehouse notes", profile["id"]):
+                self.assertNotIn(hidden, json.dumps(view, ensure_ascii=False))
+        self.assertEqual(self._database_state_snapshot(), before_read)
+        self.assertEqual(_request(self.ports[0], "GET", "/api/events/crew?event_id=" + identity, bearer=link["token"])[0], 401)
+        expired_token = link["token"]
+        # Advance this credential's expiry in the fixture, not the application clock.
+        with self.factory.begin() as session:
+            credential = session.scalar(select(CrewAccessModel).where(CrewAccessModel.assignment_id == assignment["id"]))
+            credential.expires_at = utc_now() - timedelta(seconds=1)
+        self.assertEqual(_request(self.ports[0], "GET", "/api/external/assignment", bearer=expired_token)[0], 404)
+        link = post("/api/events/crew/access", {"assignment_id": assignment["id"], "version": link["version"],
+            "action": "issue", "idempotency_key": uuid4().hex})
+        self.assertEqual(_request(self.ports[0], "GET", "/api/external/assignment", bearer=expired_token)[0], 404)
+        for route, body in (("/api/events/logistics", {"event_id": identity, "version": version(), "milestones": {}, "idempotency_key": uuid4().hex}),
+                ("/api/events/crew/access", {"assignment_id": assignment["id"], "version": link["version"], "action": "revoke", "idempotency_key": uuid4().hex})):
+            self.assertEqual(_request(self.ports[0], "POST", route, body, role_cookies["read_only"])[0], 403)
+            self.assertEqual(_request(self.ports[0], "POST", route, body, bearer=link["token"])[0], 401)
+
+        event = post("/api/events/status", {"event_id": identity, "status": "confirmed"})["event"]
+        stock((6, 6, 0, 0, 0))
+        selected = post("/api/events/crew/assign", {"event_id": identity, "event_version": version(), "id": assignment["id"],
+            "version": link["version"], "role_id": role["id"], "profile_id": profile["id"],
+            "call_at": "2027-10-10T12:00+03:00", "release_at": "2027-10-10T23:00+03:00", "equipment": [holding_id],
+            "override_reason": "Supervisor approved shared coverage", "idempotency_key": uuid4().hex})
+        link["version"] = selected["version"]
+        for line in event["checklist"]:
+            post("/api/events/checklist", {"event_id": identity, "item_id": line["item_id"], "phase": "pack", "done": True})
+        post("/api/events/status", {"event_id": identity, "status": "packed"})
+        stock((6, 0, 6, 0, 0))
+        post("/api/events/logistics/stage", {"event_id": identity, "version": version(), "standby": True, "idempotency_key": uuid4().hex})
+        self.assertEqual(_request(self.ports[0], "GET", "/api/inventory/operations", cookie=cookie)[1]["standby"], 6)
+
+        def adjust(amount, removal=False, fulfill=True):
+            body = {"event_id": identity, "version": version(), "reason": "Onsite \u05e9\u05dc\u05d5\u05dd \u0639\u0631\u0628\u064a", "idempotency_key": uuid4().hex,
+                "requirements": [] if removal else [{"capability": "transport.cart", "amount": amount}],
+                "removals": [{"holding_id": holding_id, "quantity": amount}] if removal else []}
+            result = post("/api/events/adjustments", body)
+            self.assertEqual(post("/api/events/adjustments", body), result)
+            post("/api/events/adjustments", {**body, "reason": "Changed"}, 409)
+            post("/api/events/adjustments", {**body, "idempotency_key": uuid4().hex}, 409)
+            preview = post("/api/events/adjustments/preview", {"event_id": identity, "adjustment_id": result["adjustment"]["id"]})
+            command = {"event_id": identity, "adjustment_id": result["adjustment"]["id"], "version": preview["event_version"],
+                "adjustment_version": preview["adjustment_version"], "preview_token": preview["preview_token"], "idempotency_key": uuid4().hex}
+            outcome = post("/api/events/adjustments/fulfill", command, 200 if fulfill else 409)
+            if fulfill:
+                self.assertEqual(post("/api/events/adjustments/fulfill", command), outcome)
+
+        adjust(2, removal=True)
+        stock((8, 0, 4, 0, 0))
+        post("/api/events/status", {"event_id": identity, "status": "out"})
+        stock((8, 0, 0, 4, 0))
+        with self.factory() as session:
+            original = deepcopy(session.scalar(select(StockMovementModel).where(StockMovementModel.event_id == identity, StockMovementModel.action == "out")).lines)
+        before_export = self._database_state_snapshot()
+        connection = http.client.HTTPConnection("127.0.0.1", self.ports[0], timeout=10)
+        try:
+            connection.request("GET", "/api/events/logistics/export?event_id=" + identity, headers={"Cookie": cookie})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            exported = response.read().decode("utf-8-sig")
+            self.assertIn("Crew \u05e9\u05dc\u05d5\u05dd \u0639\u0631\u0628\u064a", exported)
+            self.assertIn("Cart \u05e2\u05d2\u05dc\u05d4 \u0639\u0631\u0628\u064a", exported)
+        finally:
+            connection.close()
+        self.assertEqual(self._database_state_snapshot(), before_export)
+        adjust(2)
+        stock((6, 0, 0, 6, 0))
+        external = _request(self.ports[0], "GET", "/api/external/assignment", bearer=link["token"])[1]
+        self.assertEqual(sum(row["quantity"] for row in external["equipment"]), 6)
+        self.assertTrue(any(row["message"] == "Your selected equipment quantities changed." for row in external["updates"]))
+        _, _, _, foreign_cookie = self._learning_fixture(count=0)
+        def foreign_post(route, body, expected=200):
+            status, response, _ = _request(self.ports[1], "POST", route, body, foreign_cookie)
+            self.assertEqual(status, expected, response)
+            return response
+
+        foreign_post("/api/inventory/items", {"id": "foreign-cart", "display_name": "Private B cart", "type": "transport",
+            "class_id": "utility-cart", "amount": 3, "scope": "shared", "idempotency_key": uuid4().hex})
+        foreign_event = foreign_post("/api/events/save", {"description": "Private B event", "overrides": {"title": "Private B event",
+            "planning_mode": "manual", "start_date": "2027-10-10", "start_time": "18:00",
+            "capability_requirements": [{"capability": "transport.cart", "amount": 1, "level": "required"}]}, "idempotency_key": uuid4().hex}, 201)["event"]
+        foreign_logistics = foreign_post("/api/events/logistics", {"event_id": foreign_event["id"], "version": foreign_event["version"],
+            "milestones": {"prepare_at": "2027-10-09T10:00+03:00"}, "notes": "Private B schedule", "idempotency_key": uuid4().hex})
+        foreign_profile = foreign_post("/api/crew", {"name": "Private B crew", "kind": "external", "skills": {}, "idempotency_key": uuid4().hex})
+        foreign_role = foreign_post("/api/events/crew/role", {"event_id": foreign_event["id"], "event_version": foreign_logistics["logistics"]["event_version"],
+            "name": "Private B role", "idempotency_key": uuid4().hex})
+        foreign_assignment = foreign_post("/api/events/crew/assign", {"event_id": foreign_event["id"], "event_version": foreign_role["event_version"],
+            "profile_id": foreign_profile["id"], "role_id": foreign_role["id"], "call_at": "2027-10-10T12:00+03:00",
+            "release_at": "2027-10-10T23:00+03:00", "idempotency_key": uuid4().hex})
+        foreign_post("/api/events/crew/access", {"assignment_id": foreign_assignment["id"], "version": 1, "action": "issue", "idempotency_key": uuid4().hex})
+        before_probes = self._database_state_snapshot()
+        for route in ("/api/events/crew", "/api/events/logistics", "/api/events/logistics/export", "/api/events/adjustments", "/api/events/return"):
+            for target, requesting_cookie in ((identity, foreign_cookie), (foreign_event["id"], cookie)):
+                response = _request(self.ports[0], "GET", route + "?event_id=" + target, cookie=requesting_cookie)
+                self.assertEqual(response[0], 404)
+                self.assertEqual(response[:2], _request(self.ports[0], "GET", route + "?event_id=absent", cookie=requesting_cookie)[:2])
+        for route, body, key in (
+                ("/api/events/logistics", {"event_id": identity, "version": version(), "milestones": {}, "idempotency_key": uuid4().hex}, "event_id"),
+                ("/api/events/crew/access", {"assignment_id": assignment["id"], "version": link["version"], "action": "issue", "idempotency_key": uuid4().hex}, "assignment_id"),
+                ("/api/crew", {"id": profile["id"], "version": 1, "name": "Intrusion", "kind": "external", "skills": {}, "idempotency_key": uuid4().hex}, "id")):
+            foreign = _request(self.ports[0], "POST", route, body, foreign_cookie)
+            absent = _request(self.ports[0], "POST", route, {**body, key: "absent"}, foreign_cookie)
+            self.assertEqual(foreign[0], 404, foreign)
+            self.assertEqual(foreign[:2], absent[:2])
+        for route, body, key in (
+                ("/api/events/logistics", {"event_id": foreign_event["id"], "version": foreign_assignment["event_version"], "milestones": {}, "idempotency_key": uuid4().hex}, "event_id"),
+                ("/api/events/crew/access", {"assignment_id": foreign_assignment["id"], "version": 2, "action": "revoke", "idempotency_key": uuid4().hex}, "assignment_id"),
+                ("/api/crew", {"id": foreign_profile["id"], "version": 1, "name": "Intrusion", "kind": "external", "skills": {}, "idempotency_key": uuid4().hex}, "id")):
+            response = _request(self.ports[0], "POST", route, body, cookie)
+            self.assertEqual(response[0], 404, response)
+            self.assertEqual(response[:2], _request(self.ports[0], "POST", route, {**body, key: "absent"}, cookie)[:2])
+        external = _request(self.ports[0], "GET", "/api/external/assignment?event_id=" + foreign_event["id"], bearer=link["token"])[1]
+        self.assertNotIn("Private B", json.dumps(external))
+        self.assertEqual(self._database_state_snapshot(), before_probes)
+        adjust(1, removal=True, fulfill=False)
+        stock((6, 0, 0, 6, 0))
+        with self.factory() as session:
+            immutable_movements = {row.id: (row.action, deepcopy(row.lines), row.created_at) for row in
+                session.scalars(select(StockMovementModel).where(StockMovementModel.event_id == identity))}
+            immutable_audit = {row.id: deepcopy(row.changes) for row in
+                session.scalars(select(AuditEventModel).where(AuditEventModel.organization_id == org))}
+        command = {"event_id": identity, "version": version(), "idempotency_key": uuid4().hex,
+            "lines": [{"holding_id": holding_id, "ready": 3, "damaged": 2, "missing": 1, "reason": "Inspection \u05e9\u05dc\u05d5\u05dd \u0639\u0631\u0628\u064a"}]}
+        post("/api/events/return", {**command, "version": command["version"] - 1}, 409)
+        result = post("/api/events/return", command)
+        self.assertEqual(post("/api/events/return", command), result)
+        post("/api/events/return", {**command, "lines": [{**command["lines"][0], "ready": 2, "missing": 2}]}, 409)
+        stock((9, 0, 0, 0, 3))
+        summary = _request(self.ports[0], "GET", "/api/inventory/operations", cookie=cookie)[1]
+        self.assertEqual((summary["needs_repair"], summary["missing"]), (2, 1))
+        with self.factory() as session:
+            movements = list(session.scalars(select(StockMovementModel).where(StockMovementModel.event_id == identity)))
+            for row in movements:
+                if row.id in immutable_movements:
+                    self.assertEqual((row.action, row.lines, row.created_at), immutable_movements[row.id])
+            for audit_id, changes in immutable_audit.items():
+                self.assertEqual(session.get(AuditEventModel, audit_id).changes, changes)
+            self.assertEqual(next(row.lines for row in movements if row.action == "out"), original)
+            for action in ("out", "release", "supplemental_dispatch", "returned"):
+                self.assertEqual(sum(row.action == action for row in movements), 1, action)
+            incidents = list(session.scalars(select(ConditionIncidentModel).where(ConditionIncidentModel.event_id == identity)))
+            self.assertEqual(len(incidents), 2)
+            self.assertEqual({row.holding_id for row in incidents}, {holding_id})
+        post("/api/events/crew/access", {"assignment_id": assignment["id"], "version": link["version"],
+            "action": "revoke", "idempotency_key": uuid4().hex})
+        for _ in range(2):
+            self.assertEqual(_request(self.ports[0], "GET", "/api/external/assignment", bearer=link["token"])[:2],
+                _request(self.ports[0], "GET", "/api/external/assignment", bearer="x" * 43)[:2])
+
+    @isolated_database_inserts
+    @race_required
+    def test_split_return_http_two_process_retry_is_atomic(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from database import TransactionalEventOperations, ConditionIncidentModel
+        org, actor, _, cookie = self._learning_fixture(count=0)
+        _, _, _, foreign_cookie = self._learning_fixture(count=0)
+        event_id, holding_id = uuid4().hex, uuid4().hex
+        with self.factory.begin() as session:
+            member = session.scalar(select(MembershipModel).where(MembershipModel.organization_id == org, MembershipModel.user_id == actor))
+            member_id = member.id
+            session.add(InventoryHoldingModel(id=holding_id, organization_id=org, scope="shared", legacy_item_id="return-mic", available_quantity=6))
+            session.add(EventModel(id=event_id, organization_id=org, owner_user_id=actor, title="Split return", status="planning",
+                data={"plan_verified": True, "plan": {"lines": [{"item_id": "return-mic", "amount": 6, "missing": 0}]}}))
+        for status in ("confirmed", "packed", "out"):
+            TransactionalEventOperations(self.factory).transition(org, event_id, status, member_id, "fixture")
+        path = f"/api/events/return?event_id={event_id}"
+        self.assertEqual(_request(self.ports[0], "GET", path)[0], 401)
+        self.assertEqual(_request(self.ports[0], "GET", path, cookie=foreign_cookie)[:2],
+            _request(self.ports[0], "GET", "/api/events/return?event_id=absent", cookie=foreign_cookie)[:2])
+        status, preview, _ = _request(self.ports[0], "GET", path, cookie=cookie)
+        self.assertEqual(status, 200, preview)
+        body = {"event_id": event_id, "version": preview["version"], "idempotency_key": uuid4().hex,
+            "lines": [{"holding_id": holding_id, "ready": 3, "damaged": 2, "missing": 1, "reason": "Inspection"}]}
+        self.assertEqual(_request(self.ports[0], "POST", "/api/events/return", body, foreign_cookie)[0], 404)
+        barrier = threading.Barrier(2)
+        def send(index):
+            barrier.wait(timeout=5)
+            return _request(self.ports[index], "POST", "/api/events/return", body, cookie)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(send, range(2)))
+        self.assertEqual([result[0] for result in results], [200, 200], results)
+        self.assertEqual(results[0][1]["reconciliation"], results[1][1]["reconciliation"])
+        with self.factory() as session:
+            holding = session.get(InventoryHoldingModel, holding_id)
+            self.assertEqual((holding.available_quantity, holding.condition_quantity, holding.dispatched_quantity), (3, 3, 0))
+            self.assertEqual(session.scalar(select(func.count()).select_from(StockMovementModel).where(StockMovementModel.event_id == event_id, StockMovementModel.action == "returned")), 1)
+            self.assertEqual(session.scalar(select(func.count()).select_from(ConditionIncidentModel).where(ConditionIncidentModel.event_id == event_id)), 2)
+
+    @isolated_database_inserts
+    @race_required
+    def test_field_fulfillment_http_races_with_itself_and_inspected_return(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from database import TransactionalEventOperations
+        org, actor, _, cookie = self._learning_fixture(count=0)
+        _, _, _, foreign = self._learning_fixture(count=0)
+        event_id, holding_id = uuid4().hex, uuid4().hex
+        with self.factory.begin() as session:
+            member = session.scalar(select(MembershipModel).where(MembershipModel.organization_id == org, MembershipModel.user_id == actor))
+            member_id = member.id
+            session.add(InventoryHoldingModel(id=holding_id, organization_id=org, scope="shared", legacy_item_id="cart", available_quantity=10,
+                data={"type": "transport", "class_id": "utility-cart", "capabilities": ["transport.cart"]}))
+            session.add(EventModel(id=event_id, organization_id=org, owner_user_id=actor, title="Adjustment race", status="planning",
+                data={"plan_verified": True, "plan": {"lines": [{"item_id": "cart", "amount": 6, "missing": 0}]}}))
+        for status in ("confirmed", "packed", "out"):
+            TransactionalEventOperations(self.factory).transition(org, event_id, status, member_id, "fixture")
+        def post(path, body):
+            status, result, _ = _request(self.ports[0], "POST", path, body, cookie)
+            self.assertEqual(status, 200, result)
+            return result
+        def addition(amount):
+            with self.factory() as session:
+                version = session.get(EventModel, event_id).version
+            row = post("/api/events/adjustments", {"event_id": event_id, "version": version, "reason": "Onsite", "requirements": [{"capability": "transport.cart", "amount": amount}], "idempotency_key": uuid4().hex})
+            preview = post("/api/events/adjustments/preview", {"event_id": event_id, "adjustment_id": row["adjustment"]["id"]})
+            return {"event_id": event_id, "adjustment_id": preview["adjustment_id"], "version": preview["event_version"],
+                "adjustment_version": preview["adjustment_version"], "preview_token": preview["preview_token"], "idempotency_key": uuid4().hex}
+        def race(commands):
+            barrier = threading.Barrier(2)
+            def send(index):
+                barrier.wait(timeout=5)
+                path, body = commands[index]
+                return _request(self.ports[index], "POST", path, body, cookie)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                return list(pool.map(send, range(2)))
+        body = addition(2)
+        path = "/api/events/adjustments/fulfill"
+        for identity in (event_id, "absent"):
+            self.assertEqual(_request(self.ports[0], "GET", f"/api/events/adjustments?event_id={identity}", cookie=foreign)[0], 404)
+        self.assertEqual(_request(self.ports[0], "POST", path, body)[0], 401)
+        duplicate = race([(path, body), (path, body)])
+        self.assertEqual([r[0] for r in duplicate], [200, 200], duplicate)
+        with self.factory() as session:
+            self.assertEqual(session.get(InventoryHoldingModel, holding_id).dispatched_quantity, 8)
+            self.assertEqual(session.scalar(select(func.count()).select_from(StockMovementModel).where(StockMovementModel.event_id == event_id, StockMovementModel.action == "supplemental_dispatch")), 1)
+        body = addition(1)
+        returning = {"event_id": event_id, "version": body["version"], "idempotency_key": uuid4().hex,
+            "lines": [{"holding_id": holding_id, "ready": 7, "damaged": 0, "missing": 1, "reason": "Missing on return"}]}
+        competing = race([(path, body), ("/api/events/return", returning)])
+        self.assertEqual(sorted(r[0] for r in competing), [200, 409], competing)
+        if competing[0][0] == 200:
+            preview = _request(self.ports[0], "GET", f"/api/events/return?event_id={event_id}", cookie=cookie)[1]
+            post("/api/events/return", {**returning, "version": preview["version"], "idempotency_key": uuid4().hex,
+                "lines": [{"holding_id": holding_id, "ready": 8, "damaged": 0, "missing": 1, "reason": "Missing on return"}]})
+        with self.factory() as session:
+            holding = session.get(InventoryHoldingModel, holding_id)
+            self.assertEqual((holding.available_quantity, holding.condition_quantity, holding.dispatched_quantity), (9, 1, 0))
+
+    @isolated_database_inserts
+    @race_required
+    def test_logistics_http_window_standby_scope_and_competing_edits(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from database import TransactionalEventOperations
+        org, actor, _, cookie = self._learning_fixture(count=0)
+        _, _, _, foreign = self._learning_fixture(count=0)
+        event_id, holding_id = uuid4().hex, uuid4().hex
+        with self.factory.begin() as session:
+            member_id = session.scalar(select(MembershipModel.id).where(MembershipModel.organization_id == org, MembershipModel.user_id == actor))
+            session.add(InventoryHoldingModel(id=holding_id, organization_id=org, scope="shared", legacy_item_id="logistics-mic", available_quantity=4))
+            session.add(EventModel(id=event_id, organization_id=org, owner_user_id=actor, title="Logistics", status="planning", data={
+                "start_date": "2027-09-20", "start_time": "18:00", "duration_minutes": 300, "plan_verified": True,
+                "plan": {"lines": [{"item_id": "logistics-mic", "amount": 2, "missing": 0}]}}))
+        path = f"/api/events/logistics?event_id={event_id}"
+        self.assertEqual(_request(self.ports[0], "GET", path)[0], 401)
+        for route in ("/api/events/logistics", "/api/events/logistics/export"):
+            self.assertEqual(_request(self.ports[0], "GET", f"{route}?event_id={event_id}", cookie=foreign)[:2],
+                _request(self.ports[0], "GET", f"{route}?event_id=absent", cookie=foreign)[:2])
+        body = {"event_id": event_id, "version": 1, "idempotency_key": uuid4().hex, "milestones": {
+            "standby_at": "2027-09-19T17:00", "return_due_at": "2027-09-21T10:00"}, "notes": "Warehouse only"}
+        barrier = threading.Barrier(2)
+        def send(index):
+            barrier.wait(timeout=5)
+            return _request(self.ports[index], "POST", "/api/events/logistics", {**body, "idempotency_key": f"{body['idempotency_key']}-{index}"}, cookie)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(send, range(2)))
+        self.assertEqual(sorted(r[0] for r in results), [200, 409], results)
+        operations = TransactionalEventOperations(self.factory)
+        for status in ("confirmed", "packed"):
+            operations.transition(org, event_id, status, member_id, "fixture")
+        current = _request(self.ports[0], "GET", path, cookie=cookie)[1]
+        stage = {"event_id": event_id, "version": current["event_version"], "standby": True, "idempotency_key": uuid4().hex}
+        for port in self.ports:
+            status, staged, _ = _request(port, "POST", "/api/events/logistics/stage", stage, cookie)
+            self.assertEqual(status, 200, staged)
+            self.assertTrue(staged["logistics"]["standby"])
+        with self.factory() as session:
+            holding = session.get(InventoryHoldingModel, holding_id)
+            self.assertEqual((holding.available_quantity, holding.packed_quantity), (2, 2))
+            self.assertEqual(session.get(EventModel, event_id).data["duration_minutes"], 300)
+        with self.factory.begin() as session:
+            session.get(MembershipModel, member_id).role = "technician"
+        self.assertEqual(_request(self.ports[0], "POST", "/api/events/logistics", body, cookie)[0], 403)
+
+    @isolated_database_inserts
+    @race_required
+    def test_crew_two_process_overlap_and_external_scope_revocation(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from database import CrewAssignmentModel, CrewAccessModel
+        org, actor, _, cookie = self._learning_fixture(count=0)
+        _, _, _, foreign = self._learning_fixture(count=0)
+        identities = [uuid4().hex, uuid4().hex]
+        with self.factory.begin() as session:
+            for identity in identities:
+                session.add(EventModel(id=identity, organization_id=org, owner_user_id=actor, title="Crew show", status="planning",
+                    data={"start_date": "2027-09-20", "start_time": "18:00", "duration_minutes": 120, "location": "Crew venue"}))
+        port = self.ports[0]
+        profile_body = {"name": "Crew \u05d9\u05d5\u05e1\u05d9", "kind": "external", "skills": {"foh": 2}, "idempotency_key": uuid4().hex}
+        self.assertEqual(_request(port, "POST", "/api/crew", profile_body)[0], 401)
+        status, profile, _ = _request(port, "POST", "/api/crew", profile_body, cookie)
+        self.assertEqual(status, 200, profile)
+        bodies = []
+        for identity in identities:
+            status, role, _ = _request(port, "POST", "/api/events/crew/role", {"event_id": identity, "event_version": 1,
+                "name": "FOH", "skills": {"foh": 1}, "idempotency_key": uuid4().hex}, cookie)
+            self.assertEqual(status, 200, role)
+            bodies.append({"event_id": identity, "event_version": 2, "role_id": role["id"], "profile_id": profile["id"],
+                "call_at": "2027-09-20T12:00+03:00", "release_at": "2027-09-20T23:00+03:00", "notes": "\u0639\u0631\u0628\u064a assigned only", "idempotency_key": uuid4().hex})
+        barrier = threading.Barrier(2)
+        def send(index):
+            barrier.wait(timeout=5)
+            return _request(self.ports[index], "POST", "/api/events/crew/assign", bodies[index], cookie)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(send, range(2)))
+        self.assertEqual(sorted(result[0] for result in results), [200, 409], results)
+        winner = next(index for index, result in enumerate(results) if result[0] == 200)
+        assigned = results[winner][1]
+        self.assertEqual(_request(self.ports[1], "POST", "/api/events/crew/assign", bodies[winner], cookie)[1], assigned)
+        for identity in (identities[winner], "absent"):
+            self.assertEqual(_request(port, "GET", "/api/events/crew?event_id=" + identity, cookie=foreign)[0], 404)
+        self.assertEqual(_request(port, "GET", "/api/crew", cookie=foreign)[1], {"profiles": []})
+        access_body = {"assignment_id": assigned["id"], "version": 1, "action": "issue", "idempotency_key": uuid4().hex}
+        self.assertEqual(_request(port, "POST", "/api/events/crew/access", access_body, foreign)[0], 404)
+        barrier = threading.Barrier(2)
+        def issue(index):
+            barrier.wait(timeout=5)
+            return _request(self.ports[index], "POST", "/api/events/crew/access", access_body, cookie)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            links = list(pool.map(issue, range(2)))
+        self.assertEqual([r[0] for r in links], [200, 200], links)
+        tokens = [r[1]["token"] for r in links if r[1]["token"]]
+        self.assertEqual(len(tokens), 1)
+        token = tokens[0]
+        status, view, _ = _request(port, "GET", "/api/external/assignment", bearer=token)
+        self.assertEqual(status, 200, view)
+        self.assertEqual(view["notes"], bodies[winner]["notes"])
+        self.assertNotIn(identities[winner], json.dumps(view))
+        for route in ("/api/crew", "/api/events/crew?event_id=" + identities[winner], "/api/events/logistics?event_id=" + identities[winner]):
+            self.assertEqual(_request(port, "GET", route, bearer=token)[0], 401)
+        self.assertFalse(_request(port, "GET", "/api/state", bearer=token)[1]["auth"]["authenticated"])
+        barrier = threading.Barrier(2)
+        def edit(index):
+            barrier.wait(timeout=5)
+            return _request(self.ports[index], "POST", "/api/events/crew/assign", {**bodies[winner], "id": assigned["id"],
+                "version": 2, "event_version": 3, "notes": f"Revision {index}", "idempotency_key": uuid4().hex}, cookie)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            edits = list(pool.map(edit, range(2)))
+        self.assertEqual(sorted(r[0] for r in edits), [200, 409], edits)
+        self.assertIn(_request(port, "GET", "/api/external/assignment", bearer=token)[1]["notes"], {"Revision 0", "Revision 1"})
+        revoke = {**access_body, "version": 3, "action": "revoke", "idempotency_key": uuid4().hex}
+        self.assertEqual(_request(self.ports[1], "POST", "/api/events/crew/access", revoke, cookie)[0], 200)
+        self.assertEqual(_request(port, "GET", "/api/external/assignment", bearer=token)[:2],
+            _request(port, "GET", "/api/external/assignment", bearer="x" * 43)[:2])
+        with self.factory() as session:
+            self.assertEqual(session.scalar(select(func.count()).select_from(CrewAssignmentModel).where(CrewAssignmentModel.organization_id == org)), 1)
+            self.assertEqual(session.scalar(select(func.count()).select_from(CrewAccessModel).where(CrewAccessModel.organization_id == org)), 1)
 
     @isolated_database_inserts
     def test_event_edit_http_is_versioned_scoped_and_lifecycle_safe(self):

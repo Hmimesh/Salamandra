@@ -1079,3 +1079,30 @@ html[data-theme="dark"] .onboarding-actions button > span:first-child { backgrou
   .first-run-heading h1 { font-size: 1.5625rem; }
   .onboarding-panel .section-title-row { align-items: flex-start; flex-direction: column; gap: 8px; }
 }
+.maintenance-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 0; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.maintenance-row > div { min-width: 0; flex: 1 1 220px; overflow-wrap: anywhere; }
+.maintenance-row h2 { font-size: 16px; }
+.condition-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 16px; padding: 16px 0; border-bottom: 1px solid var(--line); }
+.condition-summary dt { color: var(--muted); }
+.condition-summary dd { margin: 4px 0 0; font-size: 1.125rem; font-weight: 700; }
+.return-inspection-line { min-width: 0; margin: 0; padding: 12px 0; border: 0; border-bottom: 1px solid var(--line); }
+.return-inspection-line legend { max-width: 100%; overflow-wrap: anywhere; font-weight: 700; }
+.return-inspection-quantities { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.logistics-timeline { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.logistics-timeline li { display: grid; gap: 4px; border-left: 2px solid var(--line); padding-left: 10px; min-width: 0; overflow-wrap: anywhere; }
+.crew-form { border: 0; padding: 0; min-width: 0; display: grid; gap: 16px; }
+.logistics-timeline [aria-current="step"] { border-left: 3px solid var(--teal); padding-left: 10px; }
+.inventory-operational-totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 12px; padding: 16px 0; }
+.inventory-operational-totals dt { font-size: 13px; }
+.inventory-operational-totals dd { margin: 4px 0 0; font-size: 20px; font-weight: 650; }
+.crew-skills { min-width: 0; display: grid; gap: 12px; border: 1px solid var(--line); padding: 12px; }
+.crew-skill-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 36px; gap: 8px; align-items: center; }
+.crew-profile-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--line); }
+.crew-profile-row > div { min-width: 0; overflow-wrap: anywhere; }
+.crew-profile-row .row-actions { flex-wrap: wrap; flex-shrink: 0; }
+.external-assignment { width: min(880px, 100%); padding: 24px; margin: auto; overflow-wrap: anywhere; }
+.external-assignment .brand-mark { width: 90px; height: auto; flex-shrink: 0; }
+.external-assignment section { border-top: 1px solid var(--line); padding: 20px 0; }
+.external-assignment h1 { font-size: 28px; }
+.external-assignment h2 { font-size: 20px; }
+.external-assignment dd { margin: 4px 0 16px; }

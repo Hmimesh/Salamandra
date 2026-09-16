@@ -20,6 +20,7 @@ import { titleCase } from "../lib/format";
 import type { InventoryItem, InventoryScope, ItemClass } from "../types";
 import { normalizeSearch } from "../lib/catalog";
 import { ClearInventoryAction } from "../components/ClearInventoryAction";
+import { InventoryOperationsSummary } from "../components/InventoryOperationsSummary";
 
 type ItemAction = "remove" | "archive";
 
@@ -197,6 +198,7 @@ export function InventoryPage() {
     <div className="page inventory-page">
       <PageHeader title="Inventory" description="Work from real shared stock and personal items in your account." actions={<>{["owner", "admin"].includes(state!.auth.user!.role) ? <button className="button button-secondary" onClick={() => navigate("/inventory/cleanup")}><Search size={17} />Inventory cleanup</button> : null}{canManageDefinitions ? <button className="button button-secondary" onClick={() => setClassesOpen(true)}><Shapes size={17} />Item classes</button> : null}<button className="button button-primary" onClick={() => { setAddMode(null); setAddOpen(true); }}><Plus size={17} />Add item</button></>} />
 
+      <InventoryOperationsSummary scope={scope} />
       <section className="inventory-summary">
         <div><span className="summary-icon"><Boxes size={20} /></span><span><small>Item types</small><strong>{inventory.summary.unique_items}</strong></span></div>
         <div><span><small>Ready in stock</small><strong>{inventory.summary.in_stock}</strong></span></div>

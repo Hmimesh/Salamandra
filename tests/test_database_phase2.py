@@ -1421,6 +1421,11 @@ class TestAlembicMigration(unittest.TestCase):
                 engine.dispose()
 
         expected_tables = {
+            "crew_profiles",
+            "crew_skills",
+            "crew_roles",
+            "crew_assignments",
+            "crew_access",
             "catalog_decisions",
             "catalog_terms",
             "event_learning_records",
@@ -1428,6 +1433,10 @@ class TestAlembicMigration(unittest.TestCase):
             "event_feedback_items",
             "suggestion_sessions",
             "suggestion_evaluations",
+            "event_proposals",
+            "condition_incidents",
+            "field_adjustments",
+            "condition_movements",
             "alembic_version",
             "organizations",
             "users",

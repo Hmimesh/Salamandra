@@ -263,6 +263,7 @@ export interface EventRecord {
 }
 
 export interface EventDraft {
+  proposal_id?: string;
   event: EventRecord;
   learned_items: Requirement[];
 }
@@ -307,6 +308,7 @@ export interface EventLearning {
 export interface WorkspaceState {
   auth: {
     learning_summary_allowed?: boolean;
+    maintenance_allowed?: boolean;
     authenticated: boolean;
     user: UserAccount | null;
     users: UserAccount[];

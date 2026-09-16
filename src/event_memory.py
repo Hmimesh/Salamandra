@@ -28,6 +28,7 @@ class EventRecord:
     requested_items: list[Requirement] = field(default_factory=list)
     capability_requirements: list[CapabilityRequirement] = field(default_factory=list)
     milestones: list[dict[str, str]] = field(default_factory=list)
+    logistics: dict[str, Any] = field(default_factory=dict)
     attendee_count: int = 0
     event_size: str = "medium"
     venue_kind: str = ""
@@ -70,6 +71,7 @@ class EventRecord:
                 for requirement in self.capability_requirements
             ],
             "milestones": self.milestones,
+            "logistics": self.logistics,
             "attendee_count": self.attendee_count,
             "event_size": self.event_size,
             "venue_kind": self.venue_kind,
@@ -112,6 +114,7 @@ class EventRecord:
                 for requirement in data.get("capability_requirements", [])
             ],
             milestones=list(data.get("milestones", [])),
+            logistics=dict(data.get("logistics") or {}),
             attendee_count=int(data.get("attendee_count", 0)),
             event_size=data.get("event_size", "medium"),
             venue_kind=data.get("venue_kind", ""),

@@ -258,6 +258,59 @@ test("Phase D history suggestions remain operator controlled", async ({ page }, 
   await expect(page).toHaveURL(/\/events$/);
 });
 
+test("smart plan requirements can be edited before saving", async ({ page }, testInfo) => {
+  test.setTimeout(90000);
+  await signIn(page);
+  await page.goto("/events/new");
+  const brief = `Coffee house ${testInfo.project.name}: singer with acoustic guitar, saxophone, oud and harmonica, 50 guests, no lighting, 2030-08-22 at 20:00.`;
+  await page.getByLabel("Event brief", { exact: true }).fill(brief);
+  await activate(page.getByRole("button", { name: "Build event plan" }));
+  const edit = page.getByRole("button", { name: "Edit requirements", exact: true });
+  await expect(edit).toBeVisible();
+  await activate(edit);
+  const form = page.locator("form.brief-editor");
+  const rows = form.locator(".manual-requirement-row");
+  await expect(rows.first().getByLabel("Quantity", { exact: true })).toBeFocused();
+  const monitor = rows.filter({ has: page.locator('select option[value="monitor.stage"]:checked') });
+  await expect(monitor).toHaveCount(1);
+  await monitor.getByLabel("Quantity", { exact: true }).fill("2");
+  const save = page.getByRole("button", { name: /Save as planning|Save event/ });
+  await expect(save).toBeDisabled();
+  await expectNoViewportOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("smart-plan-edit.png"), fullPage: true });
+  const rebuilt = page.waitForResponse(r => r.url().endsWith("/api/events/describe") && r.status() === 200);
+  await activate(page.getByRole("button", { name: "Recalculate", exact: true }));
+  const preview = (await (await rebuilt).json()).draft.event;
+  expect(preview.capability_requirements).toContainEqual(expect.objectContaining({ capability: "monitor.stage", amount: 2 }));
+  expect(preview.description).toBe(brief);
+  await expect(save).toBeEnabled();
+  const saved = page.waitForResponse(r => r.url().endsWith("/api/events/save") && r.status() === 201);
+  await activate(save);
+  const event = (await (await saved).json()).event;
+  expect(event.capability_requirements).toContainEqual(expect.objectContaining({ capability: "monitor.stage", amount: 2 }));
+  expect(event.description).toBe(brief);
+  expect(event.assigned_user_ids).toEqual(preview.assigned_user_ids);
+  expect(event.status).toBe("planning");
+  await page.goto(`/events?event=${event.id}`);
+  await activate(page.getByRole("button", { name: "Edit plan", exact: true }));
+  const editor = page.getByRole("dialog", { name: "Edit event", exact: true });
+  const requirement = editor.locator(".manual-requirement-row").filter({ has: page.locator('input[value="monitor.stage"]') });
+  await requirement.getByLabel("Quantity", { exact: true }).fill("4");
+  await activate(editor.getByRole("button", { name: "Add requirement", exact: true }));
+  const added = editor.locator(".manual-requirement-row").last();
+  await added.getByLabel("Capability", { exact: true }).fill("furniture.chair");
+  await added.getByLabel("Quantity", { exact: true }).fill("3");
+  await added.getByRole("combobox", { name: "Priority", exact: true }).selectOption("optional");
+  await expectNoViewportOverflow(page);
+  const updated = page.waitForResponse(r => r.url().endsWith("/api/events/update") && r.status() === 200);
+  await activate(editor.getByRole("button", { name: "Save and rebuild plan" }));
+  const stored = (await (await updated).json()).event;
+  expect(stored.id).toBe(event.id);
+  expect(stored.version).toBeGreaterThan(event.version);
+  expect(stored.capability_requirements).toContainEqual(expect.objectContaining({ capability: "monitor.stage", amount: 4 }));
+  expect(stored.capability_requirements).toContainEqual(expect.objectContaining({ capability: "furniture.chair", amount: 3, level: "optional" }));
+});
+
 test("history states reject stale drafts and in-flight plans", async ({ page }, testInfo) => {
   await signIn(page, `owner@phase-d-${testInfo.project.name}.test`);
   await page.goto("/events/new");
@@ -375,6 +428,208 @@ test("history empty, insufficient and error states remain usable", async ({ page
     await activate(page.getByRole("button", { name: "Revise brief" }));
   }
   await expectNoViewportOverflow(page);
+});
+
+test("crew profiles assignments and restricted external view work with keyboard", async ({ page, browser }, testInfo) => {
+  test.setTimeout(90000);
+  await signIn(page);
+  await page.goto("/team");
+  const profiles = page.getByRole("region", { name: "Crew profiles" });
+  await activate(profiles.getByRole("button", { name: "Add crew profile" }));
+  const dialog = page.getByRole("dialog", { name: "Add crew profile" });
+  const name = `Crew ${testInfo.project.name} יוסי`;
+  await dialog.getByLabel("Name", { exact: true }).fill(name);
+  await dialog.getByLabel("Contact", { exact: true }).fill("private@example.test");
+  await activate(dialog.getByRole("button", { name: "Add skill" }));
+  await dialog.getByRole("textbox", { name: "Skill 1", exact: true }).fill("foh");
+  await dialog.getByLabel("Skill 1 proficiency").selectOption("2");
+  await expectNoViewportOverflow(page);
+  await activate(dialog.getByRole("button", { name: "Save crew profile" }));
+  await expect(dialog).toHaveCount(0);
+  await expect(profiles.getByText(name, { exact: true })).toBeVisible();
+  const response = await page.request.post("/api/events/save", { data: { description: "Indoor meeting", idempotency_key: crypto.randomUUID(), overrides: { title: `Crew event ${testInfo.project.name}`, start_date: "2027-09-20", start_time: "18:00" } } });
+  expect(response.ok(), await response.text()).toBe(true);
+  const event = (await response.json()).event;
+  await page.goto(`/events?event=${event.id}`);
+  const crew = page.getByRole("region", { name: "Event crew assignments" });
+  await expect(crew.getByRole("button", { name: "Add role" })).toBeEnabled();
+  await activate(crew.getByRole("button", { name: "Add role" }));
+  await crew.getByLabel("Role name").fill("FOH");
+  await activate(crew.getByRole("button", { name: "Save role" }));
+  await expect(crew.getByRole("button", { name: "Assign crew" })).toBeEnabled();
+  await activate(crew.getByRole("button", { name: "Assign crew" }));
+  await crew.getByRole("combobox", { name: "Person", exact: true }).selectOption({ label: name });
+  await crew.getByRole("combobox", { name: "Event role", exact: true }).selectOption({ label: "FOH" });
+  await crew.getByLabel("Call time (Asia/Jerusalem)").fill("2027-09-20T15:00");
+  await crew.getByLabel("Release time (Asia/Jerusalem)").fill("2027-09-20T23:00");
+  await crew.getByLabel("Notes for this person").fill("مرحبا שלום assigned notes");
+  await expectNoViewportOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("crew-assignment.png"), fullPage: true });
+  await activate(crew.getByRole("button", { name: "Save assignment" }));
+  const issue = crew.getByRole("button", { name: "Issue or regenerate assignment link" });
+  await expect(issue).toBeEnabled();
+  await activate(issue);
+  const link = crew.getByRole("textbox", { name: "Assignment link" });
+  await expect(link).toHaveValue(/\/external#/);
+  const context = await browser.newContext({ viewport: testInfo.project.use.viewport });
+  try {
+    const external = await context.newPage();
+    await external.goto(await link.inputValue());
+    await expect(external.getByRole("heading", { name: event.title })).toBeVisible();
+    await expect(external.getByText("مرحبا שלום assigned notes", { exact: true })).toBeVisible();
+    await expect(external.getByText("private@example.test")).toHaveCount(0);
+    await expect(external.getByText("No equipment shared with this assignment.")).toBeVisible();
+    await expectNoViewportOverflow(external);
+    await external.screenshot({ path: testInfo.outputPath("external-assignment.png"), fullPage: true });
+    await activate(crew.getByRole("button", { name: "Revoke assignment links" }));
+    await expect(crew.getByRole("button", { name: "Revoke assignment links" })).toBeEnabled();
+    await activate(external.getByRole("button", { name: "Refresh assignment" }));
+    await expect(external.getByRole("alert")).toContainText("unavailable");
+    await expect(external.getByRole("heading", { name: event.title })).toHaveCount(0);
+  } finally { await context.close(); }
+});
+
+test("logistics dates remain separate from the show and export safely", async ({ page }, testInfo) => {
+  await signIn(page);
+  const response = await page.request.post("/api/events/save", { data: { description: "Indoor meeting", idempotency_key: crypto.randomUUID(), overrides: {
+    title: `Logistics ${testInfo.project.name}`, start_date: "2027-09-20", start_time: "18:00", duration_minutes: 300,
+  } } });
+  expect(response.ok(), await response.text()).toBe(true);
+  const event = (await response.json()).event;
+  await page.goto(`/events?event=${event.id}`);
+  const logistics = page.getByRole("region", { name: "Event logistics" });
+  await expect(logistics.getByRole("button", { name: "Edit logistics" })).toBeEnabled();
+  await activate(logistics.getByRole("button", { name: "Edit logistics" }));
+  await logistics.getByLabel("Prepare", { exact: true }).fill("2027-09-19T10:00");
+  await logistics.getByLabel("Standby", { exact: true }).fill("2027-09-19T17:00");
+  await logistics.getByLabel("Return due", { exact: true }).fill("2027-09-21T10:00");
+  await logistics.getByLabel("Logistics notes").fill("Warehouse \u05de\u05d7\u05e1\u05df \u0639\u0631\u0628\u064a");
+  await expectNoViewportOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("logistics.png"), fullPage: true });
+  await activate(logistics.getByRole("button", { name: "Save logistics" }));
+  await expect(logistics.getByRole("button", { name: "Save logistics" })).toHaveCount(0);
+  await expect(logistics.getByText("Show: 2027-09-20 18:00 · 300 minutes", { exact: true })).toBeVisible();
+  await expect(logistics.getByText("2027-09-19 17:00", { exact: true })).toBeVisible();
+  const download = page.waitForEvent("download");
+  await activate(logistics.getByRole("link", { name: "Download logistics CSV" }));
+  expect((await download).suggestedFilename()).toBe("salamandra-logistics.csv");
+});
+
+test("field adjustment request review and supplemental dispatch preserve inspected return", async ({ page }, testInfo) => {
+  test.setTimeout(90000);
+  await signIn(page);
+  const post = async (path: string, data: object) => {
+    const response = await page.request.post(path, { data });
+    expect(response.ok(), await response.text()).toBe(true);
+    return response.json();
+  };
+  const title = `Field carts ${testInfo.project.name}`;
+  await post("/api/inventory/items", { id: title, display_name: title, type: "transport", class_id: "utility-cart", amount: 12, scope: "shared", idempotency_key: crypto.randomUUID() });
+  let event = (await post("/api/events/save", { description: "Equipment transfer", idempotency_key: crypto.randomUUID(), overrides: {
+    title, start_date: "2027-05-15", start_time: "18:00", duration_minutes: 120, planning_mode: "manual",
+    capability_requirements: [{ capability: "transport.cart", amount: 6, level: "required" }],
+  } })).event;
+  event = (await post("/api/events/status", { event_id: event.id, status: "confirmed" })).event;
+  for (const line of event.checklist) await post("/api/events/checklist", { event_id: event.id, item_id: line.item_id, phase: "pack", done: true });
+  await post("/api/events/status", { event_id: event.id, status: "packed" });
+  await post("/api/events/status", { event_id: event.id, status: "out" });
+  await page.goto(`/events?event=${event.id}`);
+  const changes = page.getByRole("region", { name: "Field adjustments" });
+  await activate(changes.getByRole("button", { name: "Request field adjustment" }));
+  await changes.getByLabel("Capability", { exact: true }).fill("transport.cart");
+  await changes.getByLabel("Quantity", { exact: true }).fill("2");
+  await changes.getByLabel("Reason", { exact: true }).fill("Onsite request \u05e2\u05d2\u05dc\u05d4 \u0639\u0631\u0628\u064a");
+  await activate(changes.getByRole("button", { name: "Record request" }));
+  await expect(changes.getByText("Pending", { exact: true })).toBeVisible();
+  await activate(changes.getByRole("button", { name: "Review fulfillment" }));
+  await expect(changes.getByRole("heading", { name: "Fulfillment preview" })).toBeVisible();
+  await expectNoViewportOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("field-adjustment.png"), fullPage: true });
+  await activate(changes.getByRole("button", { name: "Confirm supplemental dispatch" }));
+  await expect(changes.getByText("Fulfilled", { exact: true })).toBeVisible();
+  const response = await page.request.get(`/api/events/return?event_id=${event.id}`);
+  const preview = await response.json();
+  expect(preview.lines.reduce((sum: number, line: { quantity: number }) => sum + line.quantity, 0)).toBe(8);
+  await post("/api/events/return", { event_id: event.id, version: preview.version, idempotency_key: crypto.randomUUID(),
+    lines: preview.lines.map((line: { holding_id: string; quantity: number }) => ({ holding_id: line.holding_id, ready: line.quantity, damaged: 0, missing: 0 })) });
+});
+
+test("event return splits ready damaged and missing equipment", async ({ page }, testInfo) => {
+  test.setTimeout(90000);
+  await signIn(page);
+  const post = async (path: string, data: object) => {
+    const response = await page.request.post(path, { data });
+    expect(response.ok(), await response.text()).toBe(true);
+    return response.json();
+  };
+  const name = `Inspected return ${testInfo.project.name}`;
+  for (const [id, type, class_id, amount] of [[name, "furniture", "event-chair", 6], [`${name} cart`, "transport", "utility-cart", 1], [`${name} car`, "transport", "standard-vehicle", 1]] as const) {
+    await post("/api/inventory/items", { id, display_name: id, type, class_id, amount, scope: "shared", idempotency_key: crypto.randomUUID() });
+  }
+  const created = await post("/api/events/save", { description: "Indoor meeting", idempotency_key: crypto.randomUUID(), overrides: {
+    title: name, start_date: "2027-03-15", start_time: "18:00", duration_minutes: 120, planning_mode: "manual",
+    capability_requirements: [{ capability: "furniture.chair", amount: 6, level: "required" }],
+  } });
+  let event = created.event;
+  event = (await post("/api/events/status", { event_id: event.id, status: "confirmed" })).event;
+  for (const line of event.checklist) await post("/api/events/checklist", { event_id: event.id, item_id: line.item_id, phase: "pack", done: true });
+  await post("/api/events/status", { event_id: event.id, status: "packed" });
+  await post("/api/events/status", { event_id: event.id, status: "out" });
+  await page.goto("/returns");
+  await activate(page.locator(".return-work").filter({ has: page.getByRole("heading", { name, exact: true }) }).getByRole("button", { name: "Inspect return" }));
+  const dialog = page.getByRole("dialog", { name: "Inspect event return" });
+  const equipment = dialog.locator("fieldset").filter({ hasText: "6 out" }).first();
+  await equipment.getByLabel("Ready", { exact: true }).fill("3");
+  await equipment.getByLabel("Damaged", { exact: true }).fill("2");
+  await equipment.getByLabel("Missing", { exact: true }).fill("1");
+  await equipment.getByLabel("Issue / missing details").fill("Inspection \u05ea\u05d9\u05e7\u05d5\u05df \u0639\u0631\u0628\u064a");
+  await expectNoViewportOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("split-return.png"), fullPage: true });
+  await activate(dialog.getByRole("button", { name: "Complete inspected return" }));
+  await expect(dialog).toHaveCount(0);
+  const maintenance = await page.request.get("/api/maintenance");
+  const incidents = (await maintenance.json()).incidents.filter((row: { event_id: string }) => row.event_id === event.id);
+  expect(incidents.map((row: { quantity: number; status: string }) => [row.status, row.quantity]).sort()).toEqual([["missing", 1], ["needs_repair", 2]]);
+});
+
+test("maintenance reports remove ready stock and repair restores it once", async ({ page }, testInfo) => {
+  test.setTimeout(90000);
+  await signIn(page);
+  const label = `Maintenance chair ${testInfo.project.name}`;
+  const stocked = await page.request.post("/api/inventory/items", { data: { id: label, display_name: label, type: "furniture", class_id: "event-chair", amount: 3, scope: "shared", idempotency_key: crypto.randomUUID() } });
+  expect(stocked.ok(), await stocked.text()).toBe(true);
+  await page.goto("/maintenance");
+  const repairQuantity = page.locator(".condition-summary > div").filter({ has: page.getByText("Needs Repair", { exact: true }) }).locator("dd");
+  await expect(repairQuantity).toBeVisible();
+  const beforeRepair = Number(await repairQuantity.textContent());
+  await activate(page.getByRole("button", { name: "Report issue", exact: true }));
+  let dialog = page.getByRole("dialog", { name: "Report equipment issue" });
+  await dialog.getByRole("combobox", { name: "Equipment", exact: true }).fill(label);
+  await page.keyboard.press("ArrowDown");
+  await page.keyboard.press("Enter");
+  await dialog.getByLabel("Quantity", { exact: true }).fill("2");
+  await dialog.getByLabel("Reason", { exact: true }).fill("Loose fitting \u05ea\u05d9\u05e7\u05d5\u05df \u0639\u0631\u0628\u064a");
+  const reported = page.waitForResponse(r => r.url().endsWith("/api/maintenance/report") && r.status() === 200);
+  await activate(dialog.getByRole("button", { name: "Record condition" }));
+  const incident = (await (await reported).json()).incident;
+  await expect(page.locator(".maintenance-row").filter({ hasText: label })).toBeVisible();
+  await expect(repairQuantity).toHaveText(String(beforeRepair + 2));
+  await expectNoViewportOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath("maintenance.png"), fullPage: true });
+  for (const status of ["in_repair", "ready"]) {
+    await activate(page.locator(".maintenance-row").filter({ hasText: label }).getByRole("button", { name: "Update condition" }));
+    dialog = page.getByRole("dialog", { name: "Update condition", exact: true });
+    await dialog.getByRole("combobox", { name: "New condition", exact: true }).selectOption(status);
+    await dialog.getByLabel("Reason", { exact: true }).fill(status === "ready" ? "Checked and repaired" : "Workshop inspection");
+    const updated = page.waitForResponse(r => r.url().endsWith("/api/maintenance/transition") && r.status() === 200);
+    await activate(dialog.getByRole("button", { name: "Record condition" }));
+    await updated;
+    await expect(dialog).toHaveCount(0);
+  }
+  await expect(page.locator(".maintenance-row").filter({ hasText: label })).toHaveCount(0);
+  await expect(repairQuantity).toHaveText(String(beforeRepair));
+  const inventory = (await (await page.request.get("/api/state")).json()).inventory.items;
+  expect(inventory.find((item: { id: string }) => item.id === incident.item_id).count).toBe(3);
 });
 
 test("Learning summary respects roles and shows real saved and returned outcomes", async ({ page }, testInfo) => {

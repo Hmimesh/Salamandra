@@ -1,4 +1,7 @@
 import { inventoryLabel } from "../lib/inventoryLabel";
+import { FieldAdjustments } from "../components/FieldAdjustments";
+import { EventLogistics } from "../components/EventLogistics";
+import { EventCrew } from "../components/EventCrew";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -25,6 +28,7 @@ import { useLocation, useNavigate, useSearchParams } from "react-router-dom";
 import { Avatar, ConflictState, EmptyState, Modal, PageHeader, Readiness, StatusTag } from "../components/ui";
 import { useWorkspace } from "../context/WorkspaceContext";
 import { HistoricalSuggestions } from "../components/HistoricalSuggestions";
+import { EventRequirementsEditor } from "../components/EventRequirementsEditor";
 import { eventCrew, eventReadiness, formatDateLong, formatEventDate, titleCase } from "../lib/format";
 import type { EventDraft, EventPlan, EventRecord, PlanLine, StateEnvelope, UserAccount } from "../types";
 
@@ -140,12 +144,15 @@ export function EventsPage() {
   const draftRevision = useRef(0);
   const [draft, setDraft] = useState<EventDraft | null>(null);
   const [suggestionSession, setSuggestionSession] = useState<string | null>(null);
+  const [originalProposal, setOriginalProposal] = useState<string | null>(null);
+  const proposalRequest = useRef({ payload: "", key: "" });
   const [draftDirty, setDraftDirty] = useState(false);
   const [planning, setPlanning] = useState(false);
   const [saving, setSaving] = useState(false);
   const [createKey, setCreateKey] = useState(() => crypto.randomUUID());
   const [editing, setEditing] = useState<EventRecord | null>(null);
   const [editingSaving, setEditingSaving] = useState(false);
+  const [editingRequirements, setEditingRequirements] = useState(false);
   const [overflowDate, setOverflowDate] = useState<string | null>(null);
   const [destructiveAction, setDestructiveAction] = useState<"cancel" | "delete" | null>(null);
   const showComposer = location.pathname.endsWith("/new");
@@ -167,19 +174,24 @@ export function EventsPage() {
     setPlanning(true);
     try {
       const eventDescription = planningMode === "manual"
-        ? `${manualEvent.title}. Manually structured event requirements.`
+        ? (draft ? description : `${manualEvent.title}. Manually structured event requirements.`)
         : description;
+      const payload = JSON.stringify({ eventDescription, planningMode, manualEvent, manualRequirements });
+      if (proposalRequest.current.payload !== payload) proposalRequest.current = { payload, key: crypto.randomUUID() };
       const response = await mutate<{ draft: EventDraft }>("/api/events/describe", {
         description: eventDescription,
+        capture_proposal: !draft,
+        idempotency_key: proposalRequest.current.key,
         overrides: planningMode === "manual" ? {
           ...manualEvent,
           planning_mode: "manual",
           capability_requirements: manualRequirements.map(({ capability, customCapability, amount, level }) => ({ capability: capability === "custom.resource" ? customCapability : capability, amount, level })),
-          assigned_user_ids: [state!.auth.user!.id],
+          assigned_user_ids: draft?.event.assigned_user_ids ?? [state!.auth.user!.id],
         } : { assigned_user_ids: [state!.auth.user!.id] },
       });
       if (revision !== draftRevision.current) return;
       setDescription(eventDescription);
+      if (!draft) setOriginalProposal(response.draft.proposal_id ?? null);
       setDraft(response.draft);
       setDraftDirty(false);
       setCreateKey(crypto.randomUUID());
@@ -215,6 +227,7 @@ export function EventsPage() {
 
   async function recalculateDraft() {
     if (!draft) return;
+    if (planningMode === "manual" && !manualForm.current?.reportValidity()) return;
     const revision = draftRevision.current;
     setPlanning(true);
     try {
@@ -259,9 +272,12 @@ export function EventsPage() {
         },
         idempotency_key: createKey,
         ...(suggestionSession ? { suggestion_session_id: suggestionSession } : {}),
+        ...(originalProposal ? { proposal_id: originalProposal } : {}),
       }, { success: "Event saved to the workspace." });
       setDraft(null);
       setSuggestionSession(null);
+      setOriginalProposal(null);
+      proposalRequest.current = { payload: "", key: "" };
       setDescription("");
       setDraftDirty(false);
       setCreateKey(crypto.randomUUID());
@@ -275,12 +291,17 @@ export function EventsPage() {
 
   function applyHistoricalRequirements(suggestions: { capability: string; amount: number }[], sessionId: string) {
     if (!draft || draftDirty || planning) return;
-    historicalFocusPending.current = true;
     setSuggestionSession(sessionId);
     const replaced = new Set(suggestions.map(item => item.capability));
     const requirements = draft.event.capability_requirements.filter(item => !replaced.has(item.capability))
       .map(({ capability, amount, level }) => ({ capability, amount, level }));
     requirements.push(...suggestions.map(item => ({ ...item, level: "required" as const })));
+    editDraftRequirements(requirements);
+  }
+
+  function editDraftRequirements(requirements: { capability: string; amount: number; level: string }[] | undefined = draft?.event.capability_requirements) {
+    if (!draft || !requirements || planning || saving) return;
+    historicalFocusPending.current = true;
     setManualRequirements(requirements.map(item => ({ ...item, id: crypto.randomUUID(), customCapability: item.capability, capability: requirementOptions.some(option => option[0] === item.capability) ? item.capability : "custom.resource" })));
     setManualEvent({ title: draft.event.title, start_date: draft.event.start_date, start_time: draft.event.start_time, location: draft.event.location, duration_minutes: draft.event.duration_minutes, attendee_count: draft.event.attendee_count });
     setPlanningMode("manual");
@@ -290,6 +311,7 @@ export function EventsPage() {
 
   function beginEdit(event: EventRecord) {
     setEditing({ ...event });
+    setEditingRequirements(false);
   }
 
   async function saveEdit(event: FormEvent) {
@@ -309,6 +331,7 @@ export function EventsPage() {
           duration_minutes: editing.duration_minutes,
           attendee_count: editing.attendee_count,
           assigned_user_ids: editing.assigned_user_ids,
+          ...(editingRequirements ? { planning_mode: "manual", capability_requirements: editing.capability_requirements } : {}),
         },
       }, { success: "Event details and plan updated." });
       setEditing(null);
@@ -369,6 +392,11 @@ export function EventsPage() {
                   <TransportBand plan={draft.event.plan} />
                   {!draftDirty && !planning ? <HistoricalSuggestions event={draft.event} onApply={applyHistoricalRequirements} /> : null}
                   {draft.event.plan.reallocations.length ? <div className="reallocation-list"><div className="subsection-title"><h3><ArrowRightLeft size={16} />Overlap reallocation</h3><span>{draft.event.plan.reallocations.length} event affected</span></div>{draft.event.plan.reallocations.map((reallocation) => <div className="reallocation-row" key={reallocation.event_id}><strong>{reallocation.event_title}{reallocation.required_missing ? ` · ${reallocation.required_missing} now missing` : ""}</strong><span>{Object.entries(reallocation.removed).map(([item, amount]) => `${amount}x ${titleCase(item)}`).join(", ") || "Previous allocation"}</span><ArrowRightLeft size={15} /><span>{Object.entries(reallocation.added).map(([item, amount]) => `${amount}x ${titleCase(item)}`).join(", ") || "Rebalanced stock"}</span><small>{reallocation.reason}</small></div>)}</div> : null}
+                  <div className="subsection-title"><h3>Equipment requirements</h3><button className="button button-secondary button-compact" type="button" disabled={planning || saving} onClick={() => {
+                    if (planningMode === "manual") {
+                      manualForm.current?.querySelector<HTMLInputElement>(".manual-requirement-row input[type=number]")?.focus();
+                    } else editDraftRequirements();
+                  }}><Pencil size={15} />Edit requirements</button></div>
                   <div className="plan-lines">
                     {draft.event.plan.lines.map((line, index) => {
                       const name = line.item_id ? inventoryLabel(state!.inventory.items.find(candidate => candidate.id === line.item_id)) : capabilityName(line.capability);
@@ -427,13 +455,18 @@ export function EventsPage() {
               <label className="form-field-wide">Event brief<textarea dir="auto" rows={7} value={editing.description} onChange={(event) => setEditing({ ...editing, description: event.target.value })} required /></label>
             </div>
             <CrewPicker users={state!.auth.users} selected={editing.assigned_user_ids} requiredId={editing.owner_id} onChange={(assigned_user_ids) => setEditing({ ...editing, assigned_user_ids })} />
+            <EventRequirementsEditor value={editing.capability_requirements} onChange={capability_requirements => { setEditingRequirements(true); setEditing({ ...editing, capability_requirements }); }} />
             <div className="modal-actions"><button className="button button-secondary" type="button" onClick={() => setEditing(null)}>Cancel</button><button className="button button-primary" type="submit" disabled={editingSaving}>{editingSaving ? "Saving changes..." : "Save and rebuild plan"}</button></div>
           </form>
         ) : selectedEvent ? (
           <div className="event-detail">
             <div className="event-detail-summary"><div><StatusTag status={selectedEvent.status} /><Readiness value={eventReadiness(selectedEvent)} /></div><div><Users size={17} />{eventCrew(selectedEvent, state!.auth.users).map((member) => member.name).join(", ") || "No crew assigned"}</div></div>
             <p className="event-description">{selectedEvent.description}</p>
+            {selectedEvent.status === "planning" ? <button className="button button-secondary" type="button" onClick={() => beginEdit(selectedEvent)}><Pencil size={16} />Edit plan</button> : null}
             <TransportBand plan={selectedEvent.plan} />
+            <EventLogistics key={`logistics-${selectedEvent.id}`} event={selectedEvent} />
+            {["owner", "admin", "operator", "producer"].includes(state!.auth.user!.role) ? <EventCrew key={`crew-${selectedEvent.id}`} event={selectedEvent} /> : null}
+            {selectedEvent.status !== "planning" && selectedEvent.status !== "confirmed" ? <FieldAdjustments key={`adjustments-${selectedEvent.id}`} event={selectedEvent} /> : null}
             <div className="event-detail-grid">
               <section><div className="subsection-title"><h3>{selectedEvent.status === "out" ? "Return checklist" : "Packing checklist"}</h3><span>{(selectedEvent.status === "out" ? selectedEvent.return_checklist : selectedEvent.checklist).filter((item) => item.done).length}/{(selectedEvent.status === "out" ? selectedEvent.return_checklist : selectedEvent.checklist).length}</span></div><div className="checklist-list">{(selectedEvent.status === "out" ? selectedEvent.return_checklist : selectedEvent.checklist).map((item) => <label key={item.id}><input type="checkbox" checked={item.done} onChange={(event) => void toggleChecklist(selectedEvent.id, item.phase, item.item_id, event.target.checked)} /><span><strong>{item.amount}x {inventoryLabel(state!.inventory.items.find(candidate => candidate.id === item.item_id))}</strong><small>{item.phase === "return" ? "Inspect and return to stock" : "Pack and verify"}</small></span><CheckCircle2 size={18} /></label>)}</div></section>
               <section><div className="subsection-title"><h3>Operations plan</h3><span>{selectedEvent.plan.lines.length} lines</span></div><div className="detail-gear-list">{selectedEvent.plan.lines.map((line, index) => <div key={`${line.level}-${line.capability}-${line.item_id}-${index}`}><span><strong>{line.amount}x {line.item_id ? inventoryLabel(state!.inventory.items.find(candidate => candidate.id === line.item_id)) : capabilityName(line.capability)}</strong><small>{lineBreakdown(line)} · {titleCase(line.type || line.capability)}</small></span><span className={line.missing ? "line-missing" : "line-ready"}>{line.missing ? `${line.missing} missing` : "Ready"}</span></div>)}</div></section>

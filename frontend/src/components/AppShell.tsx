@@ -13,6 +13,7 @@ import {
   Settings,
   Users,
   X,
+  Wrench,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
@@ -24,6 +25,7 @@ const navigation = [
   { to: "/", label: "Dashboard", icon: Gauge },
   { to: "/events", label: "Events", icon: CalendarDays },
   { to: "/inventory", label: "Inventory", icon: Boxes },
+  { to: "/maintenance", label: "Maintenance", icon: Wrench },
   { to: "/kits", label: "Kits", icon: PackageOpen },
   { to: "/returns", label: "Returns", icon: ClipboardCheck },
   { to: "/team", label: "Team", icon: Users, divider: true },
@@ -35,6 +37,7 @@ const pageNames: Record<string, string> = {
   dashboard: "Dashboard",
   events: "Events",
   inventory: "Inventory",
+  maintenance: "Maintenance",
   kits: "Kits",
   returns: "Returns",
   team: "Team",
@@ -88,7 +91,7 @@ export function AppShell() {
         </button>
 
         <nav className="primary-nav" aria-label="Main navigation">
-          {navigation.map(({ to, label, icon: Icon, divider }) => (
+          {navigation.filter(item => item.to !== "/maintenance" || state!.auth.maintenance_allowed).map(({ to, label, icon: Icon, divider }) => (
             <NavLink
               key={to}
               className={({ isActive }) => `nav-link ${isActive ? "active" : ""} ${divider ? "nav-divider" : ""}`}

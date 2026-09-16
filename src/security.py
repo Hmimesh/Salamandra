@@ -13,6 +13,9 @@ class Permission(StrEnum):
     INVENTORY_EXPORT = "inventory.export"
     INVENTORY_IMPORT = "inventory.import"
     INVENTORY_CLEAR = "inventory.clear"
+    MAINTENANCE_READ = "maintenance.read"
+    MAINTENANCE_REPORT = "maintenance.report"
+    MAINTENANCE_MANAGE = "maintenance.manage"
     ITEM_CLASSES_MANAGE = "item_classes.manage"
     CATALOG_MANAGE = "catalog.manage"
     EVENTS_PLAN = "events.plan"
@@ -24,6 +27,13 @@ class Permission(StrEnum):
     OPERATIONS_PACK = "operations.pack"
     OPERATIONS_DISPATCH = "operations.dispatch"
     OPERATIONS_RETURN = "operations.return"
+    EVENTS_ADJUST = "events.adjust"
+    LOGISTICS_EDIT = "logistics.edit"
+    CREW_READ = "crew.read"
+    CREW_MANAGE = "crew.manage"
+    CREW_ASSIGN = "crew.assign"
+    CREW_OVERRIDE = "crew.override"
+    CREW_ACCESS = "crew.access"
     INTEGRATIONS_MANAGE = "integrations.manage"
     MEMBERS_INVITE = "members.invite"
     SYNC_RUN = "sync.run"
@@ -42,10 +52,14 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
     "admin": ALL_PERMISSIONS - {Permission.INVENTORY_CLEAR},
     "producer": frozenset(
         {
+            Permission.CREW_READ,
+            Permission.CREW_ASSIGN,
             Permission.STATE_READ,
             Permission.INVENTORY_READ,
             Permission.INVENTORY_PERSONAL_WRITE,
             Permission.EVENTS_PLAN,
+            Permission.EVENTS_ADJUST,
+            Permission.LOGISTICS_EDIT,
             Permission.LEARNING_OUTCOME_WRITE,
             Permission.EVENTS_CREATE,
             Permission.EVENTS_UPDATE,
@@ -59,6 +73,16 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
     ),
     "operator": frozenset(
         {
+            Permission.CREW_READ,
+            Permission.CREW_MANAGE,
+            Permission.CREW_ASSIGN,
+            Permission.CREW_OVERRIDE,
+            Permission.CREW_ACCESS,
+            Permission.MAINTENANCE_READ,
+            Permission.EVENTS_ADJUST,
+            Permission.LOGISTICS_EDIT,
+            Permission.MAINTENANCE_REPORT,
+            Permission.MAINTENANCE_MANAGE,
             Permission.STATE_READ,
             Permission.INVENTORY_READ,
             Permission.INVENTORY_PERSONAL_WRITE,
@@ -82,7 +106,9 @@ ROLE_PERMISSIONS: dict[str, frozenset[Permission]] = {
     ),
     "technician": frozenset(
         {
+            Permission.MAINTENANCE_REPORT,
             Permission.STATE_READ,
+            Permission.EVENTS_ADJUST,
             Permission.INVENTORY_READ,
             Permission.INVENTORY_PERSONAL_WRITE,
             Permission.OPERATIONS_PACK,

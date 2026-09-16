@@ -3,6 +3,7 @@ import { type FormEvent, useState } from "react";
 import { Avatar, EmptyState, Modal, PageHeader } from "../components/ui";
 import { useWorkspace } from "../context/WorkspaceContext";
 import { titleCase } from "../lib/format";
+import { CrewProfiles } from "../components/CrewProfiles";
 
 export function TeamPage() {
   const { state, mutate } = useWorkspace();
@@ -31,6 +32,7 @@ export function TeamPage() {
     <div className="page team-page">
       <PageHeader title="Team" description="See who is available, where they work, and what role they hold." actions={canInvite ? <button className="button button-primary" onClick={() => setInviteOpen(true)}><Plus size={17} />Add team member</button> : undefined} />
       <section className="team-overview"><div><span className="summary-icon"><Users size={20} /></span><span><small>Workspace members</small><strong>{state!.organization.seat_count}</strong></span></div><div><small>Online now</small><strong>{state!.presence.filter((member) => member.online).length}</strong></div><div><small>Primary warehouse</small><strong>{state!.organization.warehouse}</strong></div><div><small>Your access</small><strong>{titleCase(state!.auth.user!.role)}</strong></div></section>
+      {["owner", "admin", "operator", "producer"].includes(state!.auth.user!.role) ? <CrewProfiles /> : null}
       <section className="data-section team-directory">
         <div className="section-title-row"><div><h2>Workspace members</h2><p>Accounts are isolated to {state!.organization.name}.</p></div><span className="result-count">{state!.presence.length} members</span></div>
         <div className="team-table">
