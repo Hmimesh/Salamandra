@@ -239,6 +239,10 @@ class EventCrew:
                     raise StateConflict("This role is already fully assigned.")
                 if problems and not reason.strip():
                     raise StateConflict(" ".join(problems) + " An authorized override with a reason is required.")
+            shortened_access = bool(row and release < aware(row.release_at) and session.scalar(
+                select(CrewAccessModel.id).where(CrewAccessModel.organization_id == org,
+                    CrewAccessModel.assignment_id == row.id, CrewAccessModel.revoked.is_(False),
+                    CrewAccessModel.expires_at > release + timedelta(hours=24)).limit(1)))
             if row is None:
                 row = CrewAssignmentModel(id=new_id(), organization_id=org, event_id=event.id, profile_id=profile.id,
                     role_id=role.id, version=1, updates=[])
@@ -248,11 +252,12 @@ class EventCrew:
             row.call_at, row.release_at, row.status, row.notes, row.equipment = call, release, status, notes, equipment
             row.updates = [*row.updates[-19:], {"at": utc_now().isoformat(), "message": "Assignment updated.",
                 "call_at": call.isoformat(), "release_at": release.isoformat()}]
-            if status == "cancelled":
+            if status == "cancelled" or shortened_access:
                 session.execute(update(CrewAccessModel).where(CrewAccessModel.organization_id == org,
                     CrewAccessModel.assignment_id == row.id).values(revoked=True))
             event.version += 1
-            audit(session, member, "crew.assign", row, request_id, {**public_assignment(row), "warnings": problems, "override_reason": reason})
+            audit(session, member, "crew.assign", row, request_id, {**public_assignment(row), "warnings": problems, "override_reason": reason,
+                **({"access_revocation_reason": "release_shortened"} if shortened_access else {})})
             return complete(op, {**public_assignment(row), "event_version": event.version, "warnings": problems})
 
     def access(self, org, actor, body, request_id):
@@ -298,6 +303,8 @@ class EventCrew:
             if access is None:
                 raise ResourceNotFound()
             row = scoped(session, CrewAssignmentModel, access.organization_id, access.assignment_id)
+            if utc_now() >= min(aware(access.expires_at), aware(row.release_at) + timedelta(hours=24)):
+                raise ResourceNotFound()
             profile = scoped(session, CrewProfileModel, access.organization_id, row.profile_id)
             event = EventReturns._event(session, access.organization_id, row.event_id)
             role = scoped(session, CrewRoleModel, access.organization_id, row.role_id)

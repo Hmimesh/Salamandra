@@ -64,6 +64,24 @@ class ProposalCases:
             self.assertEqual(session.scalar(select(func.count()).select_from(EventModel)), 0)
             self.assertFalse(session.get(EventProposalModel, self.identity).consumed)
 
+    def test_unrelated_intake_rejected_before_consumption_then_correction_succeeds(self):
+        with self.assertRaises(StateConflict):
+            self.creator.create("a", "a", "bad", "test", {"proposal_id": self.identity},
+                {**self.data, "description": "Unrelated event"})
+        with self.factory() as session:
+            self.assertFalse(session.get(EventProposalModel, self.identity).consumed)
+            self.assertEqual(session.scalar(select(func.count()).select_from(EventModel)), 0)
+        changed = {**self.data, "description": "  " + self.data["description"] + "\n", "title": "Corrected title",
+            "start_date": "2030-01-01", "capability_requirements": [{"capability": "monitor.stage", "amount": 4}]}
+        event, _ = self.creator.create("a", "a", "good", "test", {"proposal_id": self.identity}, changed)
+        with self.factory() as session:
+            learning = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.event_id == event.id))
+            self.assertEqual(learning.original_request["brief"], self.data["description"])
+
+    def test_capture_rejects_request_and_generated_brief_mismatch(self):
+        with self.assertRaises(StateConflict):
+            capture_proposal(self.factory, "a", "a", self.data, {"description": "Other intake"}, "mismatch")
+
 
 class TestProposalsSQLite(ProposalCases, unittest.TestCase):
     def setUp(self):

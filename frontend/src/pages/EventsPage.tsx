@@ -2,6 +2,7 @@ import { inventoryLabel } from "../lib/inventoryLabel";
 import { FieldAdjustments } from "../components/FieldAdjustments";
 import { EventLogistics } from "../components/EventLogistics";
 import { EventCrew } from "../components/EventCrew";
+import { ReturnInspection } from "../components/ReturnInspection";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -70,7 +71,7 @@ function eventAction(event: EventRecord): { status: EventRecord["status"]; label
   if (event.status === "planning") return { status: "confirmed", label: "Confirm event" };
   if (event.status === "confirmed" && event.checklist.every((item) => item.done)) return { status: "packed", label: "Mark packed" };
   if (event.status === "packed") return { status: "out", label: "Dispatch load" };
-  if (event.status === "out" && event.return_checklist.every((item) => item.done)) return { status: "returned", label: "Close return" };
+  if (event.status === "out") return { status: "returned", label: "Inspect return" };
   return null;
 }
 
@@ -155,6 +156,15 @@ export function EventsPage() {
   const [editingRequirements, setEditingRequirements] = useState(false);
   const [overflowDate, setOverflowDate] = useState<string | null>(null);
   const [destructiveAction, setDestructiveAction] = useState<"cancel" | "delete" | null>(null);
+  const [inspectEvent, setInspectEvent] = useState<EventRecord | null>(null);
+  const actionButton = useRef<HTMLButtonElement>(null);
+  const restoreInspectionFocus = useRef(false);
+  useLayoutEffect(() => {
+    if (!inspectEvent && restoreInspectionFocus.current) {
+      restoreInspectionFocus.current = false;
+      actionButton.current?.focus();
+    }
+  });
   const showComposer = location.pathname.endsWith("/new");
   const selectedEvent = state!.events.events.find((event) => event.id === searchParams.get("event")) || null;
   const calendarEvents = useMemo(() => {
@@ -347,6 +357,10 @@ export function EventsPage() {
   }
 
   async function changeStatus(eventId: string, status: EventRecord["status"]) {
+    if (status === "returned") {
+      setInspectEvent(state!.events.events.find(event => event.id === eventId) || null);
+      return;
+    }
     await mutate("/api/events/status", { event_id: eventId, status }, { success: `Event marked ${titleCase(status).toLowerCase()}.` }).catch(() => undefined);
   }
 
@@ -441,7 +455,8 @@ export function EventsPage() {
         </>
       )}
 
-      <Modal open={Boolean(selectedEvent)} suspended={Boolean(destructiveAction)} title={editing ? "Edit event" : selectedEvent?.title || "Event"} description={selectedEvent ? `${formatDateLong(selectedEvent.start_date)} · ${selectedEvent.start_time} · ${selectedEvent.location || "Location TBD"}` : undefined} onClose={() => { setEditing(null); setSearchParams({}); }} size="lg">
+      <ReturnInspection event={inspectEvent} onClose={() => { restoreInspectionFocus.current = true; setInspectEvent(null); }} />
+      <Modal open={Boolean(selectedEvent) && !inspectEvent} suspended={Boolean(destructiveAction)} title={editing ? "Edit event" : selectedEvent?.title || "Event"} description={selectedEvent ? `${formatDateLong(selectedEvent.start_date)} · ${selectedEvent.start_time} · ${selectedEvent.location || "Location TBD"}` : undefined} onClose={() => { setEditing(null); setSearchParams({}); }} size="lg">
         {selectedEvent && editing ? (
           <form className="event-edit-form" onSubmit={saveEdit}>
             <p className="event-edit-intro">Update the brief or schedule. Salamandra will rebuild the inventory plan from current workspace stock when you save.</p>
@@ -472,7 +487,7 @@ export function EventsPage() {
               <section><div className="subsection-title"><h3>Operations plan</h3><span>{selectedEvent.plan.lines.length} lines</span></div><div className="detail-gear-list">{selectedEvent.plan.lines.map((line, index) => <div key={`${line.level}-${line.capability}-${line.item_id}-${index}`}><span><strong>{line.amount}x {line.item_id ? inventoryLabel(state!.inventory.items.find(candidate => candidate.id === line.item_id)) : capabilityName(line.capability)}</strong><small>{lineBreakdown(line)} · {titleCase(line.type || line.capability)}</small></span><span className={line.missing ? "line-missing" : "line-ready"}>{line.missing ? `${line.missing} missing` : "Ready"}</span></div>)}</div></section>
             </div>
             {selectedEvent.status !== "planning" ? <p className="event-edit-lock-note"><AlertTriangle size={16} />Editing is locked after confirmation to protect reservations and inventory movement history.</p> : null}
-            <div className="modal-actions"><button className="button button-secondary" onClick={() => setSearchParams({})}>Close</button>{selectedEvent.status === "planning" && ["owner", "admin"].includes(state!.auth.user!.role) ? <button className="button button-danger" type="button" onClick={() => setDestructiveAction("delete")}><Trash2 size={16} />Delete draft</button> : null}{["planning", "confirmed", "packed"].includes(selectedEvent.status) ? <button className="button button-secondary" type="button" onClick={() => setDestructiveAction("cancel")}><XCircle size={16} />Cancel event</button> : null}{selectedEvent.status === "planning" ? <button className="button button-secondary" type="button" onClick={() => beginEdit(selectedEvent)}><Pencil size={16} />Edit event</button> : null}{eventAction(selectedEvent) ? <button className="button button-primary" onClick={() => void changeStatus(selectedEvent.id, eventAction(selectedEvent)!.status)}>{eventAction(selectedEvent)!.label}</button> : null}</div>
+            <div className="modal-actions"><button className="button button-secondary" onClick={() => setSearchParams({})}>Close</button>{selectedEvent.status === "planning" && ["owner", "admin"].includes(state!.auth.user!.role) ? <button className="button button-danger" type="button" onClick={() => setDestructiveAction("delete")}><Trash2 size={16} />Delete draft</button> : null}{["planning", "confirmed", "packed"].includes(selectedEvent.status) ? <button className="button button-secondary" type="button" onClick={() => setDestructiveAction("cancel")}><XCircle size={16} />Cancel event</button> : null}{selectedEvent.status === "planning" ? <button className="button button-secondary" type="button" onClick={() => beginEdit(selectedEvent)}><Pencil size={16} />Edit event</button> : null}{eventAction(selectedEvent) ? <button ref={actionButton} className="button button-primary" onClick={() => void changeStatus(selectedEvent.id, eventAction(selectedEvent)!.status)}>{eventAction(selectedEvent)!.label}</button> : null}</div>
           </div>
         ) : null}
       </Modal>

@@ -1222,6 +1222,146 @@ class TestPostgresHttpRuntime(unittest.TestCase):
         self.assertEqual(_request(self.ports[0], "POST", "/api/maintenance/report", report, cookie)[0], 403)
 
     @isolated_database_inserts
+    def test_crew_export_http_permissions_utf8_and_non_disclosure(self):
+        from postgres_runtime import PostgresRuntime
+        import csv
+        import io
+        org, actor, _, owner = self._learning_fixture(count=0)
+        _, _, _, foreign = self._learning_fixture(count=0)
+        identity = uuid4().hex
+        with self.factory.begin() as session:
+            session.add(EventModel(id=identity, organization_id=org, owner_user_id=actor, title="=HYPERLINK(\"bad\")",
+                status="planning", data={"start_date": "2027-10-10", "start_time": "18:00", "duration_minutes": 120}))
+        def post(path, body):
+            status, result, _ = _request(self.ports[0], "POST", path, body, owner)
+            self.assertEqual(status, 200, result)
+            return result
+        person = "Crew, \u05e9\u05dc\u05d5\u05dd \u0639\u0631\u0628\u064a\nQuoted \"name\""
+        profile = post("/api/crew", {"name": person, "kind": "external", "idempotency_key": uuid4().hex})
+        role = post("/api/events/crew/role", {"event_id": identity, "event_version": 1, "name": "Stage", "idempotency_key": uuid4().hex})
+        post("/api/events/crew/assign", {"event_id": identity, "event_version": role["event_version"], "profile_id": profile["id"],
+            "role_id": role["id"], "call_at": "2027-10-10T12:00+03:00", "release_at": "2027-10-10T23:00+03:00", "idempotency_key": uuid4().hex})
+        cookies = {"owner": owner}
+        for role_name in ("admin", "operator", "producer", "client", "read_only"):
+            email = uuid4().hex + "@example.test"
+            PostgresRuntime(self.factory).accounts.create_user(name=role_name, email=email, password="Export-password-123",
+                role=role_name, organization_id=org, organization_name=org)
+            cookies[role_name] = self._sign_in_credentials(self.ports[0], email, "Export-password-123")
+        before = self._database_state_snapshot()
+        for name, cookie in cookies.items():
+            connection = http.client.HTTPConnection("127.0.0.1", self.ports[0], timeout=10)
+            try:
+                connection.request("GET", "/api/events/logistics/export?event_id=" + identity, headers={"Cookie": cookie})
+                response = connection.getresponse()
+                content = response.read().decode("utf-8-sig")
+                if name in {"client", "read_only"}:
+                    self.assertEqual(response.status, 403, content)
+                    for hidden in (person, "2027-10-10", identity, "Stage"):
+                        self.assertNotIn(hidden, content)
+                else:
+                    self.assertEqual(response.status, 200, content)
+                    rows = list(csv.reader(io.StringIO(content)))
+                    self.assertIn(["Crew", "Stage", person], rows)
+                    self.assertIn(["Event", "Title", "'=HYPERLINK(\"bad\")"], rows)
+            finally:
+                connection.close()
+        for cookie in (foreign, cookies["client"], cookies["read_only"]):
+            actual = _request(self.ports[0], "GET", "/api/events/logistics/export?event_id=" + identity, cookie=cookie)
+            absent = _request(self.ports[0], "GET", "/api/events/logistics/export?event_id=absent", cookie=cookie)
+            self.assertEqual(actual[:2], absent[:2])
+        self.assertEqual(before, self._database_state_snapshot())
+
+    @isolated_database_inserts
+    def test_proposal_http_binds_intake_without_preventing_operator_corrections(self):
+        from postgres_runtime import PostgresRuntime
+        from database import EventProposalModel, EventLearningRecordModel
+        org, _, _, owner = self._learning_fixture(count=0)
+        _, _, _, foreign = self._learning_fixture(count=0)
+        email = uuid4().hex + "@example.test"
+        PostgresRuntime(self.factory).accounts.create_user(name="Second actor", email=email, password="Proposal-password-123",
+            role="owner", organization_id=org, organization_name=org)
+        other_actor = self._sign_in_credentials(self.ports[0], email, "Proposal-password-123")
+        brief = "Original \u05e9\u05dc\u05d5\u05dd \u0639\u0631\u0628\u064a, indoor event."
+        overrides = {"planning_mode": "manual", "title": "Original", "start_date": "2027-10-10", "start_time": "18:00",
+            "capability_requirements": [{"capability": "transport.cart", "amount": 2, "level": "required"}]}
+        status, response, _ = _request(self.ports[0], "POST", "/api/events/describe", {"description": "  " + brief + "\n",
+            "overrides": overrides, "capture_proposal": True, "idempotency_key": uuid4().hex}, owner)
+        self.assertEqual(status, 200, response)
+        proposal = response["draft"]["proposal_id"]
+        body = {"description": brief, "proposal_id": proposal, "idempotency_key": uuid4().hex,
+            "overrides": {**overrides, "title": "Corrected", "start_date": "2027-10-11",
+                "capability_requirements": [{"capability": "transport.cart", "amount": 4, "level": "required"}]}}
+        before = self._database_state_snapshot()
+        for bad_brief in ("Unrelated event", brief.replace("indoor", "outdoor"), brief.replace(" ", "  ")):
+            result = _request(self.ports[0], "POST", "/api/events/save", {**body, "description": bad_brief}, owner)
+            self.assertEqual(result[0], 409, result)
+            self.assertEqual(before, self._database_state_snapshot())
+        for cookie in (foreign, other_actor):
+            result = _request(self.ports[0], "POST", "/api/events/save", body, cookie)
+            absent = _request(self.ports[0], "POST", "/api/events/save", {**body, "proposal_id": "absent"}, cookie)
+            self.assertEqual(result[0], 404, result)
+            self.assertEqual(result[:2], absent[:2])
+        self.assertEqual(before, self._database_state_snapshot())
+        status, saved, _ = _request(self.ports[0], "POST", "/api/events/save", body, owner)
+        self.assertEqual(status, 201, saved)
+        retry = _request(self.ports[1], "POST", "/api/events/save", body, owner)
+        self.assertEqual(retry[0], 200, retry)
+        self.assertEqual(retry[1]["event"]["id"], saved["event"]["id"])
+        self.assertEqual(_request(self.ports[0], "POST", "/api/events/save", {**body, "idempotency_key": uuid4().hex}, owner)[0], 409)
+        with self.factory() as session:
+            learning = session.scalar(select(EventLearningRecordModel).where(EventLearningRecordModel.event_id == saved["event"]["id"]))
+            self.assertEqual(learning.original_request["brief"], brief)
+            self.assertEqual(learning.proposal["requirements"][0]["amount"], 2)
+            self.assertEqual(learning.corrections["requirements"]["final_planned"][0]["amount"], 4)
+            self.assertTrue(session.get(EventProposalModel, proposal).consumed)
+
+    @isolated_database_inserts
+    @race_required
+    def test_crew_issue_races_shortening_without_stale_access(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from database import CrewAccessModel, CrewAssignmentModel
+        org, actor, _, cookie = self._learning_fixture(count=0)
+        identity = uuid4().hex
+        with self.factory.begin() as session:
+            session.add(EventModel(id=identity, organization_id=org, owner_user_id=actor, title="Access race", status="planning",
+                data={"start_date": "2027-10-10", "start_time": "18:00", "duration_minutes": 120}))
+        def post(path, body):
+            status, result, _ = _request(self.ports[0], "POST", path, body, cookie)
+            self.assertEqual(status, 200, result)
+            return result
+        profile = post("/api/crew", {"name": "Race crew", "kind": "external", "idempotency_key": uuid4().hex})
+        role = post("/api/events/crew/role", {"event_id": identity, "event_version": 1, "name": "Stage", "idempotency_key": uuid4().hex})
+        body = {"event_id": identity, "event_version": role["event_version"], "profile_id": profile["id"], "role_id": role["id"],
+            "call_at": "2027-10-10T12:00+03:00", "release_at": "2027-10-10T23:00+03:00", "idempotency_key": uuid4().hex}
+        assigned = post("/api/events/crew/assign", body)
+        access_body = {"assignment_id": assigned["id"], "version": assigned["version"], "action": "issue", "idempotency_key": uuid4().hex}
+        first = post("/api/events/crew/access", access_body)
+        shortening = {**body, "id": assigned["id"], "version": first["version"], "event_version": assigned["event_version"],
+            "release_at": "2027-10-10T18:00+03:00", "idempotency_key": uuid4().hex}
+        commands = [("/api/events/crew/access", {**access_body, "version": first["version"], "idempotency_key": uuid4().hex}),
+            ("/api/events/crew/assign", shortening)]
+        barrier = threading.Barrier(2)
+        def send(index):
+            barrier.wait(timeout=5)
+            path, payload = commands[index]
+            return _request(self.ports[index], "POST", path, payload, cookie)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(send, range(2)))
+        self.assertEqual(sorted(row[0] for row in outcomes), [200, 409], outcomes)
+        tokens = [first["token"]]
+        if outcomes[0][0] == 200:
+            tokens.append(outcomes[0][1]["token"])
+            post("/api/events/crew/assign", {**shortening, "version": outcomes[0][1]["version"]})
+        for token in tokens:
+            self.assertEqual(_request(self.ports[0], "GET", "/api/external/assignment", bearer=token)[0], 404)
+        with self.factory() as session:
+            self.assertTrue(all(row.revoked for row in session.scalars(select(CrewAccessModel).where(CrewAccessModel.organization_id == org))))
+            current_version = session.get(CrewAssignmentModel, assigned["id"]).version
+        renewed = post("/api/events/crew/access", {**access_body, "version": current_version, "idempotency_key": uuid4().hex})
+        self.assertEqual(renewed["expires_at"], "2027-10-11T18:00:00+03:00")
+        self.assertEqual(_request(self.ports[0], "GET", "/api/external/assignment", bearer=renewed["token"])[0], 200)
+
+    @isolated_database_inserts
     def test_integrated_field_release_supplement_dispatch_inspected_return(self):
         from copy import deepcopy
         from database import ConditionIncidentModel, CrewAccessModel, utc_now

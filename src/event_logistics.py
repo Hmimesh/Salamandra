@@ -65,7 +65,9 @@ class EventLogistics:
 
     def export(self, org, actor, event_id):
         with self.factory() as session:
-            require_permission(active_membership(session, org, actor).role, Permission.STATE_READ)
+            member = active_membership(session, org, actor)
+            require_permission(member.role, Permission.STATE_READ)
+            require_permission(member.role, Permission.CREW_READ)
             event = EventReturns._event(session, org, identifier(event_id))
             public = self.public(event)
             rows = [["Section", "Name", "Value"], ["Event", "Title", event.title],

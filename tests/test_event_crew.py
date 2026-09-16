@@ -147,6 +147,41 @@ class CrewCases:
         with self.assertRaises(ResourceNotFound):
             self.crew.external(renewed["token"])
 
+    def test_shortened_release_revokes_and_extension_never_revives(self):
+        self.setup_crew()
+        assigned = self.crew.assign("a", "a", self.assignment_body, "test")
+        access = self.crew.access("a", "a", {"assignment_id": assigned["id"], "version": 1, "action": "issue", "idempotency_key": "issue"}, "test")
+        self.crew.external(access["token"])
+        shortened = {**self.assignment_body, "id": assigned["id"], "version": 2, "event_version": 3,
+            "release_at": "2027-09-20T18:00+03:00", "idempotency_key": "shorten"}
+        changed = self.crew.assign("a", "a", shortened, "test")
+        self.assertEqual(self.crew.assign("a", "a", shortened, "retry"), changed)
+        with self.assertRaises(ResourceNotFound):
+            self.crew.external(access["token"])
+        extended = self.crew.assign("a", "a", {**shortened, "version": changed["version"], "event_version": changed["event_version"],
+            "release_at": self.assignment_body["release_at"], "idempotency_key": "extend"}, "test")
+        with self.assertRaises(ResourceNotFound):
+            self.crew.external(access["token"])
+        renewed = self.crew.access("a", "a", {"assignment_id": assigned["id"], "version": extended["version"], "action": "issue", "idempotency_key": "renew"}, "test")
+        self.assertEqual(renewed["expires_at"], access["expires_at"])
+        self.crew.external(renewed["token"])
+        with self.factory() as session:
+            audit = session.scalar(select(AuditEventModel).where(AuditEventModel.resource_id == assigned["id"],
+                AuditEventModel.changes["access_revocation_reason"].as_string() == "release_shortened"))
+            self.assertIsNotNone(audit)
+
+    def test_current_release_window_independently_rejects_unrevoked_credential(self):
+        self.setup_crew()
+        assigned = self.crew.assign("a", "a", self.assignment_body, "test")
+        access = self.crew.access("a", "a", {"assignment_id": assigned["id"], "version": 1, "action": "issue", "idempotency_key": "issue"}, "test")
+        # Deliberately bypass the writer to prove request-time defense in depth.
+        with self.factory.begin() as session:
+            row = session.get(CrewAssignmentModel, assigned["id"])
+            row.call_at = utc_now() - timedelta(days=4)
+            row.release_at = utc_now() - timedelta(days=2)
+        with self.assertRaises(ResourceNotFound):
+            self.crew.external(access["token"])
+
     def test_rollback_and_closed_event(self):
         self.setup_crew()
         with patch("event_crew.audit", side_effect=RuntimeError("injected")):

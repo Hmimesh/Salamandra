@@ -1,11 +1,26 @@
 """Server-owned original planning evidence, never client-supplied plan truth."""
 from copy import deepcopy
+import hashlib
+import json
 
 from sqlalchemy import select
 
 from database import EventProposalModel, AuditEventModel, active_membership, new_id
 from event_learning import _original, _proposal, _corrections
 from security import Permission, ResourceNotFound, StateConflict, require_permission
+
+
+def intake_fingerprint(description, request=None):
+    if not isinstance(description, str) or not description.strip():
+        raise StateConflict("The proposal intake is unavailable. Build a new event plan.")
+    normalized = description.strip()
+    if isinstance(request, dict) and "description" in request:
+        supplied = request["description"]
+        if not isinstance(supplied, str) or supplied.strip() != normalized:
+            raise StateConflict("The proposal does not match this event brief. Build a new event plan.")
+    encoded = json.dumps({"version": 1, "description": normalized}, ensure_ascii=False,
+        sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def capture_proposal(factory, organization_id, actor_id, data, request, key=None, request_id=""):
@@ -16,6 +31,7 @@ def capture_proposal(factory, organization_id, actor_id, data, request, key=None
         operation = receipt(session, organization_id, actor_id, "event.proposal", key or new_id(), request)
         if operation.status == "completed":
             return deepcopy(operation.response)
+        intake_fingerprint(data.get("description"), request)
         row = EventProposalModel(organization_id=organization_id, actor_user_id=actor_id,
             original_request=deepcopy(_original(data, request)), proposal=deepcopy(_proposal(data)))
         session.add(row)
@@ -38,6 +54,10 @@ def consume_proposal(session, learning, event, actor_id, identity):
         raise ResourceNotFound("Proposal was not found.")
     if row.consumed:
         raise StateConflict("This proposal was already used. Build a new event plan.")
+    original = row.original_request
+    if intake_fingerprint(original.get("brief"), original.get("request")) != intake_fingerprint(
+            event.data.get("description"), learning.original_request.get("request")):
+        raise StateConflict("The proposal does not match this event brief. Build a new event plan.")
     learning.original_request = deepcopy(row.original_request)
     learning.proposal = deepcopy(row.proposal)
     learning.corrections = _corrections(row.proposal, event.data)

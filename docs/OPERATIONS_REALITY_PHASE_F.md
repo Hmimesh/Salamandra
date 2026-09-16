@@ -261,12 +261,25 @@ of randomness; only SHA-256 hashes are persisted. The raw secret is returned onc
 never stored in receipts/audits. Identical issue retries return the original
 metadata with token=null; a lost response requires explicit regeneration. Expiry
 is fixed at release+24h at issuance and cannot be extended by editing the schedule.
+Shortening release within the assignment transaction revokes all assignment
+credentials if it reduces any unrevoked credential's access window. The assignment
+audit records `access_revocation_reason=release_shortened`. A later extension cannot
+revive those credentials; explicit reissue uses the current release time. Every
+external read independently enforces the earlier of stored expiry and the current
+assignment release+24h, even if a stale credential was not revoked.
 Deactivating a profile, changing it to internal or cancelling an assignment revokes
 its links. Reactivation does not revive old credentials. Event cancellation is
 also checked on every external read. Returned events remain readable until expiry.
 
 /external#<secret> sends its fragment credential only in an Authorization bearer
-header to GET /api/external/assignment, without session cookies. It does not grant
+header to GET /api/external/assignment, without session cookies.
+The page captures the fragment in component memory and removes it with history
+replacement before fetching, preserving the pathname, query and router state.
+No token is persisted in storage or cookies. In-page Refresh retains access; full
+reload without a fragment requires reopening the original link and sends no empty
+Bearer request. Reopening the original fragment in the same tab also recaptures
+and immediately removes it. Capture is safe under React StrictMode.
+It does not grant
 workspace authentication. Invalid, expired, revoked and cancelled access returns
 the same not-found response. No organization/event/profile/holding IDs, other
 personnel, contacts, internal notes, inventory browser, maintenance incidents,
@@ -287,6 +300,29 @@ Team exposes profile creation/editing and skill rows. Event detail exposes role
 creation, assignment/edit/cancel, override reason and link issue/revoke controls.
 All controls use existing application styling and modal primitives. The separate
 external page has no workspace navigation or write controls.
+
+## Review Remediation Boundaries
+
+Logistics CSV requires both `state.read` and `crew.read` before event lookup or
+construction. Existing tenant scope, UTF-8 and spreadsheet formula escaping remain
+unchanged. Clients and read-only users cannot obtain personnel through this export.
+
+Server proposal capture and consumption use one versioned SHA-256 intake binding
+over canonical JSON containing only the original description after `.strip()`.
+Internal whitespace, punctuation, case and Unicode remain exact. When both request
+and generated descriptions exist they must agree. Existing proposals derive the
+binding from stored original request/brief; no browser fingerprint or new column
+is accepted. Title, time, location, attendance, duration, crew, planning mode and
+requirements remain editable. A mismatched brief returns 409 under the existing
+proposal lock before copying evidence or consuming the proposal; event creation
+and its receipt roll back. A legitimate existing creation replay is unchanged.
+
+Events and Returns both use `ReturnInspection`, including all-ready equipment.
+Events hides its detail dialog during inspection; cancellation restores detail and
+focus to Inspect return. Successful reconciliation uses the existing workspace
+mutation flow. Normal Events UI never posts `status=returned`; the all-ready
+backend transition remains solely for existing API compatibility. This remediation
+does not change authoritative return reconciliation, ledger history or migrations.
 
 ## Inventory Operational Summary
 

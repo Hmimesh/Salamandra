@@ -1,5 +1,45 @@
 # Phase F Implementation and Verification
 
+## Review Remediation
+
+Remediation base: `674f5e8eb706846e386b24dfea9753b20509457d` on
+`staging-deployment`. Changes are limited to export permissions, shortened external
+access windows, original-intake proposal binding, Events return inspection and
+in-memory external credentials. See `OPERATIONS_REALITY_PHASE_F.md` for the exact
+binding, revocation and refresh rules. No migrations or services were added.
+
+The five focused backend reproductions failed before the corrections on both
+SQLite and PostgreSQL. Their corrected suites passed 43 tests. Added HTTP tests
+cover CSV roles/non-disclosure/formula-safe Unicode, proposal rollback/corrections/
+replay/actor and tenant scope, and two-process issuance versus shortening with
+stale-version rejection. All newly inserted HTTP fixture state is torn down by
+the existing database-isolation decorator.
+
+Canonical verification used PostgreSQL 16.15 on loopback port 55433, disposable
+schemas and actual production API processes. `tests/run_production_core_acceptance.py`
+passed 340/340 tests: 110/110 PostgreSQL-required and 31/31 race-required, zero
+skips/failures. The composed field-release/supplemental-dispatch/inspected-return
+HTTP lifecycle passed. Independent Alembic upgrade/check/downgrade-to-base/upgrade/
+check passed through unchanged head `0017_event_crew` with no pending operations.
+
+TypeScript and Vite passed before browser verification; assets were held fixed
+during each browser run. A focused browser reproduction exposed same-tab fragment
+reopening after reload; handling hash changes now captures and removes the fragment
+before fetching. The corrected focused matrix passed 10/10 checks across all five
+viewports. Browser SQLite fixtures are UI evidence only, not PostgreSQL evidence.
+The final full Playwright matrix passed 135/135 in 15.4 minutes with zero failures
+or skips: 360px, 768px, 1280px, 1440px and 640x450 CSS pixels at doubled DPR
+(200%-equivalent). Existing lifecycle, learning, theme, multilingual, keyboard and
+inventory regressions remained enabled. The fixture shut down cleanly on port
+4174; previews on port 8000 were not changed.
+
+Generated bundle replacements are content-hash changes from the two page updates
+and extraction of the shared ReturnInspection chunk, not deletion of product
+functionality. UX-audit screenshots and ignored local test/debug artifacts are
+excluded from the remediation commit.
+
+## Frozen Implementation Baseline
+
 Branch: `staging-deployment`. Integrated debugging is complete; this document
 records the verified implementation being frozen for the authorized commit/push.
 No manual deployment, merge, Railway/DNS change or Senior review is included.

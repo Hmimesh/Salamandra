@@ -1,11 +1,22 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { BrandMark } from "../components/BrandMark";
 
 type Assignment = { event: string; venue: string; status: string; person: string; role: string; call_at: string; release_at: string; timezone: string; notes: string; milestones: Record<string, string>; equipment: { name: string; quantity: number }[]; updates: { at: string; message: string }[] };
 const labels: Record<string, string> = { prepare_at: "Prepare", pack_by: "Pack by", standby_at: "Standby", dispatch_at: "Dispatch", load_in_at: "Load in", setup_at: "Setup", teardown_at: "Teardown", return_due_at: "Return due" };
 export function ExternalAssignmentPage() {
-  const [token] = useState(() => location.hash.slice(1));
+  const [token, setToken] = useState(() => location.hash.slice(1));
+  useLayoutEffect(() => {
+    function captureFragment() {
+      if (!location.hash) return;
+      const credential = location.hash.slice(1);
+      history.replaceState(history.state, "", location.pathname + location.search);
+      setToken(credential);
+    }
+    captureFragment();
+    window.addEventListener("hashchange", captureFragment);
+    return () => window.removeEventListener("hashchange", captureFragment);
+  }, []);
   const [data, setData] = useState<Assignment | null>(null);
   const [error, setError] = useState("");
   const [revision, setRevision] = useState(0);
@@ -15,6 +26,11 @@ export function ExternalAssignmentPage() {
     let pending = false;
     async function load() {
       if (pending || document.hidden) return;
+      if (!token) {
+        setData(null);
+        setError("Reopen the original assignment link to view this assignment.");
+        return;
+      }
       pending = true;
       try {
         const response = await fetch("/api/external/assignment", { credentials: "omit", headers: { Authorization: `Bearer ${token}` }, signal: controller.signal, cache: "no-store" });

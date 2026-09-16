@@ -89,6 +89,15 @@ class LogisticsCases:
         with self.factory() as session:
             self.assertEqual(session.get(EventModel, "event").version, 1)
 
+    def test_export_requires_crew_permission_before_resource_lookup(self):
+        self.setup_event()
+        for role in ("client", "read_only", "technician"):
+            with self.factory.begin() as session:
+                session.get(MembershipModel, "a").role = role
+            for identity in ("event", "absent"):
+                with self.assertRaises(AccessDenied):
+                    self.logistics.export("a", "a", identity)
+
 
 class TestLogisticsSQLite(LogisticsCases, unittest.TestCase):
     setUp = conditions.TestConditionsSQLite.setUp

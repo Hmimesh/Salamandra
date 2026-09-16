@@ -474,7 +474,36 @@ test("crew profiles assignments and restricted external view work with keyboard"
   const context = await browser.newContext({ viewport: testInfo.project.use.viewport });
   try {
     const external = await context.newPage();
-    await external.goto(await link.inputValue());
+    const original = new URL(await link.inputValue());
+    original.searchParams.set("view", "crew");
+    const token = original.hash.slice(1);
+    const requests: string[] = [];
+    external.on("request", request => {
+      expect(request.url()).not.toContain(token);
+      if (request.url().includes("/api/external/assignment")) requests.push(request.headers().authorization);
+    });
+    await external.goto(original.toString());
+    await expect(external.getByRole("heading", { name: event.title })).toBeVisible();
+    expect(new URL(external.url()).hash).toBe("");
+    expect(new URL(external.url()).searchParams.get("view")).toBe("crew");
+    expect(requests.length).toBeGreaterThan(0);
+    expect(requests.every(value => value === `Bearer ${token}`)).toBe(true);
+    expect(await external.evaluate(() => JSON.stringify([localStorage, sessionStorage]))).not.toContain(token);
+    expect(JSON.stringify(await context.cookies())).not.toContain(token);
+    const workspace = await context.request.get("/api/crew", { headers: { Authorization: `Bearer ${token}` } });
+    expect(workspace.status()).toBe(401);
+    const refreshed = external.waitForResponse(r => r.url().includes("/api/external/assignment"));
+    await activate(external.getByRole("button", { name: "Refresh assignment" }));
+    expect((await refreshed).ok()).toBe(true);
+    const countBeforeReload = requests.length;
+    await external.reload();
+    await expect(external.getByRole("alert")).toContainText("Reopen the original assignment link");
+    expect(requests.length).toBe(countBeforeReload);
+    const countAfterReload = requests.length;
+    await activate(external.getByRole("button", { name: "Refresh assignment" }));
+    await expect(external.getByRole("alert")).toContainText("Reopen the original assignment link");
+    expect(requests.length).toBe(countAfterReload);
+    await external.goto(original.toString());
     await expect(external.getByRole("heading", { name: event.title })).toBeVisible();
     await expect(external.getByText("مرحبا שלום assigned notes", { exact: true })).toBeVisible();
     await expect(external.getByText("private@example.test")).toHaveCount(0);
@@ -552,6 +581,63 @@ test("field adjustment request review and supplemental dispatch preserve inspect
   expect(preview.lines.reduce((sum: number, line: { quantity: number }) => sum + line.quantity, 0)).toBe(8);
   await post("/api/events/return", { event_id: event.id, version: preview.version, idempotency_key: crypto.randomUUID(),
     lines: preview.lines.map((line: { holding_id: string; quantity: number }) => ({ holding_id: line.holding_id, ready: line.quantity, damaged: 0, missing: 0 })) });
+});
+
+test("Events inspection replaces detail and restores focus for healthy and damaged returns", async ({ page }, testInfo) => {
+  test.setTimeout(90000);
+  await signIn(page);
+  const legacyReturns: string[] = [];
+  page.on("request", request => {
+    if (request.method() === "POST" && request.url().endsWith("/api/events/status") && request.postDataJSON()?.status === "returned") legacyReturns.push(request.url());
+  });
+  const post = async (path: string, data: object) => {
+    const response = await page.request.post(path, { data });
+    expect(response.ok(), await response.text()).toBe(true);
+    return response.json();
+  };
+  for (const damaged of [2, 0]) {
+    const title = `Events inspection ${damaged} ${testInfo.project.name}`;
+    await post("/api/inventory/items", { id: title, display_name: title, type: "transport", class_id: "utility-cart", amount: 4, scope: "shared", idempotency_key: crypto.randomUUID() });
+    let event = (await post("/api/events/save", { description: "Equipment transfer", idempotency_key: crypto.randomUUID(), overrides: {
+      title, start_date: "2027-06-15", start_time: "18:00", duration_minutes: 120, planning_mode: "manual",
+      capability_requirements: [{ capability: "transport.cart", amount: 4, level: "required" }],
+    } })).event;
+    event = (await post("/api/events/status", { event_id: event.id, status: "confirmed" })).event;
+    for (const line of event.checklist) await post("/api/events/checklist", { event_id: event.id, item_id: line.item_id, phase: "pack", done: true });
+    await post("/api/events/status", { event_id: event.id, status: "packed" });
+    await post("/api/events/status", { event_id: event.id, status: "out" });
+    const beforeReturn = (await (await page.request.get("/api/state")).json()).inventory.items;
+    await page.goto(`/events?event=${event.id}`);
+    const inspect = page.getByRole("button", { name: "Inspect return", exact: true });
+    await activate(inspect);
+    let dialog = page.getByRole("dialog", { name: "Inspect event return" });
+    await expect(dialog).toBeVisible();
+    await expect(page.getByRole("dialog")).toHaveCount(1);
+    await page.keyboard.press("Escape");
+    await expect(inspect).toBeFocused();
+    await activate(inspect);
+    dialog = page.getByRole("dialog", { name: "Inspect event return" });
+    const equipment = dialog.locator("fieldset").filter({ hasText: "4 out" }).first();
+    if (damaged) {
+      await equipment.getByLabel("Ready", { exact: true }).fill("2");
+      await equipment.getByLabel("Damaged", { exact: true }).fill("2");
+      await equipment.getByLabel("Issue / missing details").fill("Broken wheel");
+    }
+    await expectNoViewportOverflow(page);
+    const returned = page.waitForResponse(r => r.url().endsWith("/api/events/return") && r.request().method() === "POST");
+    await activate(dialog.getByRole("button", { name: "Complete inspected return" }));
+    expect((await returned).ok()).toBe(true);
+    await expect(dialog).toHaveCount(0);
+    const incidents = (await (await page.request.get("/api/maintenance")).json()).incidents.filter((row: { event_id: string }) => row.event_id === event.id);
+    expect(incidents.map((row: { status: string; quantity: number }) => [row.status, row.quantity])).toEqual(damaged ? [["needs_repair", 2]] : []);
+    if (damaged) {
+      const items = (await (await page.request.get("/api/state")).json()).inventory.items;
+      const itemId = incidents[0].item_id;
+      expect(items.find((item: { id: string }) => item.id === itemId).count).toBe(
+        beforeReturn.find((item: { id: string }) => item.id === itemId).count + 2);
+    }
+  }
+  expect(legacyReturns).toEqual([]);
 });
 
 test("event return splits ready damaged and missing equipment", async ({ page }, testInfo) => {
